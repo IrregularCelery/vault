@@ -84,7 +84,7 @@ fn bytes_to_bits(bytes: &[u8]) -> Vec<bool> {
 }
 
 fn sha256_first_bits(data: &[u8], count: usize) -> Vec<bool> {
-    let hash = sha256(data);
+    let hash = sha256::sha256(data);
     let bits = bytes_to_bits(&hash);
 
     bits[..count.min(256)].to_vec()
@@ -122,7 +122,7 @@ fn entropy_to_mnemonic(entropy: &[u8]) -> Result<Vec<String>, &'static str> {
 }
 
 #[cfg(test)]
-mod bip39_tests {
+mod tests {
     use super::*;
 
     #[test]
