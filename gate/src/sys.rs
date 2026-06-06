@@ -3,6 +3,8 @@ extern crate std;
 
 pub mod macros {
     pub use super::std::dbg;
+    pub use super::std::eprint;
+    pub use super::std::eprintln;
     pub use super::std::format;
     pub use super::std::print;
     pub use super::std::println;
@@ -59,6 +61,10 @@ pub mod path {
 
 pub mod time {
     pub use super::std::time::*;
+}
+
+pub mod env {
+    pub use super::std::env::*;
 }
 
 pub mod random {
