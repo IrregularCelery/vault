@@ -75,13 +75,14 @@ fn derive_subkey(material: &[u8], domain: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+    const TEST_PHRASE1: &str = "abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon about";
+    const TEST_PHRASE2: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 
     #[test]
     fn derivation_is_deterministic() {
-        let id1 = Identity::from_phrase(TEST_PHRASE).unwrap();
-        let id2 = Identity::from_phrase(TEST_PHRASE).unwrap();
+        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let id2 = Identity::from_phrase(TEST_PHRASE1).unwrap();
 
         assert_eq!(id1.public_key_bytes(), id2.public_key_bytes());
         assert_eq!(id1.encryption_key, id2.encryption_key);
@@ -89,16 +90,15 @@ mod tests {
 
     #[test]
     fn enc_and_sign_keys_are_different() {
-        let id = Identity::from_phrase(TEST_PHRASE).unwrap();
+        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
 
         assert_ne!(id.encryption_key, id.signing_key.to_bytes());
     }
 
     #[test]
     fn different_mnemonics_produce_different_keys() {
-        let id1 = Identity::from_phrase(TEST_PHRASE).unwrap();
-        let id2 =
-            Identity::from_phrase("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
+        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let id2 = Identity::from_phrase(TEST_PHRASE2).unwrap();
 
         assert_ne!(id1.public_key_bytes(), id2.public_key_bytes());
         assert_ne!(id1.encryption_key, id2.encryption_key);
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify_roundtrip() {
-        let id = Identity::from_phrase(TEST_PHRASE).unwrap();
+        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
         let challenge = b"challenge";
         let signature = id.sign(challenge);
 
@@ -115,9 +115,37 @@ mod tests {
 
     #[test]
     fn wrong_challenge_fails_verification() {
-        let id = Identity::from_phrase(TEST_PHRASE).unwrap();
+        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
         let signature = id.sign(b"correct_nonce");
 
         assert!(!id.verify(b"wrong_nonce", &signature));
+    }
+
+    #[test]
+    fn cross_identity_verification_fails() {
+        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let id2 = Identity::from_phrase(TEST_PHRASE2).unwrap();
+        let sig = id1.sign(b"message");
+
+        // id2 must not be able to verify id1's signature
+        assert!(!id2.verify(b"message", &sig));
+    }
+
+    #[test]
+    fn tampered_signature_fails() {
+        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let mut sig = id.sign(b"message");
+
+        sig[0] ^= 0xFF; // flip bits in the first byte
+
+        assert!(!id.verify(b"message", &sig));
+    }
+
+    #[test]
+    fn empty_message_roundtrip() {
+        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let sig = id.sign(b"");
+
+        assert!(id.verify(b"", &sig));
     }
 }
