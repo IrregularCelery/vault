@@ -14,7 +14,7 @@ pub mod sha256 {
         0xc67178f2,
     ];
 
-    pub fn sha256(data: &[u8]) -> [u8; 32] {
+    pub fn hash(data: &[u8]) -> [u8; 32] {
         let mut state: [u32; 8] = [
             0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
             0x5be0cd19,
@@ -109,7 +109,7 @@ pub mod sha256 {
 
         #[test]
         fn empty_string() {
-            let result = sha256(b"");
+            let result = hash(b"");
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -119,7 +119,7 @@ pub mod sha256 {
 
         #[test]
         fn abc() {
-            let result = sha256(b"abc");
+            let result = hash(b"abc");
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -129,7 +129,7 @@ pub mod sha256 {
 
         #[test]
         fn unicode_pi() {
-            let result = sha256("π".as_bytes());
+            let result = hash("π".as_bytes());
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -139,7 +139,7 @@ pub mod sha256 {
 
         #[test]
         fn long_sentence() {
-            let result = sha256(b"The quick brown fox jumps over the lazy dog");
+            let result = hash(b"The quick brown fox jumps over the lazy dog");
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -150,7 +150,7 @@ pub mod sha256 {
         #[test]
         fn length_55() {
             let data = [b'a'; 55];
-            let result = sha256(&data);
+            let result = hash(&data);
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -161,7 +161,7 @@ pub mod sha256 {
         #[test]
         fn length_56() {
             let data = [b'a'; 56];
-            let result = sha256(&data);
+            let result = hash(&data);
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -172,7 +172,7 @@ pub mod sha256 {
         #[test]
         fn length_63() {
             let data = [b'a'; 63];
-            let result = sha256(&data);
+            let result = hash(&data);
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -183,7 +183,7 @@ pub mod sha256 {
         #[test]
         fn length_64() {
             let data = [b'a'; 64];
-            let result = sha256(&data);
+            let result = hash(&data);
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -194,7 +194,7 @@ pub mod sha256 {
         #[test]
         fn length_65() {
             let data = [b'a'; 65];
-            let result = sha256(&data);
+            let result = hash(&data);
 
             assert_eq!(
                 bytes_to_hex(&result),
@@ -202,7 +202,6 @@ pub mod sha256 {
             );
         }
 
-        // Converts a byte array to a hex string
         fn bytes_to_hex(bytes: &[u8; 32]) -> String {
             bytes.iter().map(|b| format!("{:02x}", b)).collect()
         }
@@ -244,7 +243,7 @@ pub mod bip39 {
         for word in words {
             let index = list
                 .binary_search(word)
-                .map_err(|_| format!("Unknown word: {}", word))?;
+                .map_err(|_| format!("unknown word: {}", word))?;
 
             // Each word encodes 11 bits
             for bit in (0..11).rev() {
@@ -296,7 +295,7 @@ pub mod bip39 {
     }
 
     fn sha256_first_bits(data: &[u8], count: usize) -> Vec<bool> {
-        let hash = sha256::sha256(data);
+        let hash = sha256::hash(data);
         let bits = bytes_to_bits(&hash);
 
         bits[..count.min(256)].to_vec()
