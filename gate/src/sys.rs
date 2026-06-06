@@ -1,61 +1,64 @@
+// Should probably be feature-gated
+extern crate std;
+
 pub mod macros {
-    pub use std::dbg;
-    pub use std::format;
-    pub use std::print;
-    pub use std::println;
-    pub use std::vec;
+    pub use super::std::dbg;
+    pub use super::std::format;
+    pub use super::std::print;
+    pub use super::std::println;
+    pub use super::std::vec;
 }
 
 pub mod vec {
-    pub use std::vec::*;
+    pub use super::std::vec::*;
 }
 
 pub mod string {
-    pub use std::string::*;
+    pub use super::std::string::*;
 }
 
 pub mod boxed {
-    pub use std::boxed::*;
+    pub use super::std::boxed::*;
 }
 
 pub mod borrow {
-    pub use std::borrow::*;
+    pub use super::std::borrow::*;
 }
 
 pub mod collections {
-    pub use std::collections::*;
+    pub use super::std::collections::*;
 }
 
 pub mod rc {
-    pub use std::rc::*;
+    pub use super::std::rc::*;
 }
 
 pub mod cell {
-    pub use std::cell::*;
+    pub use super::std::cell::*;
 }
 
 pub mod sync {
-    pub use std::sync::*;
+    pub use super::std::sync::*;
 }
 
 pub mod fmt {
-    pub use std::fmt::*;
+    pub use super::std::fmt::*;
 }
 
 pub mod iter {
-    pub use std::iter::*;
+    pub use super::std::iter::*;
 }
 
 pub mod io {
-    pub use std::io::*;
+    pub use super::std::io::*;
 }
 
 pub mod path {
-    pub use std::path::*;
+    pub use super::std::path::*;
 }
 
 pub mod time {
-    pub use std::time::*;
+    pub use super::std::time::*;
 }
 
 pub mod random {

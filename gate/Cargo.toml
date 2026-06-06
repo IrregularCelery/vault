@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.5.3"
+blake3 = "1.8.5"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 rand = "0.10.1"
