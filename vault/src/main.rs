@@ -8,7 +8,7 @@ use gate::{
         string::String,
     },
 };
-use vault::crypto::keys::Identity;
+use vault::crypto::identity::Identity;
 
 fn main() {
     let args: Vec<String> = env::args().collect();

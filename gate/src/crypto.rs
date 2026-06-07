@@ -745,3 +745,10 @@ pub mod ed25519 {
 pub mod blake3 {
     pub use blake3::keyed_hash;
 }
+
+pub mod chacha20poly1305 {
+    pub use chacha20poly1305::{
+        ChaCha20Poly1305, Key, Nonce,
+        aead::{Aead, AeadCore, KeyInit, OsRng},
+    };
+}
