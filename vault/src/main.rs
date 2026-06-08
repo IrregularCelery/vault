@@ -1,5 +1,7 @@
 #![no_std]
 
+use vault::crypto::identity::Identity;
+
 use gate::{
     crypto::bip39,
     sys::{
@@ -8,7 +10,6 @@ use gate::{
         string::String,
     },
 };
-use vault::crypto::identity::Identity;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
