@@ -55,12 +55,20 @@ pub mod io {
     pub use super::std::io::*;
 }
 
+pub mod fs {
+    pub use super::std::fs::*;
+}
+
 pub mod path {
     pub use super::std::path::*;
 }
 
 pub mod time {
     pub use super::std::time::*;
+}
+
+pub mod thread {
+    pub use super::std::thread::*;
 }
 
 pub mod env {
