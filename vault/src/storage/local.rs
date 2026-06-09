@@ -3,10 +3,7 @@
 //!                   ^- encrpyted blob file
 //!
 //! Blob writes are atomic
-use crate::{
-    crypto::HashPath,
-    storage::{Backend, Error},
-};
+use crate::storage::{Backend, Error, HashPath};
 
 use gate::sys::{fs, io, path::PathBuf, string::ToString, vec::Vec};
 
