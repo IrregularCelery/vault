@@ -48,7 +48,7 @@ impl Backend for Storage {
         Ok(())
     }
 
-    fn get(&self, hash: &[u8; 32]) -> Result<gate::sys::macros::vec::Vec<u8>, Error> {
+    fn get(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error> {
         let path = self.blob_path(hash);
 
         Ok(fs::read(&path)?)
@@ -97,24 +97,28 @@ impl Backend for Storage {
             Some(hash)
         }
 
-        for dir in entries {
-            let dir = dir?;
-
-            if !dir.file_type()?.is_dir() {
+        for dir in entries.flatten() {
+            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
 
-            for subdir in fs::read_dir(dir.path())? {
-                let subdir = subdir?;
+            let subdir_entries = match fs::read_dir(dir.path()) {
+                Ok(e) => e,
+                Err(_) => continue, // Skip unreadable subdirs
+            };
 
-                if !subdir.file_type()?.is_dir() {
+            for subdir in subdir_entries.flatten() {
+                if !subdir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
 
-                for file in fs::read_dir(subdir.path())? {
-                    let file = file?;
+                let file_entries = match fs::read_dir(subdir.path()) {
+                    Ok(e) => e,
+                    Err(_) => continue, // Skip unreadable files
+                };
 
-                    if !file.file_type()?.is_file() {
+                for file in file_entries.flatten() {
+                    if !file.file_type().map(|t| t.is_file()).unwrap_or(false) {
                         continue;
                     }
 
@@ -236,5 +240,39 @@ mod tests {
         list.sort();
 
         assert_eq!(list, expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_skips_inaccessible_directories() {
+        use gate::sys::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+        let storage = temp_storage("list_inaccessible");
+        let hash = [8; 32];
+
+        storage.put(&hash, b"accessible payload").unwrap();
+
+        let broken_dir = storage.root.join("ff");
+
+        fs::create_dir_all(&broken_dir).unwrap();
+
+        // Revoke all permissions so read_dir fails
+        fs::set_permissions(&broken_dir, Permissions::from_mode(0o000)).unwrap();
+
+        let result = storage.list();
+
+        // Restore permissions so we can delete the temporary directory after the test
+        let _ = fs::set_permissions(&broken_dir, Permissions::from_mode(0o755));
+        let list = result.unwrap();
+
+        assert_eq!(
+            list.len(),
+            1,
+            "Should have skipped the broken directory instead of failing"
+        );
+        assert_eq!(
+            list[0], hash,
+            "The valid chunk must still be collected safely"
+        );
     }
 }
