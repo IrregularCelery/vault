@@ -8,7 +8,7 @@
 //!     [path_len bytes]    path (UTF-8)
 //!     [8-bytes]           size (u64)
 //!     [8-bytes]           modified (u64)
-//!     [4-bytes]           chunk_count (u64)
+//!     [4-bytes]           chunk_count (u32)
 //!     each chunk:
 //!       [32-bytes]        hash
 
