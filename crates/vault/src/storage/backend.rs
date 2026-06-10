@@ -1,13 +1,9 @@
-use gate::sys::{
-    io,
-    string::{String, ToString},
-    vec::Vec,
-};
+use gate::sys::{io, string::String, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
     NotFound,
-    Io(String),
+    Io(io::Error),
     Other(String),
 }
 
@@ -27,7 +23,7 @@ impl From<io::Error> for Error {
             return Self::NotFound;
         }
 
-        Self::Io(value.to_string())
+        Self::Io(value)
     }
 }
 

@@ -1,5 +1,6 @@
 //! Encrypted blobs are as follows:
 //!   `[ 12-bytes nonce ] + [ ciphertext ] + [ 16-bytes tag ]`
+
 use gate::{
     crypto::chacha20poly1305::{Aead, AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce, OsRng},
     sys::macros::vec::Vec,

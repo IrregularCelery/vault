@@ -1,11 +1,13 @@
 //! Storage layout is as follows: (Content-Addressed Storage)
+//!
 //!   [root]/a1/b2/c3d4e5...
 //!                   ^- encrpyted blob file
 //!
 //! Blob writes are atomic
-use crate::storage::{Backend, Error, HashPath};
 
-use gate::sys::{fs, io, path::PathBuf, string::ToString, vec::Vec};
+use crate::storage::{Backend, Error, hashpath::HashPath};
+
+use gate::sys::{fs, io, path::PathBuf, vec::Vec};
 
 pub struct Storage {
     root: PathBuf,
@@ -62,7 +64,7 @@ impl Backend for Storage {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(e.to_string())),
+            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -73,7 +75,7 @@ impl Backend for Storage {
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
-            Err(e) => return Err(Error::Io(e.to_string())),
+            Err(e) => return Err(Error::Io(e)),
         };
 
         fn path_to_hash(dir: &str, subdir: &str, file: &str) -> Option<[u8; 32]> {
