@@ -1,37 +1,59 @@
-use gate::sys::{macros::vec, vec::Vec};
+use gate::sys::{io, macros::vec, string::String, vec::Vec};
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // Each chunk's max capacity is 4 MiB
 
 #[derive(Debug)]
-pub struct Chunk {
-    data: Vec<u8>,
+pub enum Error {
+    Io(io::Error),
+    Other(String),
 }
 
-impl Chunk {
-    pub fn new(data: Vec<u8>) -> Self {
+#[derive(Debug)]
+pub struct Chunk<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Chunk<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
         Self { data }
     }
 }
 
-pub fn split(bytes: &[u8]) -> Vec<Chunk> {
-    if bytes.is_empty() {
-        return vec![Chunk::new(vec![])];
-    }
-
-    bytes
-        .chunks(CHUNK_SIZE)
-        .map(|c| Chunk::new(c.to_vec()))
-        .collect()
+pub struct ChunkReader<R: io::Read> {
+    reader: R,
+    buf: Vec<u8>,
 }
 
-// TODO: This approach is absolutely atrocious and must be re-written as a streaming re-assembler
-pub fn reassemble(chunks: &[Chunk]) -> Vec<u8> {
-    let total = chunks.iter().map(|c| c.data.len()).sum();
-    let mut out = Vec::with_capacity(total);
-
-    for chunk in chunks {
-        out.extend_from_slice(&chunk.data);
+impl<R: io::Read> ChunkReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: vec![0u8; CHUNK_SIZE],
+        }
     }
 
-    out
+    pub fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>, Error> {
+        let mut total = 0;
+
+        loop {
+            match self.reader.read(&mut self.buf[total..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+
+                    if total == CHUNK_SIZE {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+
+        if total == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(Chunk::new(&self.buf[..total])))
+    }
 }
