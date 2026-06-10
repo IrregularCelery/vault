@@ -75,6 +75,10 @@ pub mod env {
     pub use super::std::env::*;
 }
 
+pub mod os {
+    pub use super::std::os::*;
+}
+
 pub mod random {
     pub use rand::Rng;
     pub use rand::rng;
