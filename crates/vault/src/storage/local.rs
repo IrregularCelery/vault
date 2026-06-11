@@ -54,6 +54,22 @@ impl Backend for Storage {
         Ok(fs::read(&path)?)
     }
 
+    fn overwrite(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error> {
+        let path = self.blob_path(hash);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp = path.with_extension("tmp");
+
+        // Atomic write
+        fs::write(&temp, data)?;
+        fs::rename(&temp, path)?;
+
+        Ok(())
+    }
+
     fn exists(&self, hash: &[u8; 32]) -> Result<bool, Error> {
         Ok(self.blob_path(hash).exists())
     }
@@ -159,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip() {
+    fn put_get_roundtrip() {
         let storage = temp_storage("roundtrip");
         let hash = [0; 32];
         let data = b"data";
