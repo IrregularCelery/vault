@@ -9,7 +9,7 @@
 //!     [8-bytes]           size (u64)
 //!     [8-bytes]           modified (u64)
 //!     [4-bytes]           chunk_count (u32)
-//!     each chunk:
+//!     each address:
 //!       [32-bytes]        hash
 
 use crate::crypto::cipher::{Error as CipherError, decrypt, encrypt};
@@ -27,14 +27,14 @@ const DOMAIN_INDEX: &[u8] = b"vault::index";
 
 #[derive(Debug)]
 pub enum Error {
-    Crypto(CipherError),
+    Cipher(CipherError),
     Corrupted(&'static str),
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::Crypto(e) => write!(f, "crypto: {}", e),
+            Error::Cipher(e) => write!(f, "cipher: {}", e),
             Error::Corrupted(e) => write!(f, "corrupted index: {}", e),
         }
     }
@@ -42,20 +42,20 @@ impl core::fmt::Display for Error {
 
 impl From<CipherError> for Error {
     fn from(value: CipherError) -> Self {
-        Self::Crypto(value)
+        Self::Cipher(value)
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Entry {
-    chunk_hashes: Vec<[u8; 32]>,
-    size: u64,
-    modified: u64,
+    pub addresses: Vec<[u8; 32]>,
+    pub size: u64,
+    pub modified: u64,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct Index {
-    entries: BTreeMap<String, Entry>,
+    pub entries: BTreeMap<String, Entry>,
 }
 
 impl Index {
@@ -73,18 +73,18 @@ impl Index {
         self.entries.get(path)
     }
 
-    pub fn chunk_hashes(&self) -> Vec<[u8; 32]> {
+    pub fn addresses(&self) -> Vec<[u8; 32]> {
         self.entries
             .values()
-            .flat_map(|e| e.chunk_hashes.iter().copied())
+            .flat_map(|e| e.addresses.iter().copied())
             .collect()
     }
 
-    pub fn remove(&mut self, path: &str) {
-        self.entries.remove(path);
+    pub fn remove(&mut self, path: &str) -> Option<Entry> {
+        self.entries.remove(path)
     }
 
-    pub fn storage_key(public_key: &[u8; 32]) -> [u8; 32] {
+    pub fn address(public_key: &[u8; 32]) -> [u8; 32] {
         let mut input = Vec::with_capacity(12 + 32); // 12-bytes for the DOMAIN_INDEX size
 
         input.extend_from_slice(DOMAIN_INDEX);
@@ -118,9 +118,9 @@ impl Index {
 
             write_u64(&mut buf, entry.size);
             write_u64(&mut buf, entry.modified);
-            write_u32(&mut buf, entry.chunk_hashes.len() as u32);
+            write_u32(&mut buf, entry.addresses.len() as u32);
 
-            for hash in &entry.chunk_hashes {
+            for hash in &entry.addresses {
                 buf.extend_from_slice(hash);
             }
         }
@@ -219,18 +219,18 @@ impl Index {
             let size = read_u64(data, &mut current)?;
             let modified = read_u64(data, &mut current)?;
             let chunk_count = read_u32(data, &mut current)? as usize;
-            let mut chunk_hashes = Vec::with_capacity(chunk_count);
+            let mut addresses = Vec::with_capacity(chunk_count);
 
             for _ in 0..chunk_count {
                 let hash = read_hash(data, &mut current)?;
 
-                chunk_hashes.push(hash);
+                addresses.push(hash);
             }
 
             entries.insert(
                 path,
                 Entry {
-                    chunk_hashes,
+                    addresses,
                     size,
                     modified,
                 },
@@ -271,7 +271,7 @@ mod tests {
         index.insert(
             "music/song.mp4",
             Entry {
-                chunk_hashes: vec![[0xABu8; 32], [0xCDu8; 32]],
+                addresses: vec![[0xABu8; 32], [0xCDu8; 32]],
                 size: 5_000_000, // 5MB > 4MiB hence the two chunks
                 modified: 1_700_000_000,
             },
@@ -280,7 +280,7 @@ mod tests {
         index.insert(
             "photos/image.jpg",
             Entry {
-                chunk_hashes: vec![[0xEFu8; 32]],
+                addresses: vec![[0xEFu8; 32]],
                 size: 2_048,
                 modified: 1_710_000_000,
             },
@@ -326,19 +326,16 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_storage_key() {
+    fn deterministic_address() {
         let public_key = [0xFFu8; 32];
 
-        assert_eq!(
-            Index::storage_key(&public_key),
-            Index::storage_key(&public_key)
-        );
+        assert_eq!(Index::address(&public_key), Index::address(&public_key));
     }
 
     #[test]
-    fn different_storage_keys() {
-        let key1 = Index::storage_key(&[0x01u8; 32]);
-        let key2 = Index::storage_key(&[0x02u8; 32]);
+    fn different_addresses() {
+        let key1 = Index::address(&[0x01u8; 32]);
+        let key2 = Index::address(&[0x02u8; 32]);
 
         assert_ne!(key1, key2);
     }
@@ -350,7 +347,7 @@ mod tests {
         index.insert(
             "file.txt",
             Entry {
-                chunk_hashes: vec![[0u8; 32]],
+                addresses: vec![[0u8; 32]],
                 size: 100,
                 modified: 0,
             },
@@ -366,7 +363,7 @@ mod tests {
     #[test]
     fn all_chunk_hashes() {
         let index = sample();
-        let hashes = index.chunk_hashes();
+        let hashes = index.addresses();
 
         // Sample has 2 + 1 = 3 chunk hashes
         assert_eq!(hashes.len(), 3);

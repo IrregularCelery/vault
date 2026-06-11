@@ -12,7 +12,7 @@ const DOMAIN_ENCRYPTION: &[u8] = b"vault::encryption";
 const DOMAIN_SIGNING: &[u8] = b"vault::signing";
 
 pub struct Identity {
-    encryption_key: [u8; 32],
+    pub encryption_key: [u8; 32],
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 }
@@ -34,8 +34,8 @@ impl Identity {
             .map_err(|e| format!("argon2 hash: {}", e))?;
 
         // Separate domains by hashing each half with a domain tag
-        let encryption_key = derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
-        let signing_seed = derive_subkey(&seed[32..], DOMAIN_SIGNING);
+        let encryption_key = Self::derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
+        let signing_seed = Self::derive_subkey(&seed[32..], DOMAIN_SIGNING);
         let signing_key = SigningKey::from_bytes(&signing_seed);
         let verifying_key = signing_key.verifying_key();
 
@@ -59,16 +59,16 @@ impl Identity {
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.verifying_key.to_bytes()
     }
-}
 
-fn derive_subkey(material: &[u8], domain: &[u8]) -> [u8; 32] {
-    // BLACK3 hashing key needs exactly 32-bytes for the key
-    let mut key = [0u8; 32];
-    let len = material.len().min(32);
-    key[..len].copy_from_slice(&material[..len]);
+    fn derive_subkey(material: &[u8], domain: &[u8]) -> [u8; 32] {
+        // BLAKE3 hashing key needs exactly 32-bytes for the key
+        let mut key = [0u8; 32];
+        let len = material.len().min(32);
+        key[..len].copy_from_slice(&material[..len]);
 
-    // Use domain as the input so the output is bound to both the key material and the domain
-    *blake3::keyed_hash(&key, domain).as_bytes()
+        // Use domain as the input so the output is bound to both the key material and the domain
+        *blake3::keyed_hash(&key, domain).as_bytes()
+    }
 }
 
 #[cfg(test)]

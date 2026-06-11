@@ -59,7 +59,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip() {
+    fn encrypt_decrypt_roundtrip() {
         let key = [0u8; 32];
         let plaintext = b"Something";
         let encrypted_blob = encrypt(&key, plaintext).unwrap();
