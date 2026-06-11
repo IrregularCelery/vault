@@ -1,10 +1,10 @@
-use gate::sys::{io, string::String, vec::Vec};
+use gate::sys::{io, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
     NotFound,
     Io(io::Error),
-    Other(String),
+    Other(&'static str),
 }
 
 impl core::fmt::Display for Error {

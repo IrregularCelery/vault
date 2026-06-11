@@ -1,11 +1,11 @@
-use gate::sys::{io, macros::vec, string::String, vec::Vec};
+use gate::sys::{io, macros::vec, vec::Vec};
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // Each chunk's max capacity is 4 MiB
 
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
-    Other(String),
+    Other(&'static str),
 }
 
 #[derive(Debug)]
