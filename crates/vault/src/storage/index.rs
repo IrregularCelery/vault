@@ -12,7 +12,7 @@
 //!     each chunk:
 //!       [32-bytes]        hash
 
-use crate::crypto::chacha20poly1305::{Error as CryptoError, decrypt, encrypt};
+use crate::crypto::cipher::{Error as CipherError, decrypt, encrypt};
 
 use gate::{
     crypto::blake3,
@@ -27,7 +27,7 @@ const DOMAIN_INDEX: &[u8] = b"vault::index";
 
 #[derive(Debug)]
 pub enum Error {
-    Crypto(CryptoError),
+    Crypto(CipherError),
     Corrupted(&'static str),
 }
 
@@ -40,8 +40,8 @@ impl core::fmt::Display for Error {
     }
 }
 
-impl From<CryptoError> for Error {
-    fn from(value: CryptoError) -> Self {
+impl From<CipherError> for Error {
+    fn from(value: CipherError) -> Self {
         Self::Crypto(value)
     }
 }

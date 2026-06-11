@@ -18,7 +18,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::EncryptFailed => write!(f, "encryption failed"),
             Self::DecryptFailed => write!(f, "decryption failed (wrong key or corrupted data)"),
-            Self::InvalidLength => write!(f, "crypto payload is too short"),
+            Self::InvalidLength => write!(f, "cipher payload is too short"),
         }
     }
 }
