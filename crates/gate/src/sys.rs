@@ -75,6 +75,10 @@ pub mod env {
     pub use super::std::env::*;
 }
 
+pub mod process {
+    pub use super::std::process::*;
+}
+
 pub mod os {
     pub use super::std::os::*;
 }
