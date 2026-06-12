@@ -44,9 +44,9 @@ impl HashPath {
 
 impl core::fmt::Display for HashPath {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let dir = core::str::from_utf8(&self.dir).unwrap();
-        let subdir = core::str::from_utf8(&self.subdir).unwrap();
-        let file = core::str::from_utf8(&self.file).unwrap();
+        let dir = core::str::from_utf8(&self.dir).map_err(|_| core::fmt::Error)?;
+        let subdir = core::str::from_utf8(&self.subdir).map_err(|_| core::fmt::Error)?;
+        let file = core::str::from_utf8(&self.file).map_err(|_| core::fmt::Error)?;
 
         write!(f, "{}/{}/{}", dir, subdir, file)
     }
