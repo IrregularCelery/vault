@@ -115,6 +115,9 @@ impl<S: storage::Backend> Session<S> {
 
         let chunk_count = hashes.len();
 
+        // TODO: Handle unreferenced chunks on overwrite.
+        // For now, if an entry already exists, `put()` overwrites the index silently
+        // and leaves the old chunks unreferenced.
         self.index.insert(
             path,
             index::Entry {
@@ -191,7 +194,7 @@ impl<S: storage::Backend> Session<S> {
     }
 
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.trash(path)?;
+        self.index.trash(path)?;
         self.purge(path)?;
 
         Ok(())
