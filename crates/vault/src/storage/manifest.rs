@@ -1,4 +1,4 @@
-//! Encrpted index as file manifest
+//! Encrpted manifest as blob index lookup
 //!
 //! Binary serialization format (big-endian):
 //!
@@ -25,7 +25,7 @@ use gate::{
     },
 };
 
-const DOMAIN_INDEX: &[u8] = b"vault::index";
+const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
 
 #[derive(Debug)]
 pub enum Error {
@@ -40,7 +40,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Cipher(e) => write!(f, "cipher: {}", e),
-            Error::Corrupted(e) => write!(f, "corrupted index: {}", e),
+            Error::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
             Error::NotFound => write!(f, "file not found"),
             Error::NotTrashed => write!(f, "file is not in the trash"),
             Error::AlreadyTrashed => write!(f, "file is already in the trash"),
@@ -63,11 +63,11 @@ pub struct Entry {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Index {
+pub struct Manifest {
     pub entries: BTreeMap<String, Entry>,
 }
 
-impl Index {
+impl Manifest {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -173,12 +173,12 @@ impl Index {
     }
 
     pub fn address(public_key: &[u8; 32]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(12 + 32); // 12-bytes for the DOMAIN_INDEX size
+        let mut input = Vec::with_capacity(12 + 32); // 12-bytes for the DOMAIN_MANIFEST size
 
-        input.extend_from_slice(DOMAIN_INDEX);
+        input.extend_from_slice(DOMAIN_MANIFEST);
         input.extend_from_slice(public_key);
 
-        // storage key for the index blob
+        // storage key for the manifest blob
         *blake3::hash(&input).as_bytes()
     }
 
@@ -344,7 +344,7 @@ impl Index {
     }
 }
 
-impl Default for Index {
+impl Default for Manifest {
     fn default() -> Self {
         Self::new()
     }
@@ -363,10 +363,10 @@ mod tests {
 
     use super::*;
 
-    fn index() -> Index {
-        let mut index = Index::new();
+    fn manifest() -> Manifest {
+        let mut manifest = Manifest::new();
 
-        index.insert(
+        manifest.insert(
             "music/song.mp3",
             Entry {
                 addresses: vec![[0xABu8; 32], [0xCDu8; 32]],
@@ -376,7 +376,7 @@ mod tests {
             },
         );
 
-        index.insert(
+        manifest.insert(
             "photos/image.png",
             Entry {
                 addresses: vec![[0xEFu8; 32]],
@@ -386,27 +386,27 @@ mod tests {
             },
         );
 
-        index
+        manifest
     }
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let index = index();
-        let bytes = index.serialize();
-        let deserialized = Index::deserialize(&bytes).unwrap();
+        let manifest = manifest();
+        let bytes = manifest.serialize();
+        let deserialized = Manifest::deserialize(&bytes).unwrap();
 
-        assert_eq!(index, deserialized);
+        assert_eq!(manifest, deserialized);
     }
 
     #[test]
     fn serialize_deserialize_trashed_roundtrip() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
+        manifest.trash("photos/image.png").unwrap();
 
-        let deserialized = Index::deserialize(&index.serialize()).unwrap();
+        let deserialized = Manifest::deserialize(&manifest.serialize()).unwrap();
 
-        assert_eq!(index, deserialized);
+        assert_eq!(manifest, deserialized);
         assert_ne!(
             deserialized
                 .entries
@@ -420,98 +420,101 @@ mod tests {
     #[test]
     fn lock_unlock_roundtrip() {
         let key = [0x55u8; 32];
-        let index = index();
-        let locked = index.lock(&key).unwrap();
-        let unlocked = Index::unlock(&locked, &key).unwrap();
+        let manifest = manifest();
+        let locked = manifest.lock(&key).unwrap();
+        let unlocked = Manifest::unlock(&locked, &key).unwrap();
 
-        assert_eq!(index, unlocked);
+        assert_eq!(manifest, unlocked);
     }
 
     #[test]
     fn trash_and_restore_roundtrip() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
+        manifest.trash("photos/image.png").unwrap();
 
-        assert!(index.get("photos/image.png").is_none());
-        assert_ne!(index.entries.get("photos/image.png").unwrap().trashed, 0,);
+        assert!(manifest.get("photos/image.png").is_none());
+        assert_ne!(manifest.entries.get("photos/image.png").unwrap().trashed, 0,);
 
-        index.restore("photos/image.png").unwrap();
+        manifest.restore("photos/image.png").unwrap();
 
-        assert!(index.get("photos/image.png").is_some());
-        assert_eq!(index.entries.get("photos/image.png").unwrap().trashed, 0);
+        assert!(manifest.get("photos/image.png").is_some());
+        assert_eq!(manifest.entries.get("photos/image.png").unwrap().trashed, 0);
     }
 
     #[test]
     fn wrong_key() {
-        let locked = index().lock(&[0x55u8; 32]).unwrap();
+        let locked = manifest().lock(&[0x55u8; 32]).unwrap();
 
-        assert!(Index::unlock(&locked, &[0x00u8; 32]).is_err());
+        assert!(Manifest::unlock(&locked, &[0x00u8; 32]).is_err());
     }
 
     #[test]
-    fn empty_index() {
-        let index = Index::new();
+    fn empty_manifest() {
+        let manifest = Manifest::new();
         let key = [0x01u8; 32];
-        let locked = index.lock(&key).unwrap();
-        let unlocked = Index::unlock(&locked, &key).unwrap();
+        let locked = manifest.lock(&key).unwrap();
+        let unlocked = Manifest::unlock(&locked, &key).unwrap();
 
         assert_eq!(unlocked.entries.len(), 0);
     }
 
     #[test]
     fn get_returns_none_trashed() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
+        manifest.trash("photos/image.png").unwrap();
 
-        assert!(index.get("photos/image.png").is_none());
+        assert!(manifest.get("photos/image.png").is_none());
     }
 
     #[test]
     fn deterministic_address() {
         let public_key = [0xFFu8; 32];
 
-        assert_eq!(Index::address(&public_key), Index::address(&public_key));
+        assert_eq!(
+            Manifest::address(&public_key),
+            Manifest::address(&public_key)
+        );
     }
 
     #[test]
     fn different_addresses() {
-        let key1 = Index::address(&[0x01u8; 32]);
-        let key2 = Index::address(&[0x02u8; 32]);
+        let key1 = Manifest::address(&[0x01u8; 32]);
+        let key2 = Manifest::address(&[0x02u8; 32]);
 
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn addresses_excludes_trashed() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
+        manifest.trash("photos/image.png").unwrap();
 
         // Only the 2 chunks from `music/song.mp3`, ignored the one chunk of `photos/image.png`
-        assert_eq!(index.addresses().len(), 2);
-        assert_eq!(index.addresses_trashed().len(), 1);
+        assert_eq!(manifest.addresses().len(), 2);
+        assert_eq!(manifest.addresses_trashed().len(), 1);
     }
 
     #[test]
     fn purge_returns_trashed_addresses() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
+        manifest.trash("photos/image.png").unwrap();
 
-        let deleted = index.purge("photos/image.png").unwrap();
+        let deleted = manifest.purge("photos/image.png").unwrap();
 
         assert_eq!(deleted, vec![[0xEFu8; 32]]);
-        assert!(!index.entries.contains_key("photos/image.png"));
+        assert!(!manifest.entries.contains_key("photos/image.png"));
     }
 
     #[test]
     fn purge_skips_live_shared_addresses() {
-        let mut index = Index::new();
+        let mut manifest = Manifest::new();
         let shared_addr = [0xAAu8; 32];
 
-        index.insert(
+        manifest.insert(
             "a",
             Entry {
                 addresses: vec![shared_addr],
@@ -520,7 +523,7 @@ mod tests {
                 trashed: 0,
             },
         );
-        index.insert(
+        manifest.insert(
             "b",
             Entry {
                 addresses: vec![shared_addr],
@@ -529,40 +532,40 @@ mod tests {
                 trashed: 0,
             },
         );
-        index.trash("b").unwrap();
+        manifest.trash("b").unwrap();
 
-        let deleted = index.purge("b").unwrap();
+        let deleted = manifest.purge("b").unwrap();
 
         assert!(deleted.is_empty());
-        assert!(index.get("a").is_some());
+        assert!(manifest.get("a").is_some());
     }
 
     #[test]
     fn purge_rejects_live_entry() {
-        let mut index = index();
+        let mut manifest = manifest();
 
         // Cannot purge a live entry
-        assert!(index.purge("music/song.mp3").is_err());
+        assert!(manifest.purge("music/song.mp3").is_err());
     }
 
     #[test]
     fn purge_all_clears_trash() {
-        let mut index = index();
+        let mut manifest = manifest();
 
-        index.trash("photos/image.png").unwrap();
-        index.trash("music/song.mp3").unwrap();
+        manifest.trash("photos/image.png").unwrap();
+        manifest.trash("music/song.mp3").unwrap();
 
-        let deleted = index.purge_all();
+        let deleted = manifest.purge_all();
 
-        assert!(index.entries.is_empty());
+        assert!(manifest.entries.is_empty());
         assert_eq!(deleted.len(), 3); // 2 from song + 1 from image
     }
 
     #[test]
     fn insert_remove_roundtrip() {
-        let mut index = Index::new();
+        let mut manifest = Manifest::new();
 
-        index.insert(
+        manifest.insert(
             "file.txt",
             Entry {
                 addresses: vec![[0u8; 32]],
@@ -572,17 +575,17 @@ mod tests {
             },
         );
 
-        assert!(index.get("file.txt").is_some());
+        assert!(manifest.get("file.txt").is_some());
 
-        index.remove("file.txt");
+        manifest.remove("file.txt");
 
-        assert!(index.get("file.txt").is_none());
+        assert!(manifest.get("file.txt").is_none());
     }
 
     #[test]
     fn all_chunk_hashes() {
-        let index = index();
-        let hashes = index.addresses();
+        let manifest = manifest();
+        let hashes = manifest.addresses();
 
         // Sample has 2 + 1 = 3 chunk hashes
         assert_eq!(hashes.len(), 3);

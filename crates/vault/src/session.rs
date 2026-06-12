@@ -10,7 +10,7 @@ use crate::{
     storage::{
         self,
         chunk::{self, Chunks},
-        index::{self, Index, Properties},
+        manifest::{self, Manifest, Properties},
     },
 };
 
@@ -19,7 +19,7 @@ pub enum Error {
     Storage(storage::Error),
     Cipher(cipher::Error),
     Chunk(chunk::Error),
-    Index(index::Error),
+    Manifest(manifest::Error),
     NotFound,
     NotTrashed,
     AlreadyTrashed,
@@ -32,7 +32,7 @@ impl core::fmt::Display for Error {
             Self::Storage(e) => write!(f, "storage: {}", e),
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Chunk(e) => write!(f, "chunk: {}", e),
-            Self::Index(e) => write!(f, "index: {}", e),
+            Self::Manifest(e) => write!(f, "manifest: {}", e),
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
@@ -62,13 +62,13 @@ impl From<chunk::Error> for Error {
     }
 }
 
-impl From<index::Error> for Error {
-    fn from(value: index::Error) -> Self {
+impl From<manifest::Error> for Error {
+    fn from(value: manifest::Error) -> Self {
         match value {
-            index::Error::NotFound => Self::NotFound,
-            index::Error::NotTrashed => Self::NotTrashed,
-            index::Error::AlreadyTrashed => Self::AlreadyTrashed,
-            other => Self::Index(other),
+            manifest::Error::NotFound => Self::NotFound,
+            manifest::Error::NotTrashed => Self::NotTrashed,
+            manifest::Error::AlreadyTrashed => Self::AlreadyTrashed,
+            other => Self::Manifest(other),
         }
     }
 }
@@ -76,22 +76,22 @@ impl From<index::Error> for Error {
 pub struct Session<S: storage::Backend> {
     identity: Identity,
     storage: S,
-    index: Index,
+    manifest: Manifest,
 }
 
 impl<S: storage::Backend> Session<S> {
     pub fn new(identity: Identity, storage: S) -> Result<Self, Error> {
-        let index_key = Index::address(&identity.public_key_bytes());
-        let index = match storage.get(&index_key) {
-            Ok(blob) => Index::unlock(&blob, &identity.encryption_key)?,
-            Err(storage::Error::NotFound) => Index::new(),
+        let manifest_key = Manifest::address(&identity.public_key_bytes());
+        let manifest = match storage.get(&manifest_key) {
+            Ok(blob) => Manifest::unlock(&blob, &identity.encryption_key)?,
+            Err(storage::Error::NotFound) => Manifest::new(),
             Err(e) => return Err(Error::Storage(e)),
         };
 
         Ok(Self {
             identity,
             storage,
-            index,
+            manifest,
         })
     }
 
@@ -116,11 +116,11 @@ impl<S: storage::Backend> Session<S> {
         let chunk_count = hashes.len();
 
         // TODO: Handle unreferenced chunks on overwrite.
-        // For now, if an entry already exists, `put()` overwrites the index silently
+        // For now, if an entry already exists, `put()` overwrites the manifest silently
         // and leaves the old chunks unreferenced.
-        self.index.insert(
+        self.manifest.insert(
             path,
-            index::Entry {
+            manifest::Entry {
                 addresses: hashes,
                 size,
                 modified: SystemTime::now()
@@ -131,13 +131,13 @@ impl<S: storage::Backend> Session<S> {
             },
         );
 
-        self.flush_index()?;
+        self.flush_manifest()?;
 
         Ok(chunk_count)
     }
 
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
-        let entry = self.index.get(path).ok_or(Error::NotFound)?;
+        let entry = self.manifest.get(path).ok_or(Error::NotFound)?;
         let mut size = 0u64;
 
         for address in &entry.addresses {
@@ -155,46 +155,46 @@ impl<S: storage::Backend> Session<S> {
     }
 
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
-        self.index.trash(path)?;
-        self.flush_index()?;
+        self.manifest.trash(path)?;
+        self.flush_manifest()?;
 
         Ok(())
     }
 
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
-        self.index.restore(path)?;
-        self.flush_index()?;
+        self.manifest.restore(path)?;
+        self.flush_manifest()?;
 
         Ok(())
     }
 
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
-        let addresses = self.index.purge(path)?;
+        let addresses = self.manifest.purge(path)?;
 
         for address in &addresses {
             self.storage.delete(address)?;
         }
 
-        self.flush_index()?;
+        self.flush_manifest()?;
 
         Ok(())
     }
 
     pub fn cleanup(&mut self) -> Result<usize, Error> {
-        let addresses = self.index.purge_all();
+        let addresses = self.manifest.purge_all();
         let removed = addresses.len();
 
         for address in &addresses {
             self.storage.delete(address)?;
         }
 
-        self.flush_index()?;
+        self.flush_manifest()?;
 
         Ok(removed)
     }
 
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.index.trash(path)?;
+        self.manifest.trash(path)?;
         self.purge(path)?;
 
         Ok(())
@@ -202,7 +202,7 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn list(&self) -> Vec<&str> {
         let mut paths: Vec<&str> = self
-            .index
+            .manifest
             .entries
             .iter()
             .filter(|(_, v)| v.trashed == 0)
@@ -216,7 +216,7 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn list_trash(&self) -> Vec<&str> {
         let mut paths: Vec<&str> = self
-            .index
+            .manifest
             .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
@@ -229,8 +229,8 @@ impl<S: storage::Backend> Session<S> {
     }
 
     pub fn properties(&self, path: &str) -> Option<Properties> {
-        // Direct `entries` get instead of `self.index.get()` so the trashed entries are included
-        self.index.entries.get(path).map(|e| Properties {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        self.manifest.entries.get(path).map(|e| Properties {
             size: e.size,
             chunk_count: e.addresses.len(),
             modified: e.modified,
@@ -238,9 +238,9 @@ impl<S: storage::Backend> Session<S> {
         })
     }
 
-    fn flush_index(&self) -> Result<(), Error> {
-        let data = self.index.lock(&self.identity.encryption_key)?;
-        let hash = Index::address(&self.identity.public_key_bytes());
+    fn flush_manifest(&self) -> Result<(), Error> {
+        let data = self.manifest.lock(&self.identity.encryption_key)?;
+        let hash = Manifest::address(&self.identity.public_key_bytes());
 
         self.storage.overwrite(&hash, &data)?;
 
