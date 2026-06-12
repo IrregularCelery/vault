@@ -21,6 +21,8 @@ pub enum Error {
     Chunk(chunk::Error),
     Index(index::Error),
     NotFound,
+    NotTrashed,
+    AlreadyTrashed,
     Other(String),
 }
 
@@ -31,7 +33,9 @@ impl core::fmt::Display for Error {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Chunk(e) => write!(f, "chunk: {}", e),
             Self::Index(e) => write!(f, "index: {}", e),
-            Self::NotFound => write!(f, "file not found in vault"),
+            Self::NotFound => write!(f, "file not found"),
+            Self::NotTrashed => write!(f, "file is not in the trash"),
+            Self::AlreadyTrashed => write!(f, "file is already in the trash"),
             Self::Other(e) => write!(f, "{}", e),
         }
     }
@@ -60,7 +64,12 @@ impl From<chunk::Error> for Error {
 
 impl From<index::Error> for Error {
     fn from(value: index::Error) -> Self {
-        Self::Index(value)
+        match value {
+            index::Error::NotFound => Self::NotFound,
+            index::Error::NotTrashed => Self::NotTrashed,
+            index::Error::AlreadyTrashed => Self::AlreadyTrashed,
+            other => Self::Index(other),
+        }
     }
 }
 
@@ -111,7 +120,11 @@ impl<S: storage::Backend> Session<S> {
             index::Entry {
                 addresses: hashes,
                 size,
-                modified: Self::now_secs(),
+                modified: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                trashed: 0,
             },
         );
 
@@ -138,48 +151,79 @@ impl<S: storage::Backend> Session<S> {
         Ok(size)
     }
 
-    pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.index.remove(path).ok_or(Error::NotFound)?;
+    pub fn trash(&mut self, path: &str) -> Result<(), Error> {
+        self.index.trash(path)?;
         self.flush_index()?;
 
         Ok(())
     }
 
+    pub fn restore(&mut self, path: &str) -> Result<(), Error> {
+        self.index.restore(path)?;
+        self.flush_index()?;
+
+        Ok(())
+    }
+
+    pub fn purge(&mut self, path: &str) -> Result<(), Error> {
+        let addresses = self.index.purge(path)?;
+        // Could be a "Not a trashed entry, skipped" Fix this.
+
+        for address in &addresses {
+            self.storage.delete(address)?;
+        }
+
+        self.flush_index()?;
+
+        Ok(())
+    }
+
+    pub fn purge_all(&mut self) -> Result<usize, Error> {
+        let addresses = self.index.purge_all();
+        let removed = addresses.len();
+
+        for address in &addresses {
+            self.storage.delete(address)?;
+        }
+
+        self.flush_index()?;
+
+        Ok(removed)
+    }
+
+    pub fn delete(&mut self, path: &str) -> Result<(), Error> {
+        self.trash(path)?;
+        self.purge(path)?;
+
+        Ok(())
+    }
+
     pub fn list(&self) -> Vec<&str> {
-        let mut paths: Vec<&str> = self.index.entries.keys().map(|e| e.as_str()).collect();
+        let mut paths: Vec<&str> = self
+            .index
+            .entries
+            .iter()
+            .filter(|(_, v)| v.trashed == 0)
+            .map(|(k, _)| k.as_str())
+            .collect();
 
         paths.sort();
 
         paths
     }
 
-    // TODO: Refactor this. It shouldn't need to call storage::Backend::list()
-    // FIXME: This implementation is broken for shared storage backends. It only
-    // accounts for the current user's index, so it just deletes other users' index
-    // blobs and references chunks
-    pub fn cleanup(&self) -> Result<(usize /* removed */, usize /* kept */), Error> {
-        let mut referenced = self.index.addresses();
+    pub fn list_trash(&self) -> Vec<&str> {
+        let mut paths: Vec<&str> = self
+            .index
+            .entries
+            .iter()
+            .filter(|(_, v)| v.trashed != 0)
+            .map(|(k, _)| k.as_str())
+            .collect();
 
-        referenced.sort_unstable();
+        paths.sort();
 
-        let index_key = Index::address(&self.identity.public_key_bytes());
-        let hashes = self.storage.list()?;
-        let mut removed = 0;
-        let mut kept = 0;
-
-        for hash in hashes {
-            if hash == index_key || referenced.binary_search(&hash).is_ok() {
-                kept += 1;
-
-                continue;
-            }
-
-            self.storage.delete(&hash)?;
-
-            removed += 1;
-        }
-
-        Ok((removed, kept))
+        paths
     }
 
     fn flush_index(&self) -> Result<(), Error> {
@@ -189,13 +233,6 @@ impl<S: storage::Backend> Session<S> {
         self.storage.overwrite(&hash, &data)?;
 
         Ok(())
-    }
-
-    fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
     }
 }
 
@@ -333,17 +370,78 @@ mod tests {
     }
 
     #[test]
+    fn trash() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file.txt", b"data");
+
+        session.trash("file.txt").unwrap();
+
+        assert!(session.list().is_empty());
+        assert!(!session.storage.list().unwrap().is_empty());
+        assert_eq!(session.list_trash(), vec!["file.txt"]);
+    }
+
+    #[test]
+    fn restore() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file.txt", b"data");
+
+        session.trash("file.txt").unwrap();
+        session.restore("file.txt").unwrap();
+
+        assert_eq!(get_bytes(&session, "file.txt"), b"data");
+        assert!(session.list_trash().is_empty());
+    }
+
+    #[test]
+    fn purge() {
+        let mut session = session();
+
+        put_bytes(&mut session, "1.txt", b"keep this");
+        put_bytes(&mut session, "2.txt", b"delete this");
+
+        session.trash("2.txt").unwrap();
+
+        let blobs_before_purge = session.storage.list().unwrap().len();
+
+        session.purge("2.txt").unwrap();
+
+        assert!(session.list_trash().is_empty());
+        assert!(session.storage.list().unwrap().len() < blobs_before_purge);
+        assert_eq!(get_bytes(&session, "1.txt"), b"keep this");
+    }
+
+    #[test]
+    fn purge_all() {
+        let mut session = session();
+
+        put_bytes(&mut session, "1.txt", b"data 1");
+        put_bytes(&mut session, "2.txt", b"data 2");
+
+        session.trash("1.txt").unwrap();
+        session.trash("2.txt").unwrap();
+
+        let removed = session.purge_all().unwrap();
+
+        assert_eq!(removed, 2); // 1 chunk each
+        assert!(session.list_trash().is_empty());
+        assert!(session.list().is_empty());
+    }
+
+    #[test]
     fn delete() {
         let mut session = session();
 
-        put_bytes(&mut session, "1.txt", b"content 1");
-        put_bytes(&mut session, "2.txt", b"content 2");
+        put_bytes(&mut session, "file.txt", b"data");
 
-        assert_eq!(session.list(), vec!["1.txt", "2.txt"]);
+        session.delete("file.txt").unwrap();
 
-        session.delete("1.txt").unwrap();
+        assert!(session.list_trash().is_empty());
 
-        assert_eq!(session.list(), vec!["2.txt"]);
+        // file is permanently removed and cannot be restored
+        assert!(session.restore("file.txt").is_err());
     }
 
     #[test]
@@ -364,68 +462,6 @@ mod tests {
         match session.delete("nonexistent.txt") {
             Err(Error::NotFound) => {}
             other => panic!("expected `NotFound`, got {:?}", other),
-        }
-    }
-
-    #[ignore = "cleanup() is broken for shared storage"]
-    #[test]
-    fn cleanup() {
-        let mut session = session();
-
-        put_bytes(&mut session, "file", b"temporary data");
-
-        let blobs_before = session.storage.list().unwrap().len();
-
-        session.delete("file").unwrap();
-
-        let cleanup = session.cleanup().unwrap();
-
-        assert_eq!(cleanup.0 /* removed blobs */, 1);
-
-        let blobs_after = session.storage.list().unwrap().len();
-
-        assert!(blobs_after < blobs_before);
-    }
-
-    #[ignore = "cleanup() is broken for shared storage"]
-    #[test]
-    fn cleanup_preserves_shared_chunks() {
-        let path = temp_storage_path("cleanup_shared_chunks");
-        let phrase1 = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
-        let phrase2 = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
-
-        {
-            let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
-
-            put_bytes(&mut session, "file", b"shared content");
-        }
-
-        {
-            let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase2), storage).unwrap();
-
-            put_bytes(&mut session, "file", b"shared content");
-        }
-
-        {
-            let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
-
-            session.delete("shared.txt").unwrap();
-
-            let (removed, _) = session.cleanup().unwrap();
-
-            // Only user1's unique chunks should be removed, not the shared ones
-            assert_eq!(removed, 1);
-        }
-
-        {
-            let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase2), storage).unwrap();
-
-            assert_eq!(get_bytes(&session, "file"), b"shared content");
         }
     }
 
