@@ -350,6 +350,13 @@ impl Default for Index {
     }
 }
 
+pub struct Properties {
+    pub size: u64,
+    pub chunk_count: usize,
+    pub modified: u64,
+    pub trashed: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use gate::sys::macros::vec;

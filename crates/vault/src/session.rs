@@ -10,7 +10,7 @@ use crate::{
     storage::{
         self,
         chunk::{self, Chunks},
-        index::{self, Index},
+        index::{self, Index, Properties},
     },
 };
 
@@ -224,6 +224,16 @@ impl<S: storage::Backend> Session<S> {
         paths.sort();
 
         paths
+    }
+
+    pub fn properties(&self, path: &str) -> Option<Properties> {
+        // Direct `entries` get instead of `self.index.get()` so the trashed entries are included
+        self.index.entries.get(path).map(|e| Properties {
+            size: e.size,
+            chunk_count: e.addresses.len(),
+            modified: e.modified,
+            trashed: e.trashed,
+        })
     }
 
     fn flush_index(&self) -> Result<(), Error> {
