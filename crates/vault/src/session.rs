@@ -167,7 +167,6 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
         let addresses = self.index.purge(path)?;
-        // Could be a "Not a trashed entry, skipped" Fix this.
 
         for address in &addresses {
             self.storage.delete(address)?;
