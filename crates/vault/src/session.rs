@@ -178,7 +178,7 @@ impl<S: storage::Backend> Session<S> {
         Ok(())
     }
 
-    pub fn purge_all(&mut self) -> Result<usize, Error> {
+    pub fn cleanup(&mut self) -> Result<usize, Error> {
         let addresses = self.index.purge_all();
         let removed = addresses.len();
 
@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_all() {
+    fn cleanup() {
         let mut session = session();
 
         put_bytes(&mut session, "1.txt", b"data 1");
@@ -433,7 +433,7 @@ mod tests {
         session.trash("1.txt").unwrap();
         session.trash("2.txt").unwrap();
 
-        let removed = session.purge_all().unwrap();
+        let removed = session.cleanup().unwrap();
 
         assert_eq!(removed, 2); // 1 chunk each
         assert!(session.list_trash().is_empty());
