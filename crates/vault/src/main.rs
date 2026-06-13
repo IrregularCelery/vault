@@ -21,6 +21,7 @@ fn main() {
         Some("identity") => identity(&args[2..]),
         Some("put") => put(&args[2..]),
         Some("get") => get(&args[2..]),
+        Some("rename") => rename(&args[2..]),
         Some("trash") => trash(&args[2..]),
         Some("restore") => restore(&args[2..]),
         Some("purge") => purge(&args[2..]),
@@ -42,6 +43,9 @@ fn main() {
             );
             eprintln!(
                 "  vault get        <mnemonic_file> <vault_path> <output_file>        retrieve a file"
+            );
+            eprintln!(
+                "  vault rename     <mnemonic_file> <vault_path> <new_vault_path>     rename/move a file"
             );
             eprintln!(
                 "  vault trash      <mnemonic_file> <vault_path>                      trash a file (can be restored)"
@@ -167,6 +171,24 @@ fn get(args: &[String]) {
     });
 
     println!("Got `{}` to {}. ({} bytes)", args[1], args[2], bytes);
+}
+
+fn rename(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Usage: vault rename <mnemonic_file> <vault_path> <new_vault_path>");
+
+        return;
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session.rename(&args[1], &args[2]).unwrap_or_else(|e| {
+        eprintln!("Session failed while renaming `{}`: {}", args[1], e);
+
+        process::exit(1);
+    });
+
+    println!("Renamed `{}` to {}.", args[1], args[2]);
 }
 
 fn trash(args: &[String]) {

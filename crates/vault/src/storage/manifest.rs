@@ -1,11 +1,13 @@
-//! Encrpted manifest as blob index lookup
+//! Encrypted manifest as blob index lookup
 //!
 //! Binary serialization format (big-endian):
 //!
+//!   [2-bytes] version (u16)
 //!   [4-bytes] entry_count (u32)
 //!   each entry:
 //!     [2-bytes]           path_len (u16)
 //!     [path_len bytes]    path (UTF-8)
+//!     [60-bytes]          encrypted_pfk (per-file key, 12 (nonce) + 16 (encryption tag) + 32 (key))
 //!     [8-bytes]           size (u64)
 //!     [8-bytes]           modified (u64)
 //!     [8-bytes]           trashed (u64, 0 = live, unix timestapms = trashed)
@@ -25,12 +27,14 @@ use gate::{
     },
 };
 
+const MANIFEST_VERSION: u16 = 1;
 const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
 
 #[derive(Debug)]
 pub enum Error {
     Cipher(CipherError),
     Corrupted(&'static str),
+    UnsupportedVersion(u16),
     NotFound,
     NotTrashed,
     AlreadyTrashed,
@@ -41,6 +45,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::Cipher(e) => write!(f, "cipher: {}", e),
             Error::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
+            Error::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {}", v),
             Error::NotFound => write!(f, "file not found"),
             Error::NotTrashed => write!(f, "file is not in the trash"),
             Error::AlreadyTrashed => write!(f, "file is already in the trash"),
@@ -56,6 +61,7 @@ impl From<CipherError> for Error {
 
 #[derive(Debug, PartialEq)]
 pub struct Entry {
+    pub encrypted_pfk: [u8; 60],
     pub addresses: Vec<[u8; 32]>,
     pub size: u64,
     pub modified: u64,
@@ -74,7 +80,7 @@ impl Manifest {
         }
     }
 
-    pub fn insert(&mut self, path: impl Into<String>, entry: Entry) {
+    pub fn insert(&mut self, path: &str, entry: Entry) {
         self.entries.insert(path.into(), entry);
     }
 
@@ -96,6 +102,14 @@ impl Manifest {
             .filter(|e| e.trashed != 0)
             .flat_map(|e| e.addresses.iter().copied())
             .collect()
+    }
+
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
+
+        self.entries.insert(new_path.into(), entry);
+
+        Ok(())
     }
 
     pub fn remove(&mut self, path: &str) -> Option<Entry> {
@@ -173,13 +187,40 @@ impl Manifest {
     }
 
     pub fn address(public_key: &[u8; 32]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(12 + 32); // 12-bytes for the DOMAIN_MANIFEST size
+        let mut input = Vec::with_capacity(DOMAIN_MANIFEST.len() + 32);
 
         input.extend_from_slice(DOMAIN_MANIFEST);
         input.extend_from_slice(public_key);
 
         // storage key for the manifest blob
         *blake3::hash(&input).as_bytes()
+    }
+
+    pub fn derive_pfk(encryption_key: &[u8; 32], input: &[u8]) -> [u8; 32] {
+        *blake3::keyed_hash(encryption_key, input).as_bytes()
+    }
+
+    pub fn encrypt_pfk(pfk: &[u8; 32], encryption_key: &[u8; 32]) -> Result<[u8; 60], Error> {
+        let encrypted = encrypt(encryption_key, pfk)?;
+        let mut array = [0u8; 60];
+
+        array.copy_from_slice(&encrypted);
+
+        Ok(array)
+    }
+
+    pub fn decrypt_pfk(pfk: &[u8], encryption_key: &[u8; 32]) -> Result<[u8; 32], Error> {
+        let decrypted = decrypt(encryption_key, pfk)?;
+
+        if decrypted.len() != 32 {
+            return Err(Error::Corrupted("invalid length for per-file key"));
+        }
+
+        let mut key = [0u8; 32];
+
+        key.copy_from_slice(&decrypted);
+
+        Ok(key)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -195,6 +236,7 @@ impl Manifest {
 
         let mut buf = Vec::new();
 
+        write_u16(&mut buf, MANIFEST_VERSION);
         write_u32(&mut buf, self.entries.len() as u32);
 
         for (path, entry) in &self.entries {
@@ -203,6 +245,7 @@ impl Manifest {
             write_u16(&mut buf, path_bytes.len() as u16);
 
             buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&entry.encrypted_pfk);
 
             write_u64(&mut buf, entry.size);
             write_u64(&mut buf, entry.modified);
@@ -266,6 +309,22 @@ impl Manifest {
             Ok(u64::from_be_bytes(bytes))
         }
 
+        fn read_bytes<const N: usize>(data: &[u8], current: &mut usize) -> Result<[u8; N], Error> {
+            let end = *current + N;
+
+            if end > data.len() {
+                return Err(Error::Corrupted("unexpected end reading bytes"));
+            }
+
+            let bytes = data[*current..end]
+                .try_into()
+                .map_err(|_| Error::Corrupted("failed to convert to array"))?;
+
+            *current = end;
+
+            Ok(bytes)
+        }
+
         fn read_str(data: &[u8], current: &mut usize, len: usize) -> Result<String, Error> {
             let end = *current + len;
 
@@ -299,12 +358,20 @@ impl Manifest {
         }
 
         let mut current = 0usize;
+        let version = read_u16(data, &mut current)?;
+
+        // NOTE: If we ever bump the version, this should gracefully handle data migration.
+        if version != MANIFEST_VERSION {
+            return Err(Error::UnsupportedVersion(version));
+        }
+
         let entry_count = read_u32(data, &mut current)? as usize;
         let mut entries = BTreeMap::new();
 
         for _ in 0..entry_count {
             let path_len = read_u16(data, &mut current)? as usize;
             let path = read_str(data, &mut current, path_len)?;
+            let encrypted_pfk = read_bytes(data, &mut current)?; // 12 (nonce) + 16 (tag) + 32
             let size = read_u64(data, &mut current)?;
             let modified = read_u64(data, &mut current)?;
             let trashed = read_u64(data, &mut current)?;
@@ -320,6 +387,7 @@ impl Manifest {
             entries.insert(
                 path,
                 Entry {
+                    encrypted_pfk,
                     addresses,
                     size,
                     modified,
@@ -369,6 +437,7 @@ mod tests {
         manifest.insert(
             "music/song.mp3",
             Entry {
+                encrypted_pfk: [0x12; 60],
                 addresses: vec![[0xABu8; 32], [0xCDu8; 32]],
                 size: 5_000_000, // 5MB > 4MiB hence the two chunks
                 modified: 1_700_000_000,
@@ -379,6 +448,7 @@ mod tests {
         manifest.insert(
             "photos/image.png",
             Entry {
+                encrypted_pfk: [0x12; 60],
                 addresses: vec![[0xEFu8; 32]],
                 size: 2_048,
                 modified: 1_710_000_000,
@@ -418,6 +488,28 @@ mod tests {
     }
 
     #[test]
+    fn insert_remove_roundtrip() {
+        let mut manifest = Manifest::new();
+
+        manifest.insert(
+            "file.txt",
+            Entry {
+                encrypted_pfk: [0x12; 60],
+                addresses: vec![[0u8; 32]],
+                size: 100,
+                modified: 0,
+                trashed: 0,
+            },
+        );
+
+        assert!(manifest.get("file.txt").is_some());
+
+        manifest.remove("file.txt");
+
+        assert!(manifest.get("file.txt").is_none());
+    }
+
+    #[test]
     fn lock_unlock_roundtrip() {
         let key = [0x55u8; 32];
         let manifest = manifest();
@@ -443,6 +535,45 @@ mod tests {
     }
 
     #[test]
+    fn pfk_encrypt_decrypt_roundtrip() {
+        let encryption_key = [0x69u8; 32];
+        let path = "photos/image.png";
+        let pfk = Manifest::derive_pfk(&encryption_key, path.as_bytes());
+        let encrypted = Manifest::encrypt_pfk(&pfk, &encryption_key).unwrap();
+        let decrypted = Manifest::decrypt_pfk(&encrypted, &encryption_key).unwrap();
+
+        assert_eq!(pfk, decrypted);
+    }
+
+    #[test]
+    fn pfk_wrong_key() {
+        let encryption_key = [0x69u8; 32];
+        let path = "photos/image.png";
+        let pfk = Manifest::derive_pfk(&encryption_key, path.as_bytes());
+        let encrypted = Manifest::encrypt_pfk(&pfk, &encryption_key).unwrap();
+        let decrypted = Manifest::decrypt_pfk(&encrypted, &[0x67; 32]);
+
+        assert!(decrypted.is_err());
+    }
+
+    #[test]
+    fn version_mismatch() {
+        let manifest = manifest();
+        let mut bytes = manifest.serialize();
+
+        // Change the version bytes
+        bytes[0] = 0xFF;
+        bytes[1] = 0xFF;
+
+        let deserialized = Manifest::deserialize(&bytes);
+
+        assert!(matches!(
+            deserialized,
+            Err(Error::UnsupportedVersion(0xFFFF))
+        ));
+    }
+
+    #[test]
     fn wrong_key() {
         let locked = manifest().lock(&[0x55u8; 32]).unwrap();
 
@@ -457,6 +588,26 @@ mod tests {
         let unlocked = Manifest::unlock(&locked, &key).unwrap();
 
         assert_eq!(unlocked.entries.len(), 0);
+    }
+
+    #[test]
+    fn rename() {
+        let mut manifest = manifest();
+
+        manifest
+            .rename("photos/image.png", "photos/image_renamed.png")
+            .unwrap();
+
+        assert!(manifest.get("photos/image.png").is_none());
+        assert!(manifest.get("photos/image_renamed.png").is_some());
+    }
+
+    #[test]
+    fn rename_not_found() {
+        let mut manifest = manifest();
+        let renamed = manifest.rename("nonexistent.txt", "nonexistent_renamed.txt");
+
+        assert!(matches!(renamed, Err(Error::NotFound)));
     }
 
     #[test]
@@ -517,6 +668,7 @@ mod tests {
         manifest.insert(
             "a",
             Entry {
+                encrypted_pfk: [0x12; 60],
                 addresses: vec![shared_addr],
                 size: 1,
                 modified: 0,
@@ -526,6 +678,7 @@ mod tests {
         manifest.insert(
             "b",
             Entry {
+                encrypted_pfk: [0x12; 60],
                 addresses: vec![shared_addr],
                 size: 1,
                 modified: 0,
@@ -559,27 +712,6 @@ mod tests {
 
         assert!(manifest.entries.is_empty());
         assert_eq!(deleted.len(), 3); // 2 from song + 1 from image
-    }
-
-    #[test]
-    fn insert_remove_roundtrip() {
-        let mut manifest = Manifest::new();
-
-        manifest.insert(
-            "file.txt",
-            Entry {
-                addresses: vec![[0u8; 32]],
-                size: 100,
-                modified: 0,
-                trashed: 0,
-            },
-        );
-
-        assert!(manifest.get("file.txt").is_some());
-
-        manifest.remove("file.txt");
-
-        assert!(manifest.get("file.txt").is_none());
     }
 
     #[test]

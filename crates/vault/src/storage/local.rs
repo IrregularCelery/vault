@@ -1,7 +1,7 @@
 //! Storage layout is as follows: (Content-Addressed Storage)
 //!
 //!   [root]/a1/b2/c3d4e5...
-//!                   ^- encrpyted blob file
+//!                   ^- encrypted blob file
 //!
 //! Blob writes are atomic
 
@@ -202,10 +202,9 @@ mod tests {
     fn not_found() {
         let storage = temp_storage("not_found");
         let hash = [2; 32];
-        match storage.get(&hash) {
-            Err(Error::NotFound) => {}
-            other => panic!("expected NotFound, got {:?}", other),
-        }
+        let got = storage.get(&hash);
+
+        assert!(matches!(got, Err(Error::NotFound)));
     }
 
     #[test]
