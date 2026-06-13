@@ -743,6 +743,7 @@ pub mod ed25519 {
 }
 
 pub mod blake3 {
+    pub use blake3::Hasher;
     pub use blake3::hash;
     pub use blake3::keyed_hash;
 }
