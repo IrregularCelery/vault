@@ -8,6 +8,7 @@ pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // Each chunk's max capacity is 4
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    UnexpectedEof,
     Other(&'static str),
 }
 
@@ -15,6 +16,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Io(e) => write!(f, "I/O: {}", e),
+            Error::UnexpectedEof => write!(f, "unexpected end of file"),
             Error::Other(e) => write!(f, "{}", e),
         }
     }

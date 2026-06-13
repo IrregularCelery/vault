@@ -196,8 +196,8 @@ impl Manifest {
         *blake3::hash(&input).as_bytes()
     }
 
-    pub fn derive_pfk(encryption_key: &[u8; 32], input: &[u8]) -> [u8; 32] {
-        *blake3::keyed_hash(encryption_key, input).as_bytes()
+    pub fn derive_pfk(encryption_key: &[u8; 32], content_hash: &[u8; 32]) -> [u8; 32] {
+        *blake3::keyed_hash(encryption_key, content_hash).as_bytes()
     }
 
     pub fn encrypt_pfk(pfk: &[u8; 32], encryption_key: &[u8; 32]) -> Result<[u8; 60], Error> {
@@ -537,8 +537,8 @@ mod tests {
     #[test]
     fn pfk_encrypt_decrypt_roundtrip() {
         let encryption_key = [0x69u8; 32];
-        let path = "photos/image.png";
-        let pfk = Manifest::derive_pfk(&encryption_key, path.as_bytes());
+        let content_hash = [0x12u8; 32];
+        let pfk = Manifest::derive_pfk(&encryption_key, &content_hash);
         let encrypted = Manifest::encrypt_pfk(&pfk, &encryption_key).unwrap();
         let decrypted = Manifest::decrypt_pfk(&encrypted, &encryption_key).unwrap();
 
@@ -548,8 +548,8 @@ mod tests {
     #[test]
     fn pfk_wrong_key() {
         let encryption_key = [0x69u8; 32];
-        let path = "photos/image.png";
-        let pfk = Manifest::derive_pfk(&encryption_key, path.as_bytes());
+        let content_hash = [0x12u8; 32];
+        let pfk = Manifest::derive_pfk(&encryption_key, &content_hash);
         let encrypted = Manifest::encrypt_pfk(&pfk, &encryption_key).unwrap();
         let decrypted = Manifest::decrypt_pfk(&encrypted, &[0x67; 32]);
 

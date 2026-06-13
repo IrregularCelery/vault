@@ -1,8 +1,11 @@
-use gate::sys::{
-    io,
-    string::{String, ToString},
-    time::{SystemTime, UNIX_EPOCH},
-    vec::Vec,
+use gate::{
+    crypto::blake3,
+    sys::{
+        io,
+        string::String,
+        time::{SystemTime, UNIX_EPOCH},
+        vec::Vec,
+    },
 };
 
 use crate::{
@@ -20,6 +23,7 @@ pub enum Error {
     Cipher(cipher::Error),
     Chunk(chunk::Error),
     Manifest(manifest::Error),
+    Io(io::Error),
     NotFound,
     NotTrashed,
     AlreadyTrashed,
@@ -33,6 +37,7 @@ impl core::fmt::Display for Error {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Chunk(e) => write!(f, "chunk: {}", e),
             Self::Manifest(e) => write!(f, "manifest: {}", e),
+            Error::Io(e) => write!(f, "I/O: {}", e),
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
@@ -95,24 +100,60 @@ impl<S: storage::Backend> Session<S> {
         })
     }
 
-    pub fn put(&mut self, path: &str, reader: impl io::Read, size: u64) -> Result<usize, Error> {
-        let pfk = Manifest::derive_pfk(&self.identity.encryption_key, path.as_bytes());
+    pub fn put(
+        &mut self,
+        path: &str,
+        mut reader: impl io::Read + io::Seek,
+        size: u64,
+    ) -> Result<usize, Error> {
+        // NOTE: I don't really like this two-pass design:
+        // The goal was to have a single-pass streaming, full per-user dedup,
+        // and a no-re-encryption sharing `put()` method.
+        // But with per-file encryption key, I couldn't find a better way to have them all.
+        // The single-pass approach I originally had (COMMIT LINK)
+        // had a big issue with test `same_file_different_paths_same_user`.
+        // When uploading a file that had identical chunks to what the user already had,
+        // re-uploading those chunks would be skipped, but a different PFK was stored for the entry.
+        // Therefore, the latter file couldn't be decrypted.
+
+        let hashes = {
+            let mut chunks = Chunks::new(&mut reader);
+            let mut hashes = Vec::new();
+
+            while let Some(chunk) = chunks.next_chunk()? {
+                // Addressed by identity key (not PFK) to preserve per-user chunk deduplication
+                let hash = chunk.address(&self.identity.encryption_key);
+
+                hashes.push(hash);
+            }
+
+            hashes
+        };
+
+        let mut hasher = blake3::Hasher::new();
+
+        for hash in &hashes {
+            hasher.update(hash);
+        }
+
+        let pfk = Manifest::derive_pfk(&self.identity.encryption_key, &hasher.finalize().into());
         let encrypted_pfk = Manifest::encrypt_pfk(&pfk, &self.identity.encryption_key)?;
-        let mut chunks = Chunks::new(reader);
-        let mut hashes = Vec::new();
 
-        while let Some(chunk) = chunks.next_chunk()? {
-            // Addressed by identity key (not PFK) to preserve per-user chunk deduplication
-            let hash = chunk.address(&self.identity.encryption_key);
+        reader.seek(io::SeekFrom::Start(0)).map_err(Error::Io)?;
 
-            hashes.push(hash);
+        {
+            let mut chunks = Chunks::new(&mut reader);
 
-            // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
-            // though not entirely useless since we can avoid calling cipher::encrypt()
-            if !self.storage.exists(&hash)? {
-                let encrypted = cipher::encrypt(&pfk, chunk.data)?;
+            for hash in &hashes {
+                let chunk = chunks.next_chunk()?.ok_or(chunk::Error::UnexpectedEof)?;
 
-                self.storage.put(&hash, &encrypted)?;
+                // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
+                // though not entirely useless since we can avoid calling cipher::encrypt()
+                if !self.storage.exists(hash)? {
+                    let encrypted = cipher::encrypt(&pfk, chunk.data)?;
+
+                    self.storage.put(hash, &encrypted)?;
+                }
             }
         }
 
@@ -134,7 +175,6 @@ impl<S: storage::Backend> Session<S> {
                 trashed: 0,
             },
         );
-
         self.flush_manifest()?;
 
         Ok(chunk_count)
@@ -149,9 +189,7 @@ impl<S: storage::Backend> Session<S> {
             let blob = self.storage.get(address)?;
             let plaintext = cipher::decrypt(&pfk, &blob)?;
 
-            writer
-                .write_all(&plaintext)
-                .map_err(|e| Error::Other(e.to_string()))?;
+            writer.write_all(&plaintext).map_err(Error::Io)?;
 
             size += plaintext.len() as u64;
         }
@@ -300,7 +338,9 @@ mod tests {
     }
 
     fn put_bytes(session: &mut Session<local::Storage>, path: &str, data: &[u8]) {
-        session.put(path, data, data.len() as u64).unwrap();
+        session
+            .put(path, io::Cursor::new(data), data.len() as u64)
+            .unwrap();
     }
 
     fn get_bytes(session: &Session<local::Storage>, path: &str) -> Vec<u8> {
@@ -343,7 +383,7 @@ mod tests {
         assert_eq!(get_bytes(&session, "notes/empty.txt"), b"");
     }
 
-    #[ignore = "causes unreferenced chunk. see test `different_files_same_path_same_users`"]
+    #[ignore = "causes unreferenced chunks. see test `different_files_same_path_same_users`."]
     #[test]
     fn overwrite() {
         let mut session = session();
@@ -544,7 +584,6 @@ mod tests {
         assert_eq!(get_bytes(&session, "file"), b"same content");
     }
 
-    #[ignore = "broken: shared chunks but different PFKs causes decryption failure for file2"]
     #[test]
     fn same_file_different_paths_same_user() {
         let mut session = session();
@@ -561,7 +600,7 @@ mod tests {
         assert_eq!(get_bytes(&session, "file1"), get_bytes(&session, "file2"));
     }
 
-    #[ignore = "causes unreferenced chunk."]
+    #[ignore = "causes unreferenced chunks."]
     #[test]
     fn different_files_same_path_same_user() {
         let mut session = session();
@@ -575,7 +614,7 @@ mod tests {
         let blobs_after_second = session.storage.list().unwrap().len();
 
         // TODO: This is currently true, but shouldn't be the case because it means there are
-        // unreferenced chunks.
+        // unreferenced chunks. see `Session::put()` `TODO` message.
         assert!(blobs_after_second > blobs_after_first);
         assert_eq!(get_bytes(&session, "file"), b"different content");
     }
