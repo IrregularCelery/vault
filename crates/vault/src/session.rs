@@ -27,6 +27,7 @@ pub enum Error {
     NotFound,
     NotTrashed,
     AlreadyTrashed,
+    Tampered(String),
     Other(String),
 }
 
@@ -41,6 +42,7 @@ impl core::fmt::Display for Error {
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
+            Self::Tampered(e) => write!(f, "tampered blob: {}", e),
             Self::Other(e) => write!(f, "{}", e),
         }
     }
@@ -57,7 +59,10 @@ impl From<storage::Error> for Error {
 
 impl From<cipher::Error> for Error {
     fn from(value: cipher::Error) -> Self {
-        Self::Cipher(value)
+        match value {
+            cipher::Error::InvalidSignature => Self::Tampered("unknown".into()),
+            other => Self::Cipher(other),
+        }
     }
 }
 
@@ -88,7 +93,15 @@ impl<S: storage::Backend> Session<S> {
     pub fn new(identity: Identity, storage: S) -> Result<Self, Error> {
         let manifest_key = Manifest::address(&identity.public_key_bytes());
         let manifest = match storage.get(&manifest_key) {
-            Ok(blob) => Manifest::unlock(&blob, &identity.encryption_key)?,
+            Ok(blob) => Manifest::unlock(
+                &blob,
+                &identity.encryption_key,
+                |message, signature_bytes| identity.verify(message, signature_bytes),
+            )
+            .map_err(|e| match e {
+                manifest::Error::Tampered => Error::Tampered("manifest".into()),
+                other => Error::Manifest(other),
+            })?,
             Err(storage::Error::NotFound) => Manifest::new(),
             Err(e) => return Err(Error::Storage(e)),
         };
@@ -110,7 +123,7 @@ impl<S: storage::Backend> Session<S> {
         // The goal was to have a single-pass streaming, full per-user dedup,
         // and a no-re-encryption sharing `put()` method.
         // But with per-file encryption key, I couldn't find a better way to have them all.
-        // The single-pass approach I originally had (COMMIT LINK)
+        // The single-pass approach I originally had (https://github.com/IrregularCelery/vault/commit/0db9b73)
         // had a big issue with test `same_file_different_paths_same_user`.
         // When uploading a file that had identical chunks to what the user already had,
         // re-uploading those chunks would be skipped, but a different PFK was stored for the entry.
@@ -150,7 +163,8 @@ impl<S: storage::Backend> Session<S> {
                 // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
                 // though not entirely useless since we can avoid calling cipher::encrypt()
                 if !self.storage.exists(hash)? {
-                    let encrypted = cipher::encrypt(&pfk, chunk.data)?;
+                    let encrypted =
+                        cipher::lock(&pfk, chunk.data, |message| self.identity.sign(message))?;
 
                     self.storage.put(hash, &encrypted)?;
                 }
@@ -187,7 +201,13 @@ impl<S: storage::Backend> Session<S> {
 
         for address in &entry.addresses {
             let blob = self.storage.get(address)?;
-            let plaintext = cipher::decrypt(&pfk, &blob)?;
+            let plaintext = cipher::unlock(&pfk, &blob, |message, signature_bytes| {
+                self.identity.verify(message, signature_bytes)
+            })
+            .map_err(|e| match e {
+                cipher::Error::InvalidSignature => Error::Tampered(path.into()),
+                other => Error::Cipher(other),
+            })?;
 
             writer.write_all(&plaintext).map_err(Error::Io)?;
 
@@ -288,8 +308,65 @@ impl<S: storage::Backend> Session<S> {
         })
     }
 
+    pub fn verify(&self, path: &str) -> Result<(), Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
+
+        self.verify_entry(path, entry)
+    }
+
+    pub fn verify_all(&self) -> Vec<String> {
+        let mut tampered = Vec::new();
+        let manifest_hash = Manifest::address(&self.identity.public_key_bytes());
+
+        // Check the manifest blob itself
+        if let Ok(blob) = self.storage.get(&manifest_hash)
+            && Manifest::unlock(
+                &blob,
+                &self.identity.encryption_key,
+                |message, signature_bytes| self.identity.verify(message, signature_bytes),
+            )
+            .is_err()
+        {
+            tampered.push("manifest".into());
+        }
+
+        for (path, entry) in &self.manifest.entries {
+            if self.verify_entry(path, entry).is_err() {
+                tampered.push(path.clone());
+            }
+        }
+
+        tampered.sort();
+        tampered.dedup();
+
+        tampered
+    }
+
+    fn verify_entry(&self, path: &str, entry: &manifest::Entry) -> Result<(), Error> {
+        let pfk = Manifest::decrypt_pfk(&entry.encrypted_pfk, &self.identity.encryption_key)?;
+
+        for address in &entry.addresses {
+            let blob = self.storage.get(address)?;
+
+            cipher::unlock(&pfk, &blob, |message, signature_bytes| {
+                self.identity.verify(message, signature_bytes)
+            })
+            .map_err(|e| match e {
+                cipher::Error::InvalidSignature => Error::Tampered(path.into()),
+                other => Error::Cipher(other),
+            })?;
+        }
+
+        Ok(())
+    }
+
     fn flush_manifest(&self) -> Result<(), Error> {
-        let data = self.manifest.lock(&self.identity.encryption_key)?;
+        let data = self
+            .manifest
+            .lock(&self.identity.encryption_key, |message| {
+                self.identity.sign(message)
+            })?;
         let hash = Manifest::address(&self.identity.public_key_bytes());
 
         self.storage.overwrite(&hash, &data)?;
@@ -364,13 +441,36 @@ mod tests {
     #[test]
     fn put_get_large_data_roundtrip() {
         let mut session = session();
-        let data: Vec<u8> = (0u8..=255).cycle().take(CHUNK_SIZE * 2 + 500_000).collect();
+        let data = [
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xBBu8; CHUNK_SIZE],
+            vec![0xCCu8; CHUNK_SIZE / 2],
+        ]
+        .concat();
 
         put_bytes(&mut session, "large", &data);
 
         let blobs = session.storage.list().unwrap().len();
 
-        assert_eq!(blobs, 3);
+        assert_eq!(blobs, 4); // 3 data blobs + 1 manifest blob
+        assert_eq!(get_bytes(&session, "large"), data);
+    }
+
+    #[test]
+    fn deduplicate_chunks() {
+        let mut session = session();
+        let data = [
+            vec![0xAAu8; chunk::CHUNK_SIZE],
+            vec![0xAAu8; chunk::CHUNK_SIZE],
+            vec![0xBBu8; chunk::CHUNK_SIZE / 2],
+        ]
+        .concat();
+
+        put_bytes(&mut session, "large", &data);
+
+        let blobs = session.storage.list().unwrap().len();
+
+        assert_eq!(blobs, 3); // The file has 3 blobs but two are identical, so 2 + 1 for manifest
         assert_eq!(get_bytes(&session, "large"), data);
     }
 
@@ -403,30 +503,6 @@ mod tests {
         session.rename("old/file", "new/file").unwrap();
 
         assert_eq!(get_bytes(&session, "new/file"), b"data");
-    }
-
-    #[test]
-    fn only_uploads_changed_chunks() {
-        let mut session = session();
-
-        let chunk_a = vec![0xAAu8; CHUNK_SIZE];
-        let chunk_b = vec![0xBBu8; CHUNK_SIZE];
-        let original: Vec<u8> = [chunk_a.clone(), chunk_b].concat();
-
-        put_bytes(&mut session, "file", &original);
-
-        let blobs_after_first = session.storage.list().unwrap().len();
-
-        // Since `chunk_a` is identical, it should not be re-uploaded
-        let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
-        let updated: Vec<u8> = [chunk_a, chunk_b2].concat();
-
-        put_bytes(&mut session, "file", &updated);
-
-        let blobs_after_second = session.storage.list().unwrap().len();
-
-        // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
-        assert_eq!(blobs_after_second, blobs_after_first + 1);
     }
 
     #[test]
@@ -505,6 +581,30 @@ mod tests {
     }
 
     #[test]
+    fn only_uploads_changed_chunks() {
+        let mut session = session();
+
+        let chunk_a = vec![0xAAu8; CHUNK_SIZE];
+        let chunk_b = vec![0xBBu8; CHUNK_SIZE];
+        let original: Vec<u8> = [chunk_a.clone(), chunk_b].concat();
+
+        put_bytes(&mut session, "file", &original);
+
+        let blobs_after_first = session.storage.list().unwrap().len();
+
+        // Since `chunk_a` is identical, it should not be re-uploaded
+        let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
+        let updated: Vec<u8> = [chunk_a, chunk_b2].concat();
+
+        put_bytes(&mut session, "file", &updated);
+
+        let blobs_after_second = session.storage.list().unwrap().len();
+
+        // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
+        assert_eq!(blobs_after_second, blobs_after_first + 1);
+    }
+
+    #[test]
     fn not_found() {
         let session = session();
         let mut buf = Vec::new();
@@ -541,6 +641,150 @@ mod tests {
 
             assert_eq!(get_bytes(&session, "persistant.txt"), b"persistent data");
         }
+    }
+
+    #[test]
+    fn verify_all() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file1", b"clean data");
+        put_bytes(&mut session, "file2", b"more clean data");
+
+        assert!(session.verify_all().is_empty());
+    }
+
+    #[test]
+    fn verify_all_empty_vault() {
+        let session = session();
+
+        assert!(session.verify_all().is_empty());
+    }
+
+    #[test]
+    fn verify_all_tampered_chunk() {
+        let path = temp_storage_path("verify_all_tampered_chunk");
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+
+        put_bytes(&mut session, "file", b"important data");
+
+        let entry = session.manifest.entries.get("file").unwrap();
+        let address = entry.addresses[0];
+        let mut blob = session.storage.get(&address).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        session.storage.overwrite(&address, &blob).unwrap();
+
+        let tampared = session.verify_all();
+
+        assert!(tampared.contains(&"file".into()));
+    }
+
+    #[test]
+    fn verify_all_tampered_error() {
+        let path = temp_storage_path("verify_all_tampered_error");
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+
+        put_bytes(&mut session, "secret.txt", b"secret");
+
+        let entry = session.manifest.entries.get("secret.txt").unwrap();
+        let address = entry.addresses[0];
+        let mut blob = session.storage.get(&address).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        session.storage.overwrite(&address, &blob).unwrap();
+
+        let mut buf = Vec::new();
+        let result = session.get("secret.txt", &mut buf);
+
+        assert!(matches!(result, Err(Error::Tampered(_))));
+    }
+
+    #[test]
+    fn verify_all_includes_trashed_entries() {
+        let path = temp_storage_path("verify_trashed");
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+
+        put_bytes(&mut session, "trashed.txt", b"will be trashed");
+
+        session.trash("trashed.txt").unwrap();
+
+        // Corrupt the trashed chunk
+        let entry = session.manifest.entries.get("trashed.txt").unwrap();
+        let address = entry.addresses[0];
+        let mut blob = session.storage.get(&address).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        session.storage.overwrite(&address, &blob).unwrap();
+
+        let tampared = session.verify_all();
+
+        assert!(tampared.contains(&"trashed.txt".into()));
+    }
+
+    #[test]
+    fn verify_all_deduplicates_multi_chunk_path() {
+        let path = temp_storage_path("verify_dedup");
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
+
+        put_bytes(&mut session, "large", &data);
+
+        // Corrupt both chunks
+        let entry = session.manifest.entries.get("large").unwrap();
+        let addresses = entry.addresses.clone();
+
+        for address in &addresses {
+            let mut blob = session.storage.get(address).unwrap();
+
+            blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+            session.storage.overwrite(address, &blob).unwrap();
+        }
+
+        let tampared = session.verify_all();
+
+        // Path should appear exactly once despite two tampared chunks
+        assert_eq!(tampared.iter().filter(|p| p.as_str() == "large").count(), 1);
+    }
+
+    #[test]
+    fn verify_all_shared_tampered_chunk() {
+        let path = temp_storage_path("verify_shared_tampered");
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon about";
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+
+        put_bytes(&mut session, "file1", b"shared content");
+        put_bytes(&mut session, "file2", b"shared content");
+
+        let entry = session.manifest.entries.get("file1").unwrap();
+        let address = entry.addresses[0];
+        let mut blob = session.storage.get(&address).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        session.storage.overwrite(&address, &blob).unwrap();
+
+        let tampared = session.verify_all();
+
+        assert!(tampared.contains(&"file1".into()));
+        assert!(tampared.contains(&"file2".into()));
     }
 
     #[test]

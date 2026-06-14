@@ -15,13 +15,13 @@
 //!     each address:
 //!       [32-bytes]        hash
 
-use crate::crypto::cipher::{Error as CipherError, decrypt, encrypt};
+use crate::crypto::cipher::{self, decrypt, encrypt};
 
 use gate::{
     crypto::blake3,
     sys::{
         collections::btree_map::BTreeMap,
-        string::{String, ToString},
+        string::String,
         time::{SystemTime, UNIX_EPOCH},
         vec::Vec,
     },
@@ -32,30 +32,35 @@ const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
 
 #[derive(Debug)]
 pub enum Error {
-    Cipher(CipherError),
+    Cipher(cipher::Error),
     Corrupted(&'static str),
     UnsupportedVersion(u16),
     NotFound,
     NotTrashed,
     AlreadyTrashed,
+    Tampered,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::Cipher(e) => write!(f, "cipher: {}", e),
-            Error::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {}", v),
-            Error::NotFound => write!(f, "file not found"),
-            Error::NotTrashed => write!(f, "file is not in the trash"),
-            Error::AlreadyTrashed => write!(f, "file is already in the trash"),
+            Self::Cipher(e) => write!(f, "cipher: {}", e),
+            Self::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {}", v),
+            Self::NotFound => write!(f, "file not found"),
+            Self::NotTrashed => write!(f, "file is not in the trash"),
+            Self::AlreadyTrashed => write!(f, "file is already in the trash"),
+            Self::Tampered => write!(f, "tampered manifest"),
         }
     }
 }
 
-impl From<CipherError> for Error {
-    fn from(value: CipherError) -> Self {
-        Self::Cipher(value)
+impl From<cipher::Error> for Error {
+    fn from(value: cipher::Error) -> Self {
+        match value {
+            cipher::Error::InvalidSignature => Self::Tampered,
+            other => Self::Cipher(other),
+        }
     }
 }
 
@@ -112,10 +117,6 @@ impl Manifest {
         Ok(())
     }
 
-    pub fn remove(&mut self, path: &str) -> Option<Entry> {
-        self.entries.remove(path)
-    }
-
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -169,7 +170,7 @@ impl Manifest {
             .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
-            .map(|(k, _)| k.to_string())
+            .map(|(k, _)| k.into())
             .collect();
         let mut trashed_addresses = Vec::new();
 
@@ -334,7 +335,7 @@ impl Manifest {
 
             let string = core::str::from_utf8(&data[*current..end])
                 .map_err(|_| Error::Corrupted("invalid UTF-8 in path"))?
-                .to_string();
+                .into();
 
             *current = end;
 
@@ -399,16 +400,25 @@ impl Manifest {
         Ok(Self { entries })
     }
 
-    pub fn lock(&self, encryption_key: &[u8; 32]) -> Result<Vec<u8>, Error> {
+    pub fn lock(
+        &self,
+        encryption_key: &[u8; 32],
+        sign: impl Fn(&[u8]) -> [u8; 64],
+    ) -> Result<Vec<u8>, Error> {
         let plaintext = self.serialize();
+        let locked = cipher::lock(encryption_key, &plaintext, sign)?;
 
-        Ok(encrypt(encryption_key, &plaintext)?)
+        Ok(locked)
     }
 
-    pub fn unlock(blob: &[u8], encryption_key: &[u8; 32]) -> Result<Self, Error> {
-        let plaintext = decrypt(encryption_key, blob)?;
+    pub fn unlock(
+        blob: &[u8],
+        encryption_key: &[u8; 32],
+        verify: impl Fn(&[u8], &[u8; 64]) -> bool,
+    ) -> Result<Self, Error> {
+        let unlocked = cipher::unlock(encryption_key, blob, verify)?;
 
-        Self::deserialize(&plaintext)
+        Self::deserialize(&unlocked)
     }
 }
 
@@ -459,6 +469,21 @@ mod tests {
         manifest
     }
 
+    fn sign(data: &[u8]) -> [u8; 64] {
+        let mut sig = [0u8; 64];
+
+        // XOR the first 64 bytes of data into the signature so tampering is detectable
+        for (i, &b) in data.iter().take(64).enumerate() {
+            sig[i] = b ^ 0xAB;
+        }
+
+        sig
+    }
+
+    fn verify(data: &[u8], sig: &[u8; 64]) -> bool {
+        sign(data) == *sig
+    }
+
     #[test]
     fn serialize_deserialize_roundtrip() {
         let manifest = manifest();
@@ -504,7 +529,7 @@ mod tests {
 
         assert!(manifest.get("file.txt").is_some());
 
-        manifest.remove("file.txt");
+        manifest.trash("file.txt").unwrap();
 
         assert!(manifest.get("file.txt").is_none());
     }
@@ -513,8 +538,8 @@ mod tests {
     fn lock_unlock_roundtrip() {
         let key = [0x55u8; 32];
         let manifest = manifest();
-        let locked = manifest.lock(&key).unwrap();
-        let unlocked = Manifest::unlock(&locked, &key).unwrap();
+        let locked = manifest.lock(&key, sign).unwrap();
+        let unlocked = Manifest::unlock(&locked, &key, verify).unwrap();
 
         assert_eq!(manifest, unlocked);
     }
@@ -575,17 +600,17 @@ mod tests {
 
     #[test]
     fn wrong_key() {
-        let locked = manifest().lock(&[0x55u8; 32]).unwrap();
+        let locked = manifest().lock(&[0x55u8; 32], sign).unwrap();
 
-        assert!(Manifest::unlock(&locked, &[0x00u8; 32]).is_err());
+        assert!(Manifest::unlock(&locked, &[0x00u8; 32], verify).is_err());
     }
 
     #[test]
     fn empty_manifest() {
         let manifest = Manifest::new();
         let key = [0x01u8; 32];
-        let locked = manifest.lock(&key).unwrap();
-        let unlocked = Manifest::unlock(&locked, &key).unwrap();
+        let locked = manifest.lock(&key, sign).unwrap();
+        let unlocked = Manifest::unlock(&locked, &key, verify).unwrap();
 
         assert_eq!(unlocked.entries.len(), 0);
     }

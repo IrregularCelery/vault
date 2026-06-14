@@ -29,6 +29,7 @@ fn main() {
         Some("cleanup") => cleanup(&args[2..]),
         Some("list") => list(&args[2..]),
         Some("properties") => properties(&args[2..]),
+        Some("verify") => verify(&args[2..]),
         _ => {
             eprintln!("Usage:");
             eprintln!(
@@ -67,6 +68,9 @@ fn main() {
             );
             eprintln!(
                 "  vault properties <mnemonic_file> <vault_path>                      show properties for a file"
+            );
+            eprintln!(
+                "  vault verify     <mnemonic_file> [vault_path]                      verify integrity of files"
             );
             eprintln!();
             eprintln!("  <mnemonic_file> is a text file containing your 12 or 24 words.");
@@ -275,13 +279,13 @@ fn cleanup(args: &[String]) {
 
     let mut session = create_session(&args[0]);
 
-    session.cleanup().unwrap_or_else(|e| {
+    let cleanedup = session.cleanup().unwrap_or_else(|e| {
         eprintln!("Session failed while cleaning up: {}", e);
 
         process::exit(1);
     });
 
-    println!("Cleaned up.");
+    println!("Cleaned up {} chunks.", cleanedup);
 }
 
 fn list(args: &[String]) {
@@ -338,6 +342,44 @@ fn properties(args: &[String]) {
             process::exit(1);
         }
     }
+}
+
+fn verify(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Usage: vault verify <mnemonic_file> [vault_path]");
+
+        return;
+    }
+
+    let session = create_session(&args[0]);
+
+    if let Some(path) = args.get(1) {
+        if let Err(e) = session.verify(path) {
+            eprintln!("Verification failed for `{}`: {}", path, e);
+
+            process::exit(1);
+        }
+
+        println!("`{}` verified successfully.", path);
+
+        return;
+    }
+
+    let tampered = session.verify_all();
+
+    if tampered.is_empty() {
+        println!("All blobs verified successfully.");
+
+        return;
+    }
+
+    eprintln!("Verification failed. Possible tampered entries:");
+
+    for path in tampered {
+        eprintln!("  {}", path);
+    }
+
+    process::exit(1)
 }
 
 fn create_session(mnemonic_file: &str) -> Session<local::Storage> {

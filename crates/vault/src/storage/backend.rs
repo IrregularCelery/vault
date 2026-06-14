@@ -10,9 +10,9 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::NotFound => write!(f, "blob not found"),
-            Error::Io(e) => write!(f, "I/O: {}", e),
-            Error::Other(e) => write!(f, "{}", e),
+            Self::NotFound => write!(f, "blob not found"),
+            Self::Io(e) => write!(f, "I/O: {}", e),
+            Self::Other(e) => write!(f, "{}", e),
         }
     }
 }

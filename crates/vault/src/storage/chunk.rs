@@ -15,9 +15,9 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "I/O: {}", e),
-            Error::UnexpectedEof => write!(f, "unexpected end of file"),
-            Error::Other(e) => write!(f, "{}", e),
+            Self::Io(e) => write!(f, "I/O: {}", e),
+            Self::UnexpectedEof => write!(f, "unexpected end of file"),
+            Self::Other(e) => write!(f, "{}", e),
         }
     }
 }
