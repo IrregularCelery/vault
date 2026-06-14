@@ -2,8 +2,8 @@
 //!   `[ 12-bytes nonce ] + [ ciphertext ] + [ 16-bytes tag ]`
 
 use gate::{
-    crypto::chacha20poly1305::{Aead, AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce, OsRng},
-    sys::macros::vec::Vec,
+    crypto::chacha20poly1305::{Aead, AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce},
+    sys::{macros::vec::Vec, random::OsRng},
 };
 
 #[derive(Debug)]

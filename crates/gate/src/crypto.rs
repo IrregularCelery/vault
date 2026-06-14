@@ -735,11 +735,18 @@ pub mod bip39 {
 }
 
 pub mod argon2 {
-    pub use argon2::{Algorithm, Argon2, Params, Version};
+    pub use argon2::Algorithm;
+    pub use argon2::Argon2;
+    pub use argon2::Params;
+    pub use argon2::Version;
 }
 
 pub mod ed25519 {
-    pub use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+    pub use ed25519_dalek::Signature;
+    pub use ed25519_dalek::Signer;
+    pub use ed25519_dalek::SigningKey;
+    pub use ed25519_dalek::Verifier;
+    pub use ed25519_dalek::VerifyingKey;
 }
 
 pub mod blake3 {
@@ -749,8 +756,11 @@ pub mod blake3 {
 }
 
 pub mod chacha20poly1305 {
-    pub use chacha20poly1305::{
-        ChaCha20Poly1305, Key, Nonce,
-        aead::{Aead, AeadCore, KeyInit, OsRng},
-    };
+    pub use chacha20poly1305::ChaCha20Poly1305;
+    pub use chacha20poly1305::Key;
+    pub use chacha20poly1305::Nonce;
+    pub use chacha20poly1305::aead::Aead;
+    pub use chacha20poly1305::aead::AeadCore;
+    pub use chacha20poly1305::aead::KeyInit;
+    pub use chacha20poly1305::aead::Payload;
 }

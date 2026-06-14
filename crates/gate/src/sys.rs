@@ -63,6 +63,10 @@ pub mod path {
     pub use super::std::path::*;
 }
 
+pub mod net {
+    pub use super::std::net::*;
+}
+
 pub mod time {
     pub use super::std::time::*;
 }
@@ -84,6 +88,10 @@ pub mod os {
 }
 
 pub mod random {
+    pub use argon2::password_hash::rand_core::RngCore;
+    pub use chacha20poly1305::aead::OsRng;
+    pub use rand::CryptoRng;
     pub use rand::Rng;
     pub use rand::rng;
+    pub use rand::rngs::ThreadRng;
 }
