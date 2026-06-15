@@ -5,15 +5,15 @@
 //!   [2-bytes] version (u16)
 //!   [4-bytes] entry_count (u32)
 //!   each entry:
-//!     [2-bytes]           path_len (u16)
-//!     [path_len bytes]    path (UTF-8)
-//!     [60-bytes]          encrypted_pfk (per-file key, 12 (nonce) + 16 (encryption tag) + 32 (key))
-//!     [8-bytes]           size (u64)
-//!     [8-bytes]           modified (u64)
-//!     [8-bytes]           trashed (u64, 0 = live, unix timestapms = trashed)
-//!     [4-bytes]           chunk_count (u32)
-//!     each address:
-//!       [32-bytes]        hash
+//!     [2-bytes]             path_len (u16)
+//!     [path_len bytes]      path (UTF-8)
+//!     [60-bytes]            encrypted_pfk (per-file key, nonce=12 + encryption_tag=16 + key=32)
+//!     [4-bytes]             chunk_count (u32)
+//!     each chunk address:
+//!       [32-bytes]          address (hash)
+//!     [8-bytes]             size (u64)
+//!     [8-bytes]             modified (u64)
+//!     [8-bytes]             trashed (u64, 0 = live, unix timestapms = trashed)
 
 use crate::crypto::cipher::{self, decrypt, encrypt};
 
@@ -248,14 +248,15 @@ impl Manifest {
             buf.extend_from_slice(path_bytes);
             buf.extend_from_slice(&entry.encrypted_pfk);
 
-            write_u64(&mut buf, entry.size);
-            write_u64(&mut buf, entry.modified);
-            write_u64(&mut buf, entry.trashed);
             write_u32(&mut buf, entry.addresses.len() as u32);
 
             for hash in &entry.addresses {
                 buf.extend_from_slice(hash);
             }
+
+            write_u64(&mut buf, entry.size);
+            write_u64(&mut buf, entry.modified);
+            write_u64(&mut buf, entry.trashed);
         }
 
         buf
@@ -373,9 +374,6 @@ impl Manifest {
             let path_len = read_u16(data, &mut current)? as usize;
             let path = read_str(data, &mut current, path_len)?;
             let encrypted_pfk = read_bytes(data, &mut current)?; // 12 (nonce) + 16 (tag) + 32
-            let size = read_u64(data, &mut current)?;
-            let modified = read_u64(data, &mut current)?;
-            let trashed = read_u64(data, &mut current)?;
             let chunk_count = read_u32(data, &mut current)? as usize;
             let mut addresses = Vec::with_capacity(chunk_count);
 
@@ -384,6 +382,10 @@ impl Manifest {
 
                 addresses.push(hash);
             }
+
+            let size = read_u64(data, &mut current)?;
+            let modified = read_u64(data, &mut current)?;
+            let trashed = read_u64(data, &mut current)?;
 
             entries.insert(
                 path,
