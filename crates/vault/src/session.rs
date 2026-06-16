@@ -255,6 +255,34 @@ impl<S: storage::Backend> Session<S> {
         Ok(())
     }
 
+    pub fn detach_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+
+        if entry.versions.is_empty() {
+            return self.rename(path, new_path);
+        }
+
+        let latest_version = entry.versions.remove(entry.versions.len() - 1);
+        let chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
+        let size = core::mem::replace(&mut entry.size, latest_version.size);
+        let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
+
+        self.manifest.insert(
+            new_path,
+            manifest::Entry {
+                chunks,
+                versions: Vec::new(),
+                size,
+                modified,
+                trashed: 0,
+            },
+        );
+        self.flush_manifest()?;
+
+        Ok(())
+    }
+
     pub fn detach_version(
         &mut self,
         path: &str,
@@ -885,14 +913,42 @@ mod tests {
     }
 
     #[test]
+    fn detach_current() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+
+        session.detach_current("file", "file_v2").unwrap();
+
+        assert_eq!(get_bytes(&session, "file_v2"), b"v2");
+        assert_eq!(get_bytes(&session, "file"), b"v1");
+        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(session.versions("file_v2").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn detach_current_no_versions_is_rename() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"data");
+
+        session.detach_current("file", "renamed").unwrap();
+
+        assert_eq!(get_bytes(&session, "renamed"), b"data");
+        assert!(matches!(
+            session.get("file", &mut Vec::new()),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
     fn detach_version() {
         let mut session = session();
 
         put_bytes(&mut session, "file", b"original");
         put_bytes(&mut session, "file", b"accidentally overwritten");
 
-        // TODO: Should we make it so the user can detach the current version too?
-        // Perhaps detaching `0` could do that.
         session.detach_version("file", 0, "original").unwrap();
 
         assert_eq!(get_bytes(&session, "original"), b"original");
