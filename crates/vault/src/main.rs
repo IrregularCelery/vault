@@ -25,8 +25,9 @@ fn main() {
         Some("get-version") => get_version(&args[2..]),
         Some("revert") => revert(&args[2..]),
         Some("drop-version") => drop_version(&args[2..]),
+        Some("drop-current") => drop_version_current(&args[2..]),
         Some("detach-version") => detach_version(&args[2..]),
-        Some("detach-current") => detach_current(&args[2..]),
+        Some("detach-current") => detach_version_current(&args[2..]),
         Some("rename") => rename(&args[2..]),
         Some("trash") => trash(&args[2..]),
         Some("restore") => restore(&args[2..]),
@@ -62,6 +63,9 @@ fn main() {
             );
             eprintln!(
                 "  vault drop-version   <mnemonic_file> <vault_path> <version>            permanently delete a version"
+            );
+            eprintln!(
+                "  vault drop-current   <mnemonic_file> <vault_path>                      drop current version, promote previous"
             );
             eprintln!(
                 "  vault detach-version <mnemonic_file> <vault_path> <version> <new_path> detach a version into a new file"
@@ -350,6 +354,27 @@ fn drop_version(args: &[String]) {
     );
 }
 
+fn drop_version_current(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Usage: vault drop-current <mnemonic_file> <vault_path>");
+
+        return;
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session.drop_version_current(&args[1]).unwrap_or_else(|e| {
+        eprintln!(
+            "Session failed while dropping current version of `{}`: {}",
+            args[1], e
+        );
+
+        process::exit(1);
+    });
+
+    println!("Dropped current version of `{}`.", args[1]);
+}
+
 fn detach_version(args: &[String]) {
     if args.len() < 4 {
         eprintln!(
@@ -390,7 +415,7 @@ fn detach_version(args: &[String]) {
     );
 }
 
-fn detach_current(args: &[String]) {
+fn detach_version_current(args: &[String]) {
     if args.len() < 3 {
         eprintln!("Usage: vault detach-current <mnemonic_file> <vault_path> <new_vault_path>");
 
@@ -400,7 +425,7 @@ fn detach_current(args: &[String]) {
     let mut session = create_session(&args[0]);
 
     session
-        .detach_current(&args[1], &args[2])
+        .detach_version_current(&args[1], &args[2])
         .unwrap_or_else(|e| {
             eprintln!(
                 "Session failed while detaching current version of `{}`: {}",

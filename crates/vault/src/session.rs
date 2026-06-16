@@ -255,29 +255,31 @@ impl<S: storage::Backend> Session<S> {
         Ok(())
     }
 
-    pub fn detach_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
+    pub fn drop_version_current(&mut self, path: &str) -> Result<(), Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
-            return self.rename(path, new_path);
+            return self.delete(path);
         }
 
         let latest_version = entry.versions.remove(entry.versions.len() - 1);
-        let chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
-        let size = core::mem::replace(&mut entry.size, latest_version.size);
-        let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
+        let dropped_chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
 
-        self.manifest.insert(
-            new_path,
-            manifest::Entry {
-                chunks,
-                versions: Vec::new(),
-                size,
-                modified,
-                trashed: 0,
-            },
-        );
+        entry.size = latest_version.size;
+        entry.modified = latest_version.modified;
+
+        let still_referenced: Vec<[u8; 32]> = self.manifest.addresses();
+        let addresses: Vec<[u8; 32]> = dropped_chunks
+            .into_iter()
+            .map(|c| c.address)
+            .filter(|a| !still_referenced.contains(a))
+            .collect();
+
+        for address in &addresses {
+            self.storage.delete(address)?;
+        }
+
         self.flush_manifest()?;
 
         Ok(())
@@ -305,6 +307,34 @@ impl<S: storage::Backend> Session<S> {
                 versions: Vec::new(),
                 size: detached.size,
                 modified: detached.modified,
+                trashed: 0,
+            },
+        );
+        self.flush_manifest()?;
+
+        Ok(())
+    }
+
+    pub fn detach_version_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+
+        if entry.versions.is_empty() {
+            return self.rename(path, new_path);
+        }
+
+        let latest_version = entry.versions.remove(entry.versions.len() - 1);
+        let chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
+        let size = core::mem::replace(&mut entry.size, latest_version.size);
+        let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
+
+        self.manifest.insert(
+            new_path,
+            manifest::Entry {
+                chunks,
+                versions: Vec::new(),
+                size,
+                modified,
                 trashed: 0,
             },
         );
@@ -913,29 +943,34 @@ mod tests {
     }
 
     #[test]
-    fn detach_current() {
+    fn drop_current() {
         let mut session = session();
 
         put_bytes(&mut session, "file", b"v1");
         put_bytes(&mut session, "file", b"v2");
 
-        session.detach_current("file", "file_v2").unwrap();
+        let blobs_before = session.storage.list().unwrap().len();
 
-        assert_eq!(get_bytes(&session, "file_v2"), b"v2");
+        session.drop_version_current("file").unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        // v2 chunk was purged
+        assert!(blobs_after < blobs_before);
+
+        // v1 is now active
         assert_eq!(get_bytes(&session, "file"), b"v1");
         assert_eq!(session.versions("file").unwrap().len(), 0);
-        assert_eq!(session.versions("file_v2").unwrap().len(), 0);
     }
 
     #[test]
-    fn detach_current_no_versions_is_rename() {
+    fn drop_current_no_versions_deletes_file() {
         let mut session = session();
 
         put_bytes(&mut session, "file", b"data");
 
-        session.detach_current("file", "renamed").unwrap();
+        session.drop_version_current("file").unwrap();
 
-        assert_eq!(get_bytes(&session, "renamed"), b"data");
         assert!(matches!(
             session.get("file", &mut Vec::new()),
             Err(Error::NotFound)
@@ -1001,6 +1036,36 @@ mod tests {
         assert!(matches!(
             session.detach_version("file", 0, "new"),
             Err(Error::VersionNotFound)
+        ));
+    }
+
+    #[test]
+    fn detach_current() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+
+        session.detach_version_current("file", "file_v2").unwrap();
+
+        assert_eq!(get_bytes(&session, "file_v2"), b"v2");
+        assert_eq!(get_bytes(&session, "file"), b"v1");
+        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(session.versions("file_v2").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn detach_current_no_versions_is_rename() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"data");
+
+        session.detach_version_current("file", "renamed").unwrap();
+
+        assert_eq!(get_bytes(&session, "renamed"), b"data");
+        assert!(matches!(
+            session.get("file", &mut Vec::new()),
+            Err(Error::NotFound)
         ));
     }
 
