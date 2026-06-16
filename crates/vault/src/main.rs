@@ -1,4 +1,3 @@
-// TODO: Add version-related commands
 #![no_std]
 
 use vault::{crypto::identity::Identity, session::Session, storage::local};
@@ -22,6 +21,12 @@ fn main() {
         Some("identity") => identity(&args[2..]),
         Some("put") => put(&args[2..]),
         Some("get") => get(&args[2..]),
+        Some("versions") => versions(&args[2..]),
+        Some("get-version") => get_version(&args[2..]),
+        Some("revert") => revert(&args[2..]),
+        Some("drop-version") => drop_version(&args[2..]),
+        Some("detach-version") => detach_version(&args[2..]),
+        Some("detach-current") => detach_current(&args[2..]),
         Some("rename") => rename(&args[2..]),
         Some("trash") => trash(&args[2..]),
         Some("restore") => restore(&args[2..]),
@@ -34,44 +39,62 @@ fn main() {
         _ => {
             eprintln!("Usage:");
             eprintln!(
-                "  vault identity   [mnemonic_file]                                   generate or validate identity"
+                "  vault identity       [mnemonic_file]                                   generate or validate identity"
             );
             eprintln!(
-                "                                                                     enter no parameters to generate"
+                "                                                                         enter no parameters to generate"
             );
             eprintln!();
             eprintln!(
-                "  vault put        <mnemonic_file> <vault_path> <local_file>         store a file"
+                "  vault put            <mnemonic_file> <vault_path> <local_file>         store a file"
             );
             eprintln!(
-                "  vault get        <mnemonic_file> <vault_path> <output_file>        retrieve a file"
+                "  vault get            <mnemonic_file> <vault_path> <out_file>           retrieve a file"
             );
             eprintln!(
-                "  vault rename     <mnemonic_file> <vault_path> <new_vault_path>     rename/move a file"
+                "  vault versions       <mnemonic_file> <vault_path>                      list all versions of a file"
             );
             eprintln!(
-                "  vault trash      <mnemonic_file> <vault_path>                      trash a file (can be restored)"
+                "  vault get-version    <mnemonic_file> <vault_path> <version> <out_file> retrieve a specific version"
             );
             eprintln!(
-                "  vault restore    <mnemonic_file> <vault_path>                      restore a trashed file"
+                "  vault revert         <mnemonic_file> <vault_path> <version>            revert file to a version"
             );
             eprintln!(
-                "  vault purge      <mnemonic_file> <vault_path>                      permanently delete a trashed file"
+                "  vault drop-version   <mnemonic_file> <vault_path> <version>            permanently delete a version"
             );
             eprintln!(
-                "  vault delete     <mnemonic_file> <vault_path>                      permanently delete a file"
+                "  vault detach-version <mnemonic_file> <vault_path> <version> <new_path> detach a version into a new file"
             );
             eprintln!(
-                "  vault cleanup    <mnemonic_file>                                   permanently delete all trashed files"
+                "  vault detach-current <mnemonic_file> <vault_path> <new_path>           detach current version into a new file"
             );
             eprintln!(
-                "  vault list       <mnemonic_file>                                   list all stored files"
+                "  vault rename         <mnemonic_file> <vault_path> <new_vault_path>     rename/move a file"
             );
             eprintln!(
-                "  vault properties <mnemonic_file> <vault_path>                      show properties for a file"
+                "  vault trash          <mnemonic_file> <vault_path>                      trash a file (can be restored)"
             );
             eprintln!(
-                "  vault verify     <mnemonic_file> [vault_path]                      verify integrity of files"
+                "  vault restore        <mnemonic_file> <vault_path>                      restore a trashed file"
+            );
+            eprintln!(
+                "  vault purge          <mnemonic_file> <vault_path>                      permanently delete a trashed file"
+            );
+            eprintln!(
+                "  vault delete         <mnemonic_file> <vault_path>                      permanently delete a file"
+            );
+            eprintln!(
+                "  vault cleanup        <mnemonic_file>                                   permanently delete all trashed files"
+            );
+            eprintln!(
+                "  vault list           <mnemonic_file>                                   list all stored files"
+            );
+            eprintln!(
+                "  vault properties     <mnemonic_file> <vault_path>                      show properties for a file"
+            );
+            eprintln!(
+                "  vault verify         <mnemonic_file> [vault_path]                      verify integrity of files"
             );
             eprintln!();
             eprintln!("  <mnemonic_file> is a text file containing your 12 or 24 words.");
@@ -158,7 +181,7 @@ fn put(args: &[String]) {
 
 fn get(args: &[String]) {
     if args.len() < 3 {
-        eprintln!("Usage: vault get <mnemonic_file> <vault_path> <output_file>");
+        eprintln!("Usage: vault get <mnemonic_file> <vault_path> <out_file>");
 
         return;
     }
@@ -176,6 +199,221 @@ fn get(args: &[String]) {
     });
 
     println!("Got `{}` to {}. ({} bytes)", args[1], args[2], bytes);
+}
+
+fn versions(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("Usage: vault versions <mnemonic_file> <vault_path>");
+
+        return;
+    }
+
+    let session = create_session(&args[0]);
+
+    match session.versions(&args[1]) {
+        None => {
+            eprintln!("`{}` not found.", args[1]);
+
+            process::exit(1);
+        }
+        Some(versions) if versions.is_empty() => {
+            println!("`{}` has no previous versions.", args[1]);
+        }
+        Some(versions) => {
+            println!("Versions for `{}`:", args[1]);
+
+            for version in versions {
+                println!(
+                    "  [{}] size: {}, modified: {}, chunks: {}",
+                    version.index + 1,
+                    version.size,
+                    version.modified,
+                    version.chunk_count
+                );
+            }
+        }
+    }
+}
+
+fn get_version(args: &[String]) {
+    if args.len() < 4 {
+        eprintln!("Usage: vault get-version <mnemonic_file> <vault_path> <version> <out_file>");
+
+        return;
+    }
+
+    let version_number: usize = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid version number `{}`.", args[2]);
+
+        process::exit(1);
+    });
+
+    if version_number == 0 {
+        eprintln!("Version number must be 1 or greater.");
+
+        process::exit(1);
+    }
+
+    let session = create_session(&args[0]);
+    let mut file = fs::File::create(&args[3]).unwrap_or_else(|e| {
+        eprintln!("Cannot create `{}`: {}", args[3], e);
+
+        process::exit(1);
+    });
+    let bytes = session
+        .get_version(&args[1], version_number - 1, &mut file)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Session failed while getting version `{}` of `{}`: {}",
+                version_number, args[1], e
+            );
+
+            process::exit(1);
+        });
+
+    println!(
+        "Got version {} of `{}` to {}. ({} bytes)",
+        version_number, args[1], args[3], bytes
+    );
+}
+
+fn revert(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Usage: vault revert <mnemonic_file> <vault_path> <version>");
+
+        return;
+    }
+
+    let version_number: usize = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid version number `{}`.", args[2]);
+
+        process::exit(1);
+    });
+
+    if version_number == 0 {
+        eprintln!("Version number must be 1 or greater.");
+
+        process::exit(1);
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session
+        .revert(&args[1], version_number - 1)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Session failed while reverting `{}` to version {}: {}",
+                args[1], version_number, e
+            );
+
+            process::exit(1);
+        });
+
+    println!("Reverted `{}` to version {}.", args[1], version_number);
+}
+
+fn drop_version(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Usage: vault drop-version <mnemonic_file> <vault_path> <version>");
+
+        return;
+    }
+
+    let version_number: usize = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid version number `{}`.", args[2]);
+
+        process::exit(1);
+    });
+
+    if version_number == 0 {
+        eprintln!("Version number must be 1 or greater.");
+
+        process::exit(1);
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session
+        .drop_version(&args[1], version_number - 1)
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Session failed while dropping version {} of `{}`: {}",
+                version_number, args[1], e
+            );
+
+            process::exit(1);
+        });
+
+    println!(
+        "Dropped version {} of `{}`. Version was permanently deleted.",
+        version_number, args[1]
+    );
+}
+
+fn detach_version(args: &[String]) {
+    if args.len() < 4 {
+        eprintln!(
+            "Usage: vault detach-version <mnemonic_file> <vault_path> <version> <new_vault_path>"
+        );
+
+        return;
+    }
+
+    let version_number: usize = args[2].parse().unwrap_or_else(|_| {
+        eprintln!("Invalid version number `{}`.", args[2]);
+
+        process::exit(1);
+    });
+
+    if version_number == 0 {
+        eprintln!("Version number must be 1 or greater.");
+
+        process::exit(1);
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session
+        .detach_version(&args[1], version_number - 1, &args[3])
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Session failed while detaching version {} of `{}`: {}",
+                version_number, args[1], e
+            );
+
+            process::exit(1);
+        });
+
+    println!(
+        "Detached version {} of `{}` into `{}`.",
+        version_number, args[1], args[3]
+    );
+}
+
+fn detach_current(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("Usage: vault detach-current <mnemonic_file> <vault_path> <new_vault_path>");
+
+        return;
+    }
+
+    let mut session = create_session(&args[0]);
+
+    session
+        .detach_current(&args[1], &args[2])
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Session failed while detaching current version of `{}`: {}",
+                args[1], e
+            );
+
+            process::exit(1);
+        });
+
+    println!(
+        "Detached current version of `{}` into `{}`.",
+        args[1], args[2]
+    );
 }
 
 fn rename(args: &[String]) {
