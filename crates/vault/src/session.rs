@@ -1,12 +1,9 @@
-use gate::{
-    crypto::blake3,
-    sys::{
-        io,
-        macros::format,
-        string::String,
-        time::{SystemTime, UNIX_EPOCH},
-        vec::Vec,
-    },
+use gate::sys::{
+    io,
+    macros::format,
+    string::String,
+    time::{SystemTime, UNIX_EPOCH},
+    vec::Vec,
 };
 
 use crate::{
@@ -117,78 +114,51 @@ impl<S: storage::Backend> Session<S> {
         })
     }
 
-    pub fn put(
-        &mut self,
-        path: &str,
-        mut reader: impl io::Read + io::Seek,
-        size: u64,
-    ) -> Result<usize, Error> {
-        // NOTE: I don't really like this two-pass design:
-        // The goal was to have a single-pass streaming, full per-user dedup,
-        // and a no-re-encryption sharing `put()` method.
-        // But with per-file encryption key, I couldn't find a better way to have them all.
-        // The single-pass approach I originally had (https://github.com/IrregularCelery/vault/commit/0db9b73)
-        // had a big issue with test `same_file_different_paths_same_user`.
-        // When uploading a file that had identical chunks to what the user already had,
-        // re-uploading those chunks would be skipped, but a different PFK was stored for the entry.
-        // Therefore, the latter file couldn't be decrypted.
+    pub fn put(&mut self, path: &str, reader: impl io::Read, size: u64) -> Result<usize, Error> {
+        let mut chunks = Chunks::new(reader);
+        let mut entry_chunks = Vec::new();
 
-        let hashes = {
-            let mut chunks = Chunks::new(&mut reader);
-            let mut hashes = Vec::new();
+        while let Some(chunk) = chunks.next_chunk()? {
+            let address = chunk.address(&self.identity.encryption_key);
+            let key = chunk.key(&self.identity.encryption_key);
+            let encrypted_chunk_key =
+                cipher::encrypt(&self.identity.encryption_key, &key).map_err(Error::Cipher)?;
+            let mut encrypted_key = [0u8; 60];
+            encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
-            while let Some(chunk) = chunks.next_chunk()? {
-                // Addressed by identity key (not PFK) to preserve per-user chunk deduplication
-                let hash = chunk.address(&self.identity.encryption_key);
+            // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
+            // though not entirely useless since we can avoid calling cipher::encrypt()
+            if !self.storage.exists(&address)? {
+                let encrypted =
+                    cipher::lock(&key, chunk.data, |message| self.identity.sign(message))?;
 
-                hashes.push(hash);
+                self.storage.put(&address, &encrypted)?;
             }
 
-            hashes
-        };
-
-        if let Some(existing) = self.manifest.entries.get(path)
-            && existing.addresses == hashes
-        {
-            return Ok(hashes.len());
+            entry_chunks.push(manifest::EntryChunk {
+                address,
+                encrypted_key,
+            });
         }
 
-        let mut hasher = blake3::Hasher::new();
+        if let Some(existing) = self.manifest.entries.get(path) {
+            let existing_addresses: Vec<[u8; 32]> =
+                existing.chunks.iter().map(|c| c.address).collect();
+            let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
 
-        for hash in &hashes {
-            hasher.update(hash);
-        }
-
-        let pfk = Manifest::derive_pfk(&self.identity.encryption_key, &hasher.finalize().into());
-        let encrypted_pfk = Manifest::encrypt_pfk(&pfk, &self.identity.encryption_key)?;
-
-        reader.seek(io::SeekFrom::Start(0)).map_err(Error::Io)?;
-
-        {
-            let mut chunks = Chunks::new(&mut reader);
-
-            for hash in &hashes {
-                let chunk = chunks.next_chunk()?.ok_or(chunk::Error::UnexpectedEof)?;
-
-                // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
-                // though not entirely useless since we can avoid calling cipher::encrypt()
-                if !self.storage.exists(hash)? {
-                    let encrypted =
-                        cipher::lock(&pfk, chunk.data, |message| self.identity.sign(message))?;
-
-                    self.storage.put(hash, &encrypted)?;
-                }
+            if existing_addresses == new_addresses {
+                return Ok(0);
             }
         }
 
-        let chunk_count = hashes.len();
+        let chunk_count = entry_chunks.len();
         let modified = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
         if let Some(existing) = self.manifest.entries.get_mut(path) {
-            existing.push_version(encrypted_pfk, hashes, size, modified);
+            existing.push_version(entry_chunks, size, modified);
 
             self.flush_manifest()?;
 
@@ -198,8 +168,7 @@ impl<S: storage::Backend> Session<S> {
         self.manifest.insert(
             path,
             manifest::Entry {
-                encrypted_pfk,
-                addresses: hashes,
+                chunks: entry_chunks,
                 versions: Vec::new(),
                 size,
                 modified,
@@ -214,7 +183,7 @@ impl<S: storage::Backend> Session<S> {
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
         let entry = self.manifest.get(path).ok_or(Error::NotFound)?;
 
-        self.decrypt_chunks(path, &entry.encrypted_pfk, &entry.addresses, writer)
+        self.decrypt_chunks(path, &entry.chunks, writer)
     }
 
     pub fn versions(&self, path: &str) -> Option<Vec<VersionProperties>> {
@@ -228,7 +197,7 @@ impl<S: storage::Backend> Session<S> {
                 .enumerate()
                 .map(|(i, v)| VersionProperties {
                     index: i,
-                    chunk_count: v.addresses.len(),
+                    chunk_count: v.chunks.len(),
                     size: v.size,
                     modified: v.modified,
                 })
@@ -246,7 +215,7 @@ impl<S: storage::Backend> Session<S> {
         let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
         let version = entry.versions.get(index).ok_or(Error::VersionNotFound)?;
 
-        self.decrypt_chunks(path, &version.encrypted_pfk, &version.addresses, writer)
+        self.decrypt_chunks(path, &version.chunks, writer)
     }
 
     pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
@@ -258,15 +227,13 @@ impl<S: storage::Backend> Session<S> {
         }
 
         let current = manifest::Version {
-            encrypted_pfk: entry.encrypted_pfk,
-            addresses: core::mem::take(&mut entry.addresses),
+            chunks: core::mem::take(&mut entry.chunks),
             size: entry.size,
             modified: entry.modified,
         };
         let target = entry.versions.remove(version_index);
 
-        entry.encrypted_pfk = target.encrypted_pfk;
-        entry.addresses = target.addresses;
+        entry.chunks = target.chunks;
         entry.size = target.size;
         entry.modified = target.modified;
         entry.versions.push(current);
@@ -306,8 +273,7 @@ impl<S: storage::Backend> Session<S> {
         self.manifest.insert(
             new_path,
             manifest::Entry {
-                encrypted_pfk: detached.encrypted_pfk,
-                addresses: detached.addresses,
+                chunks: detached.chunks,
                 versions: Vec::new(),
                 size: detached.size,
                 modified: detached.modified,
@@ -403,7 +369,7 @@ impl<S: storage::Backend> Session<S> {
     pub fn properties(&self, path: &str) -> Option<Properties> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         self.manifest.entries.get(path).map(|e| Properties {
-            chunk_count: e.addresses.len(),
+            chunk_count: e.chunks.len(),
             size: e.size,
             modified: e.modified,
             trashed: e.trashed,
@@ -415,13 +381,12 @@ impl<S: storage::Backend> Session<S> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
 
-        self.verify_entry_chunks(path, &entry.encrypted_pfk, &entry.addresses)?;
+        self.verify_entry_chunks(path, &entry.chunks)?;
 
         for (i, version) in entry.versions.iter().enumerate() {
             self.verify_entry_chunks(
                 &format!("{}@v{}", path, i + 1), // Display versions start from 1
-                &version.encrypted_pfk,
-                &version.addresses,
+                &version.chunks,
             )?;
         }
 
@@ -430,10 +395,10 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn verify_all(&self) -> Vec<String> {
         let mut tampered = Vec::new();
-        let manifest_hash = Manifest::address(&self.identity.public_key_bytes());
+        let manifest_address = Manifest::address(&self.identity.public_key_bytes());
 
         // Check the manifest blob itself
-        if let Ok(blob) = self.storage.get(&manifest_hash)
+        if let Ok(blob) = self.storage.get(&manifest_address)
             && Manifest::unlock(
                 &blob,
                 &self.identity.encryption_key,
@@ -445,10 +410,7 @@ impl<S: storage::Backend> Session<S> {
         }
 
         for (path, entry) in &self.manifest.entries {
-            if self
-                .verify_entry_chunks(path, &entry.encrypted_pfk, &entry.addresses)
-                .is_err()
-            {
+            if self.verify_entry_chunks(path, &entry.chunks).is_err() {
                 tampered.push(path.clone());
             }
 
@@ -456,11 +418,7 @@ impl<S: storage::Backend> Session<S> {
                 let path_versioned = format!("{}@v{}", path, i + 1); // Display versions start from 1
 
                 if self
-                    .verify_entry_chunks(
-                        &path_versioned,
-                        &version.encrypted_pfk,
-                        &version.addresses,
-                    )
+                    .verify_entry_chunks(&path_versioned, &version.chunks)
                     .is_err()
                 {
                     tampered.push(path_versioned);
@@ -477,16 +435,20 @@ impl<S: storage::Backend> Session<S> {
     fn decrypt_chunks(
         &self,
         path: &str,
-        encrypted_pfk: &[u8; 60],
-        addresses: &[[u8; 32]],
+        chunks: &[manifest::EntryChunk],
         writer: &mut impl io::Write,
     ) -> Result<u64, Error> {
-        let pfk = Manifest::decrypt_pfk(encrypted_pfk, &self.identity.encryption_key)?;
         let mut size = 0u64;
 
-        for address in addresses {
-            let blob = self.storage.get(address)?;
-            let plaintext = cipher::unlock(&pfk, &blob, |message, signature_bytes| {
+        for chunk in chunks {
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key, &chunk.encrypted_key)
+                .map_err(Error::Cipher)?;
+            let key = chunk_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
+            let blob = self.storage.get(&chunk.address)?;
+            let plaintext = cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
             .map_err(|e| match e {
@@ -505,15 +467,18 @@ impl<S: storage::Backend> Session<S> {
     fn verify_entry_chunks(
         &self,
         path: &str,
-        encrypted_pfk: &[u8; 60],
-        addresses: &[[u8; 32]],
+        chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
-        let pfk = Manifest::decrypt_pfk(encrypted_pfk, &self.identity.encryption_key)?;
+        for chunk in chunks {
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key, &chunk.encrypted_key)
+                .map_err(Error::Cipher)?;
+            let key = chunk_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
+            let blob = self.storage.get(&chunk.address)?;
 
-        for address in addresses {
-            let blob = self.storage.get(address)?;
-
-            cipher::unlock(&pfk, &blob, |message, signature_bytes| {
+            cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
             .map_err(|e| match e {
@@ -531,9 +496,9 @@ impl<S: storage::Backend> Session<S> {
             .lock(&self.identity.encryption_key, |message| {
                 self.identity.sign(message)
             })?;
-        let hash = Manifest::address(&self.identity.public_key_bytes());
+        let address = Manifest::address(&self.identity.public_key_bytes());
 
-        self.storage.overwrite(&hash, &data)?;
+        self.storage.overwrite(&address, &data)?;
 
         Ok(())
     }
@@ -621,7 +586,6 @@ mod tests {
         assert_eq!(get_bytes(&session, "large"), data);
     }
 
-    #[ignore = "broken: decryption error because shared chunks and different content equals different keys"]
     #[test]
     fn per_user_per_chunk_deduplication() {
         let mut session = session();
@@ -858,7 +822,6 @@ mod tests {
         assert_eq!(get_bytes(&session, "file"), b"new content");
     }
 
-    #[ignore = "broken: decryption error because shared chunk still uses original version's key"]
     #[test]
     fn drop_version_skips_shared_chunks() {
         let mut session = session();
@@ -1200,7 +1163,7 @@ mod tests {
         put_bytes(&mut session, "file", b"important data");
 
         let entry = session.manifest.entries.get("file").unwrap();
-        let address = entry.addresses[0];
+        let address = entry.chunks[0].address;
         let mut blob = session.storage.get(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
@@ -1223,7 +1186,7 @@ mod tests {
         put_bytes(&mut session, "secret.txt", b"secret");
 
         let entry = session.manifest.entries.get("secret.txt").unwrap();
-        let address = entry.addresses[0];
+        let address = entry.chunks[0].address;
         let mut blob = session.storage.get(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
@@ -1250,7 +1213,7 @@ mod tests {
 
         // Corrupt the trashed chunk
         let entry = session.manifest.entries.get("trashed.txt").unwrap();
-        let address = entry.addresses[0];
+        let address = entry.chunks[0].address;
         let mut blob = session.storage.get(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
@@ -1275,14 +1238,14 @@ mod tests {
 
         // Corrupt both chunks
         let entry = session.manifest.entries.get("large").unwrap();
-        let addresses = entry.addresses.clone();
+        let chunks = &entry.chunks;
 
-        for address in &addresses {
-            let mut blob = session.storage.get(address).unwrap();
+        for chunk in chunks {
+            let mut blob = session.storage.get(&chunk.address).unwrap();
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-            session.storage.overwrite(address, &blob).unwrap();
+            session.storage.overwrite(&chunk.address, &blob).unwrap();
         }
 
         let tampared = session.verify_all();
@@ -1303,7 +1266,7 @@ mod tests {
         put_bytes(&mut session, "file2", b"shared content");
 
         let entry = session.manifest.entries.get("file1").unwrap();
-        let address = entry.addresses[0];
+        let address = entry.chunks[0].address;
         let mut blob = session.storage.get(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
@@ -1326,7 +1289,7 @@ mod tests {
 
         // Corrupt the v1 (previous version) chunk
         let entry = session.manifest.entries.get("file").unwrap();
-        let address = entry.versions[0].addresses[0]; // Version 1
+        let address = entry.versions[0].chunks[0].address; // Version 1
         let mut blob = session.storage.get(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region

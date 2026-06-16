@@ -4,6 +4,7 @@ use gate::{
 };
 
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024; // Each chunk's max capacity is 4 MiB
+const DOMAIN_CHUNK_KEY: &[u8] = b"vault::chunk";
 
 #[derive(Debug)]
 pub enum Error {
@@ -34,6 +35,15 @@ impl<'a> Chunk<'a> {
 
     pub fn address(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
         *blake3::keyed_hash(encryption_key, self.data).as_bytes()
+    }
+
+    pub fn key(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_keyed(encryption_key);
+
+        hasher.update(DOMAIN_CHUNK_KEY);
+        hasher.update(self.data);
+
+        *hasher.finalize().as_bytes()
     }
 }
 
