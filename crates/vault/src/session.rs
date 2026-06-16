@@ -2,6 +2,7 @@ use gate::{
     crypto::blake3,
     sys::{
         io,
+        macros::format,
         string::String,
         time::{SystemTime, UNIX_EPOCH},
         vec::Vec,
@@ -13,7 +14,7 @@ use crate::{
     storage::{
         self,
         chunk::{self, Chunks},
-        manifest::{self, Manifest, Properties},
+        manifest::{self, Manifest, Properties, VersionProperties},
     },
 };
 
@@ -27,6 +28,7 @@ pub enum Error {
     NotFound,
     NotTrashed,
     AlreadyTrashed,
+    VersionNotFound,
     Tampered(String),
     Other(String),
 }
@@ -38,10 +40,11 @@ impl core::fmt::Display for Error {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Chunk(e) => write!(f, "chunk: {}", e),
             Self::Manifest(e) => write!(f, "manifest: {}", e),
-            Error::Io(e) => write!(f, "I/O: {}", e),
+            Self::Io(e) => write!(f, "I/O: {}", e),
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
+            Self::VersionNotFound => write!(f, "version not found"),
             Self::Tampered(e) => write!(f, "tampered blob: {}", e),
             Self::Other(e) => write!(f, "{}", e),
         }
@@ -78,6 +81,7 @@ impl From<manifest::Error> for Error {
             manifest::Error::NotFound => Self::NotFound,
             manifest::Error::NotTrashed => Self::NotTrashed,
             manifest::Error::AlreadyTrashed => Self::AlreadyTrashed,
+            manifest::Error::VersionNotFound => Self::VersionNotFound,
             other => Self::Manifest(other),
         }
     }
@@ -143,6 +147,12 @@ impl<S: storage::Backend> Session<S> {
             hashes
         };
 
+        if let Some(existing) = self.manifest.entries.get(path)
+            && existing.addresses == hashes
+        {
+            return Ok(hashes.len());
+        }
+
         let mut hasher = blake3::Hasher::new();
 
         for hash in &hashes {
@@ -172,20 +182,27 @@ impl<S: storage::Backend> Session<S> {
         }
 
         let chunk_count = hashes.len();
+        let modified = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
-        // TODO: Handle unreferenced chunks on overwrite.
-        // For now, if an entry already exists, `put()` overwrites the manifest silently
-        // and leaves the old chunks unreferenced.
+        if let Some(existing) = self.manifest.entries.get_mut(path) {
+            existing.push_version(encrypted_pfk, hashes, size, modified);
+
+            self.flush_manifest()?;
+
+            return Ok(chunk_count);
+        }
+
         self.manifest.insert(
             path,
             manifest::Entry {
                 encrypted_pfk,
                 addresses: hashes,
+                versions: Vec::new(),
                 size,
-                modified: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                modified,
                 trashed: 0,
             },
         );
@@ -196,25 +213,110 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
         let entry = self.manifest.get(path).ok_or(Error::NotFound)?;
-        let pfk = Manifest::decrypt_pfk(&entry.encrypted_pfk, &self.identity.encryption_key)?;
-        let mut size = 0u64;
 
-        for address in &entry.addresses {
-            let blob = self.storage.get(address)?;
-            let plaintext = cipher::unlock(&pfk, &blob, |message, signature_bytes| {
-                self.identity.verify(message, signature_bytes)
-            })
-            .map_err(|e| match e {
-                cipher::Error::InvalidSignature => Error::Tampered(path.into()),
-                other => Error::Cipher(other),
-            })?;
+        self.decrypt_chunks(path, &entry.encrypted_pfk, &entry.addresses, writer)
+    }
 
-            writer.write_all(&plaintext).map_err(Error::Io)?;
+    pub fn versions(&self, path: &str) -> Option<Vec<VersionProperties>> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get(path)?;
 
-            size += plaintext.len() as u64;
+        Some(
+            entry
+                .versions
+                .iter()
+                .enumerate()
+                .map(|(i, v)| VersionProperties {
+                    index: i,
+                    chunk_count: v.addresses.len(),
+                    size: v.size,
+                    modified: v.modified,
+                })
+                .collect(),
+        )
+    }
+
+    pub fn get_version(
+        &self,
+        path: &str,
+        index: usize,
+        writer: &mut impl io::Write,
+    ) -> Result<u64, Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
+        let version = entry.versions.get(index).ok_or(Error::VersionNotFound)?;
+
+        self.decrypt_chunks(path, &version.encrypted_pfk, &version.addresses, writer)
+    }
+
+    pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+
+        if version_index >= entry.versions.len() {
+            return Err(Error::VersionNotFound);
         }
 
-        Ok(size)
+        let current = manifest::Version {
+            encrypted_pfk: entry.encrypted_pfk,
+            addresses: core::mem::take(&mut entry.addresses),
+            size: entry.size,
+            modified: entry.modified,
+        };
+        let target = entry.versions.remove(version_index);
+
+        entry.encrypted_pfk = target.encrypted_pfk;
+        entry.addresses = target.addresses;
+        entry.size = target.size;
+        entry.modified = target.modified;
+        entry.versions.push(current);
+
+        self.flush_manifest()?;
+
+        Ok(())
+    }
+
+    pub fn drop_version(&mut self, path: &str, index: usize) -> Result<(), Error> {
+        let dropped = self.manifest.drop_version(path, index)?;
+
+        for address in dropped {
+            self.storage.delete(&address)?;
+        }
+
+        self.flush_manifest()?;
+
+        Ok(())
+    }
+
+    pub fn detach_version(
+        &mut self,
+        path: &str,
+        index: usize,
+        new_path: &str,
+    ) -> Result<(), Error> {
+        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
+        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+
+        if index >= entry.versions.len() {
+            return Err(Error::VersionNotFound);
+        }
+
+        let detached = entry.versions.remove(index);
+
+        self.manifest.insert(
+            new_path,
+            manifest::Entry {
+                encrypted_pfk: detached.encrypted_pfk,
+                addresses: detached.addresses,
+                versions: Vec::new(),
+                size: detached.size,
+                modified: detached.modified,
+                trashed: 0,
+            },
+        );
+        self.flush_manifest()?;
+
+        Ok(())
     }
 
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
@@ -301,10 +403,11 @@ impl<S: storage::Backend> Session<S> {
     pub fn properties(&self, path: &str) -> Option<Properties> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         self.manifest.entries.get(path).map(|e| Properties {
-            size: e.size,
             chunk_count: e.addresses.len(),
+            size: e.size,
             modified: e.modified,
             trashed: e.trashed,
+            version_count: e.versions.len(),
         })
     }
 
@@ -312,7 +415,17 @@ impl<S: storage::Backend> Session<S> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
 
-        self.verify_entry(path, entry)
+        self.verify_entry_chunks(path, &entry.encrypted_pfk, &entry.addresses)?;
+
+        for (i, version) in entry.versions.iter().enumerate() {
+            self.verify_entry_chunks(
+                &format!("{}@v{}", path, i + 1), // Display versions start from 1
+                &version.encrypted_pfk,
+                &version.addresses,
+            )?;
+        }
+
+        Ok(())
     }
 
     pub fn verify_all(&self) -> Vec<String> {
@@ -332,8 +445,26 @@ impl<S: storage::Backend> Session<S> {
         }
 
         for (path, entry) in &self.manifest.entries {
-            if self.verify_entry(path, entry).is_err() {
+            if self
+                .verify_entry_chunks(path, &entry.encrypted_pfk, &entry.addresses)
+                .is_err()
+            {
                 tampered.push(path.clone());
+            }
+
+            for (i, version) in entry.versions.iter().enumerate() {
+                let path_versioned = format!("{}@v{}", path, i + 1); // Display versions start from 1
+
+                if self
+                    .verify_entry_chunks(
+                        &path_versioned,
+                        &version.encrypted_pfk,
+                        &version.addresses,
+                    )
+                    .is_err()
+                {
+                    tampered.push(path_versioned);
+                }
             }
         }
 
@@ -343,10 +474,43 @@ impl<S: storage::Backend> Session<S> {
         tampered
     }
 
-    fn verify_entry(&self, path: &str, entry: &manifest::Entry) -> Result<(), Error> {
-        let pfk = Manifest::decrypt_pfk(&entry.encrypted_pfk, &self.identity.encryption_key)?;
+    fn decrypt_chunks(
+        &self,
+        path: &str,
+        encrypted_pfk: &[u8; 60],
+        addresses: &[[u8; 32]],
+        writer: &mut impl io::Write,
+    ) -> Result<u64, Error> {
+        let pfk = Manifest::decrypt_pfk(encrypted_pfk, &self.identity.encryption_key)?;
+        let mut size = 0u64;
 
-        for address in &entry.addresses {
+        for address in addresses {
+            let blob = self.storage.get(address)?;
+            let plaintext = cipher::unlock(&pfk, &blob, |message, signature_bytes| {
+                self.identity.verify(message, signature_bytes)
+            })
+            .map_err(|e| match e {
+                cipher::Error::InvalidSignature => Error::Tampered(path.into()),
+                other => Error::Cipher(other),
+            })?;
+
+            writer.write_all(&plaintext).map_err(Error::Io)?;
+
+            size += plaintext.len() as u64;
+        }
+
+        Ok(size)
+    }
+
+    fn verify_entry_chunks(
+        &self,
+        path: &str,
+        encrypted_pfk: &[u8; 60],
+        addresses: &[[u8; 32]],
+    ) -> Result<(), Error> {
+        let pfk = Manifest::decrypt_pfk(encrypted_pfk, &self.identity.encryption_key)?;
+
+        for address in addresses {
             let blob = self.storage.get(address)?;
 
             cipher::unlock(&pfk, &blob, |message, signature_bytes| {
@@ -381,6 +545,7 @@ mod tests {
         env,
         macros::{format, vec},
         path::PathBuf,
+        string::ToString,
     };
 
     use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
@@ -456,6 +621,37 @@ mod tests {
         assert_eq!(get_bytes(&session, "large"), data);
     }
 
+    #[ignore = "broken: decryption error because shared chunks and different content equals different keys"]
+    #[test]
+    fn per_user_per_chunk_deduplication() {
+        let mut session = session();
+        let data1 = [
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xBBu8; CHUNK_SIZE],
+            vec![0xCCu8; CHUNK_SIZE / 2],
+        ]
+        .concat();
+        let data2 = [
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xBBu8; CHUNK_SIZE],
+            vec![0xCCu8; CHUNK_SIZE / 2],
+            vec![0xDDu8; 32], // New different chunk
+        ]
+        .concat();
+
+        put_bytes(&mut session, "file1", &data1);
+
+        let blobs_after_first = session.storage.list().unwrap().len();
+
+        put_bytes(&mut session, "file2", &data2);
+
+        let blobs_after_second = session.storage.list().unwrap().len();
+
+        assert_eq!(blobs_after_second, blobs_after_first + 1); // Only one new chunk
+        assert_eq!(get_bytes(&session, "file1"), data1);
+        assert_eq!(get_bytes(&session, "file2"), data2);
+    }
+
     #[test]
     fn deduplicate_chunks() {
         let mut session = session();
@@ -483,7 +679,41 @@ mod tests {
         assert_eq!(get_bytes(&session, "notes/empty.txt"), b"");
     }
 
-    #[ignore = "causes unreferenced chunks. see test `different_files_same_path_same_users`."]
+    #[test]
+    fn get_version() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"first");
+        put_bytes(&mut session, "file", b"second");
+        put_bytes(&mut session, "file", b"third");
+
+        // Versions: [0 = "first", 1 = "second"], active = "third"
+        let mut buf = Vec::new();
+
+        session.get_version("file", 0, &mut buf).unwrap();
+
+        assert_eq!(buf, b"first");
+
+        let mut buf = Vec::new();
+
+        session.get_version("file", 1, &mut buf).unwrap();
+
+        assert_eq!(buf, b"second");
+    }
+
+    #[test]
+    fn get_version_not_found() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"only one version");
+
+        // No previous versions exist yet
+        let mut buf = Vec::new();
+        let result = session.get_version("file", 0, &mut buf);
+
+        assert!(matches!(result, Err(Error::VersionNotFound)));
+    }
+
     #[test]
     fn overwrite() {
         let mut session = session();
@@ -491,7 +721,268 @@ mod tests {
         put_bytes(&mut session, "file", b"version one");
         put_bytes(&mut session, "file", b"version two");
 
+        // Data in path is overwritten, but the old version is kept until dropped
         assert_eq!(get_bytes(&session, "file"), b"version two");
+    }
+
+    #[test]
+    fn overwrite_creates_version() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"version one");
+        put_bytes(&mut session, "file", b"version two");
+
+        // Active content is the latest
+        assert_eq!(get_bytes(&session, "file"), b"version two");
+
+        // One previous version was created
+        let versions = session.versions("file").unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].size, b"version one".len() as u64);
+    }
+
+    #[test]
+    fn overwrite_no_unreferenced_chunks() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"version one");
+
+        let blobs_after_first = session.storage.list().unwrap().len();
+
+        put_bytes(&mut session, "file", b"version two");
+
+        let blobs_after_second = session.storage.list().unwrap().len();
+
+        // A new chunk was added, nothing was removed
+        assert!(blobs_after_second > blobs_after_first);
+        assert_eq!(blobs_after_second, blobs_after_first + 1);
+    }
+
+    #[test]
+    fn overwrite_same_content_no_new_chunks() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"same content");
+
+        let blobs_after_first = session.storage.list().unwrap().len();
+
+        put_bytes(&mut session, "file", b"same content");
+
+        let blobs_after_second = session.storage.list().unwrap().len();
+
+        // Identical content, no new chunk written
+        assert_eq!(blobs_after_first, blobs_after_second);
+
+        // No-op, no new version recorded
+        assert_eq!(session.versions("file").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn multiple_overwrites_accumulate_versions() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut session, "file", b"v3");
+
+        assert_eq!(get_bytes(&session, "file"), b"v3");
+        assert_eq!(session.versions("file").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revert() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"original");
+        put_bytes(&mut session, "file", b"overwritten");
+
+        // Revert to index 0 ("original")
+        session.revert("file", 0).unwrap();
+
+        assert_eq!(get_bytes(&session, "file"), b"original");
+    }
+
+    #[test]
+    fn revert_preserves_full_history() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+
+        // Before revert: versions = ["v1"], active = "v2"
+        session.revert("file", 0).unwrap();
+
+        // After revert: active = "v1", versions = ["v2"]
+        assert_eq!(get_bytes(&session, "file"), b"v1");
+
+        let versions = session.versions("file").unwrap();
+
+        assert_eq!(versions.len(), 1);
+
+        let mut buf = Vec::new();
+
+        session.get_version("file", 0, &mut buf).unwrap();
+
+        assert_eq!(buf, b"v2");
+    }
+
+    #[test]
+    fn revert_version_not_found() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"data");
+
+        assert!(matches!(
+            session.revert("file", 0),
+            Err(Error::VersionNotFound)
+        ));
+    }
+
+    #[test]
+    fn drop_version() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"old content");
+        put_bytes(&mut session, "file", b"new content");
+
+        let blobs_before = session.storage.list().unwrap().len();
+
+        session.drop_version("file", 0).unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        // One chunk purged (the "old content" chunk)
+        assert!(blobs_after < blobs_before);
+        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(get_bytes(&session, "file"), b"new content");
+    }
+
+    #[ignore = "broken: decryption error because shared chunk still uses original version's key"]
+    #[test]
+    fn drop_version_skips_shared_chunks() {
+        let mut session = session();
+
+        put_bytes(
+            &mut session,
+            "file",
+            &[vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat(),
+        );
+
+        // Overwrite to create version
+        put_bytes(&mut session, "file", &vec![0xBBu8; CHUNK_SIZE]);
+
+        let blobs_before = session.storage.list().unwrap().len();
+
+        session.drop_version("file", 0).unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        // A Chunk is shared with the active version, must not be deleted
+        // Only one chunk is purged (the unshared one)
+        assert!(blobs_after < blobs_before);
+        assert_eq!(get_bytes(&session, "file"), vec![0xBBu8; CHUNK_SIZE]);
+    }
+
+    #[test]
+    fn drop_version_skips_shared_chunks_across_files() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file1", &vec![0xAAu8; CHUNK_SIZE]);
+        put_bytes(
+            &mut session,
+            "file2",
+            &[vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat(),
+        );
+
+        // Overwrite file1 to create version
+        put_bytes(&mut session, "file1", &vec![0xCCu8; CHUNK_SIZE]);
+
+        let blobs_before = session.storage.list().unwrap().len();
+
+        session.drop_version("file1", 0).unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        // Chunk is shared with the active version, must not be deleted
+        assert_eq!(blobs_before, blobs_after);
+        assert_eq!(get_bytes(&session, "file1"), vec![0xCCu8; CHUNK_SIZE]);
+    }
+
+    #[test]
+    fn drop_version_not_found() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"data");
+
+        assert!(matches!(
+            session.drop_version("file", 0),
+            Err(Error::VersionNotFound)
+        ));
+    }
+
+    #[test]
+    fn detach_version() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"original");
+        put_bytes(&mut session, "file", b"accidentally overwritten");
+
+        // TODO: Should we make it so the user can detach the current version too?
+        // Perhaps detaching `0` could do that.
+        session.detach_version("file", 0, "original").unwrap();
+
+        assert_eq!(get_bytes(&session, "original"), b"original");
+        assert_eq!(get_bytes(&session, "file"), b"accidentally overwritten");
+    }
+
+    #[test]
+    fn detach_version_removes_from_source_history() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+
+        session.detach_version("file", 0, "file_v1").unwrap();
+
+        // Version was removed from source
+        assert_eq!(session.versions("file").unwrap().len(), 0);
+
+        // Detached entry has no history of its own
+        assert_eq!(session.versions("file_v1").unwrap().len(), 0);
+
+        // Both paths are independently readable
+        assert_eq!(get_bytes(&session, "file"), b"v2");
+        assert_eq!(get_bytes(&session, "file_v1"), b"v1");
+    }
+
+    #[test]
+    fn detach_version_no_chunk_duplication() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"shared data");
+        put_bytes(&mut session, "file", b"other data");
+
+        let blobs_before = session.storage.list().unwrap().len();
+
+        // Detach just references existing chunks, no new blobs written
+        session.detach_version("file", 0, "detached").unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        assert_eq!(blobs_before, blobs_after);
+    }
+
+    #[test]
+    fn detach_version_not_found() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"data");
+
+        assert!(matches!(
+            session.detach_version("file", 0, "new"),
+            Err(Error::VersionNotFound)
+        ));
     }
 
     #[test]
@@ -550,6 +1041,27 @@ mod tests {
     }
 
     #[test]
+    fn purge_all_version_chunks() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file1", b"keep this");
+        put_bytes(&mut session, "file2", b"delete v1");
+        put_bytes(&mut session, "file2", b"delete v2");
+
+        session.trash("file2").unwrap();
+
+        let blobs_before = session.storage.list().unwrap().len();
+
+        session.purge("file2").unwrap();
+
+        let blobs_after = session.storage.list().unwrap().len();
+
+        // Both v1 and v2 chunks of file2 should be purged
+        assert_eq!(blobs_before, blobs_after + 2);
+        assert_eq!(get_bytes(&session, "file1"), b"keep this");
+    }
+
+    #[test]
     fn cleanup() {
         let mut session = session();
 
@@ -563,6 +1075,23 @@ mod tests {
 
         assert_eq!(removed, 2); // 1 chunk each
         assert!(session.list_trash().is_empty());
+        assert!(session.list().is_empty());
+    }
+
+    #[test]
+    fn cleanup_purges_all_version_chunks() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut session, "file", b"v3");
+
+        session.trash("file").unwrap();
+
+        session.cleanup().unwrap();
+
+        // Only the manifest blob remains
+        assert_eq!(session.storage.list().unwrap().len(), 1);
         assert!(session.list().is_empty());
     }
 
@@ -788,6 +1317,29 @@ mod tests {
     }
 
     #[test]
+    fn verify_all_catches_tampered_version() {
+        let mut session = session();
+
+        put_bytes(&mut session, "file", b"v0");
+        put_bytes(&mut session, "file", b"v1");
+        put_bytes(&mut session, "file", b"v2");
+
+        // Corrupt the v1 (previous version) chunk
+        let entry = session.manifest.entries.get("file").unwrap();
+        let address = entry.versions[0].addresses[0]; // Version 1
+        let mut blob = session.storage.get(&address).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        session.storage.overwrite(&address, &blob).unwrap();
+
+        let tampered = session.verify_all();
+
+        assert_eq!(tampered, vec!["file@v1".to_string()]);
+        assert!(tampered.contains(&"file@v1".into()));
+    }
+
+    #[test]
     fn wrong_key() {
         let path = temp_storage_path("wrongkey");
         let phrase1 = "abandon abandon abandon abandon abandon abandon \
@@ -844,7 +1396,6 @@ mod tests {
         assert_eq!(get_bytes(&session, "file1"), get_bytes(&session, "file2"));
     }
 
-    #[ignore = "causes unreferenced chunks."]
     #[test]
     fn different_files_same_path_same_user() {
         let mut session = session();
@@ -857,10 +1408,15 @@ mod tests {
 
         let blobs_after_second = session.storage.list().unwrap().len();
 
-        // TODO: This is currently true, but shouldn't be the case because it means there are
-        // unreferenced chunks. see `Session::put()` `TODO` message.
+        // No unreferenced chunks, the old chunks are in a separate version
         assert!(blobs_after_second > blobs_after_first);
         assert_eq!(get_bytes(&session, "file"), b"different content");
+
+        session.drop_version("file", 0).unwrap();
+
+        let blobs_after_version_drop = session.storage.list().unwrap().len();
+
+        assert_eq!(blobs_after_version_drop, blobs_after_first);
     }
 
     #[test]

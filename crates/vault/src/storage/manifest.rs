@@ -8,9 +8,17 @@
 //!     [2-bytes]             path_len (u16)
 //!     [path_len bytes]      path (UTF-8)
 //!     [60-bytes]            encrypted_pfk (per-file key, nonce=12 + encryption_tag=16 + key=32)
-//!     [4-bytes]             chunk_count (u32)
+//!     [4-bytes]             chunk_count (u32, addresses)
 //!     each chunk address:
 //!       [32-bytes]          address (hash)
+//!     [4-bytes]             version_count
+//!     each version:
+//!       [60-bytes]            encrypted_pfk
+//!       [8-bytes]             size
+//!       [8-bytes]             modified
+//!       [4-bytes]             chunk_count (addresses)
+//!       each chunk address:
+//!         [32-bytes]          address
 //!     [8-bytes]             size (u64)
 //!     [8-bytes]             modified (u64)
 //!     [8-bytes]             trashed (u64, 0 = live, unix timestapms = trashed)
@@ -38,6 +46,7 @@ pub enum Error {
     NotFound,
     NotTrashed,
     AlreadyTrashed,
+    VersionNotFound,
     Tampered,
 }
 
@@ -50,6 +59,7 @@ impl core::fmt::Display for Error {
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
+            Self::VersionNotFound => write!(f, "version not found"),
             Self::Tampered => write!(f, "tampered manifest"),
         }
     }
@@ -65,12 +75,44 @@ impl From<cipher::Error> for Error {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Entry {
+pub struct Version {
     pub encrypted_pfk: [u8; 60],
     pub addresses: Vec<[u8; 32]>,
     pub size: u64,
     pub modified: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Entry {
+    pub encrypted_pfk: [u8; 60],
+    pub addresses: Vec<[u8; 32]>,
+    pub versions: Vec<Version>,
+    pub size: u64,
+    pub modified: u64,
     pub trashed: u64,
+}
+
+impl Entry {
+    pub fn push_version(
+        &mut self,
+        new_encrypted_pfk: [u8; 60],
+        new_addresses: Vec<[u8; 32]>,
+        new_size: u64,
+        new_modified: u64,
+    ) {
+        let snapshot = Version {
+            encrypted_pfk: self.encrypted_pfk,
+            addresses: core::mem::take(&mut self.addresses),
+            size: self.size,
+            modified: self.modified,
+        };
+
+        self.versions.push(snapshot);
+        self.encrypted_pfk = new_encrypted_pfk;
+        self.addresses = new_addresses;
+        self.size = new_size;
+        self.modified = new_modified;
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -97,7 +139,12 @@ impl Manifest {
         self.entries
             .values()
             .filter(|e| e.trashed == 0)
-            .flat_map(|e| e.addresses.iter().copied())
+            .flat_map(|e| {
+                e.addresses
+                    .iter()
+                    .copied()
+                    .chain(e.versions.iter().flat_map(|v| v.addresses.iter().copied()))
+            })
             .collect()
     }
 
@@ -105,7 +152,12 @@ impl Manifest {
         self.entries
             .values()
             .filter(|e| e.trashed != 0)
-            .flat_map(|e| e.addresses.iter().copied())
+            .flat_map(|e| {
+                e.addresses
+                    .iter()
+                    .copied()
+                    .chain(e.versions.iter().flat_map(|v| v.addresses.iter().copied()))
+            })
             .collect()
     }
 
@@ -144,21 +196,52 @@ impl Manifest {
         Ok(())
     }
 
+    pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
+        let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
+
+        if index >= entry.versions.len() {
+            return Err(Error::VersionNotFound);
+        }
+
+        let removed_version = entry.versions.remove(index);
+        let still_referenced: Vec<[u8; 32]> = entry
+            .addresses
+            .iter()
+            .copied()
+            .chain(
+                entry
+                    .versions
+                    .iter()
+                    .flat_map(|v| v.addresses.iter().copied()),
+            )
+            .collect();
+        let live = self.addresses();
+        let dropped_addresses = removed_version
+            .addresses
+            .into_iter()
+            .filter(|a| !still_referenced.contains(a) && !live.contains(a))
+            .collect();
+
+        Ok(dropped_addresses)
+    }
+
     pub fn purge(&mut self, path: &str) -> Result<Vec<[u8; 32]>, Error> {
         match self.entries.get(path) {
             None => return Err(Error::NotFound),
             Some(e) if e.trashed == 0 => return Err(Error::NotTrashed),
-            _ => {
-                if let Some(entry) = self.entries.remove(path) {
-                    let live = self.addresses();
+            _ => {}
+        }
 
-                    return Ok(entry
-                        .addresses
-                        .into_iter()
-                        .filter(|a| !live.contains(a))
-                        .collect());
-                }
-            }
+        if let Some(entry) = self.entries.remove(path) {
+            let live = self.addresses();
+            let addresses = entry.addresses.iter().copied().chain(
+                entry
+                    .versions
+                    .iter()
+                    .flat_map(|v| v.addresses.iter().copied()),
+            );
+
+            return Ok(addresses.filter(|a| !live.contains(a)).collect());
         }
 
         Err(Error::NotFound)
@@ -172,19 +255,24 @@ impl Manifest {
             .filter(|(_, v)| v.trashed != 0)
             .map(|(k, _)| k.into())
             .collect();
-        let mut trashed_addresses = Vec::new();
+        let mut purged = Vec::new();
 
         for path in paths {
             if let Some(entry) = self.entries.remove(&path) {
-                for address in entry.addresses {
-                    if !live.contains(&address) && !trashed_addresses.contains(&address) {
-                        trashed_addresses.push(address);
+                let addresses = entry
+                    .addresses
+                    .into_iter()
+                    .chain(entry.versions.into_iter().flat_map(|v| v.addresses));
+
+                for address in addresses {
+                    if !live.contains(&address) && !purged.contains(&address) {
+                        purged.push(address);
                     }
                 }
             }
         }
 
-        trashed_addresses
+        purged
     }
 
     pub fn address(public_key: &[u8; 32]) -> [u8; 32] {
@@ -234,6 +322,17 @@ impl Manifest {
         fn write_u64(buf: &mut Vec<u8>, value: u64) {
             buf.extend_from_slice(&value.to_be_bytes());
         }
+        fn write_version(buf: &mut Vec<u8>, value: &Version) {
+            buf.extend_from_slice(&value.encrypted_pfk);
+
+            write_u64(buf, value.size);
+            write_u64(buf, value.modified);
+            write_u32(buf, value.addresses.len() as u32);
+
+            for hash in &value.addresses {
+                buf.extend_from_slice(hash);
+            }
+        }
 
         let mut buf = Vec::new();
 
@@ -252,6 +351,12 @@ impl Manifest {
 
             for hash in &entry.addresses {
                 buf.extend_from_slice(hash);
+            }
+
+            write_u32(&mut buf, entry.versions.len() as u32);
+
+            for version in &entry.versions {
+                write_version(&mut buf, version);
             }
 
             write_u64(&mut buf, entry.size);
@@ -278,7 +383,6 @@ impl Manifest {
 
             Ok(u16::from_be_bytes(bytes))
         }
-
         fn read_u32(data: &[u8], current: &mut usize) -> Result<u32, Error> {
             let end = *current + 4;
 
@@ -294,7 +398,6 @@ impl Manifest {
 
             Ok(u32::from_be_bytes(bytes))
         }
-
         fn read_u64(data: &[u8], current: &mut usize) -> Result<u64, Error> {
             let end = *current + 8;
 
@@ -310,7 +413,6 @@ impl Manifest {
 
             Ok(u64::from_be_bytes(bytes))
         }
-
         fn read_bytes<const N: usize>(data: &[u8], current: &mut usize) -> Result<[u8; N], Error> {
             let end = *current + N;
 
@@ -326,7 +428,6 @@ impl Manifest {
 
             Ok(bytes)
         }
-
         fn read_str(data: &[u8], current: &mut usize, len: usize) -> Result<String, Error> {
             let end = *current + len;
 
@@ -342,21 +443,36 @@ impl Manifest {
 
             Ok(string)
         }
-
-        fn read_hash(data: &[u8], current: &mut usize) -> Result<[u8; 32], Error> {
-            let end = *current + 32; // Hashes are 32 bytes
+        fn read_addresses(data: &[u8], current: &mut usize) -> Result<Vec<[u8; 32]>, Error> {
+            let count = read_u32(data, current)? as usize;
+            let total_bytes = count * 32; // Hashes are 32 bytes
+            let end = *current + total_bytes;
 
             if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading hash"));
+                return Err(Error::Corrupted("unexpected end reading addresses"));
             }
 
-            let mut hash = [0u8; 32];
-
-            hash.copy_from_slice(&data[*current..end]);
+            let addresses = data[*current..end]
+                .chunks_exact(32)
+                .map(|chunk| chunk.try_into().expect("chunk size is 32"))
+                .collect();
 
             *current = end;
 
-            Ok(hash)
+            Ok(addresses)
+        }
+        fn read_version(data: &[u8], current: &mut usize) -> Result<Version, Error> {
+            let encrypted_pfk = read_bytes(data, current)?; // 12 (nonce) + 16 (tag) + 32
+            let size = read_u64(data, current)?;
+            let modified = read_u64(data, current)?;
+            let addresses = read_addresses(data, current)?;
+
+            Ok(Version {
+                encrypted_pfk,
+                addresses,
+                size,
+                modified,
+            })
         }
 
         let mut current = 0usize;
@@ -374,13 +490,12 @@ impl Manifest {
             let path_len = read_u16(data, &mut current)? as usize;
             let path = read_str(data, &mut current, path_len)?;
             let encrypted_pfk = read_bytes(data, &mut current)?; // 12 (nonce) + 16 (tag) + 32
-            let chunk_count = read_u32(data, &mut current)? as usize;
-            let mut addresses = Vec::with_capacity(chunk_count);
+            let addresses = read_addresses(data, &mut current)?;
+            let version_count = read_u32(data, &mut current)? as usize;
+            let mut versions = Vec::with_capacity(version_count);
 
-            for _ in 0..chunk_count {
-                let hash = read_hash(data, &mut current)?;
-
-                addresses.push(hash);
+            for _ in 0..version_count {
+                versions.push(read_version(data, &mut current)?);
             }
 
             let size = read_u64(data, &mut current)?;
@@ -392,6 +507,7 @@ impl Manifest {
                 Entry {
                     encrypted_pfk,
                     addresses,
+                    versions,
                     size,
                     modified,
                     trashed,
@@ -431,10 +547,18 @@ impl Default for Manifest {
 }
 
 pub struct Properties {
-    pub size: u64,
     pub chunk_count: usize,
+    pub size: u64,
     pub modified: u64,
     pub trashed: u64,
+    pub version_count: usize,
+}
+
+pub struct VersionProperties {
+    pub index: usize,
+    pub chunk_count: usize,
+    pub size: u64,
+    pub modified: u64,
 }
 
 #[cfg(test)]
@@ -451,6 +575,7 @@ mod tests {
             Entry {
                 encrypted_pfk: [0x12; 60],
                 addresses: vec![[0xABu8; 32], [0xCDu8; 32]],
+                versions: Vec::new(),
                 size: 5_000_000, // 5MB > 4MiB hence the two chunks
                 modified: 1_700_000_000,
                 trashed: 0,
@@ -462,6 +587,7 @@ mod tests {
             Entry {
                 encrypted_pfk: [0x12; 60],
                 addresses: vec![[0xEFu8; 32]],
+                versions: Vec::new(),
                 size: 2_048,
                 modified: 1_710_000_000,
                 trashed: 0,
@@ -484,6 +610,42 @@ mod tests {
 
     fn verify(data: &[u8], sig: &[u8; 64]) -> bool {
         sign(data) == *sig
+    }
+
+    #[test]
+    fn entry_push_version() {
+        let mut manifest = Manifest::new();
+
+        manifest.insert(
+            "file",
+            Entry {
+                encrypted_pfk: [0x01; 60],
+                addresses: vec![[0xAAu8; 32]],
+                size: 10,
+                modified: 100,
+                trashed: 0,
+                versions: Vec::new(),
+            },
+        );
+
+        let entry = manifest.entries.get_mut("file").unwrap();
+
+        entry.push_version([0x02; 60], vec![[0xBBu8; 32]], 20, 200);
+
+        let entry = manifest.entries.get("file").unwrap();
+
+        // Active is the new state
+        assert_eq!(entry.encrypted_pfk, [0x02; 60]);
+        assert_eq!(entry.addresses, vec![[0xBBu8; 32]]);
+        assert_eq!(entry.size, 20);
+        assert_eq!(entry.modified, 200);
+
+        // Previous version holds the old state
+        assert_eq!(entry.versions.len(), 1);
+        assert_eq!(entry.versions[0].encrypted_pfk, [0x01; 60]);
+        assert_eq!(entry.versions[0].addresses, vec![[0xAAu8; 32]]);
+        assert_eq!(entry.versions[0].size, 10);
+        assert_eq!(entry.versions[0].modified, 100);
     }
 
     #[test]
@@ -515,6 +677,33 @@ mod tests {
     }
 
     #[test]
+    fn serialize_deserialize_with_versions_roundtrip() {
+        let mut manifest = Manifest::new();
+
+        manifest.insert(
+            "file",
+            Entry {
+                encrypted_pfk: [0x02; 60],
+                addresses: vec![[0xBBu8; 32]],
+                size: 20,
+                modified: 200,
+                trashed: 0,
+                versions: vec![Version {
+                    encrypted_pfk: [0x01; 60],
+                    addresses: vec![[0xAAu8; 32]],
+                    size: 10,
+                    modified: 100,
+                }],
+            },
+        );
+
+        let bytes = manifest.serialize();
+        let deserialized = Manifest::deserialize(&bytes).unwrap();
+
+        assert_eq!(manifest, deserialized);
+    }
+
+    #[test]
     fn insert_remove_roundtrip() {
         let mut manifest = Manifest::new();
 
@@ -523,6 +712,7 @@ mod tests {
             Entry {
                 encrypted_pfk: [0x12; 60],
                 addresses: vec![[0u8; 32]],
+                versions: Vec::new(),
                 size: 100,
                 modified: 0,
                 trashed: 0,
@@ -665,6 +855,34 @@ mod tests {
     }
 
     #[test]
+    fn addresses_includes_all_version_chunks() {
+        let mut manifest = Manifest::new();
+
+        manifest.insert(
+            "file",
+            Entry {
+                encrypted_pfk: [0x02; 60],
+                addresses: vec![[0xBBu8; 32]],
+                size: 20,
+                modified: 200,
+                trashed: 0,
+                versions: vec![Version {
+                    encrypted_pfk: [0x01; 60],
+                    addresses: vec![[0xAAu8; 32]],
+                    size: 10,
+                    modified: 100,
+                }],
+            },
+        );
+
+        let addrs = manifest.addresses();
+
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&[0xAAu8; 32]));
+        assert!(addrs.contains(&[0xBBu8; 32]));
+    }
+
+    #[test]
     fn addresses_excludes_trashed() {
         let mut manifest = manifest();
 
@@ -697,6 +915,7 @@ mod tests {
             Entry {
                 encrypted_pfk: [0x12; 60],
                 addresses: vec![shared_addr],
+                versions: Vec::new(),
                 size: 1,
                 modified: 0,
                 trashed: 0,
@@ -707,6 +926,7 @@ mod tests {
             Entry {
                 encrypted_pfk: [0x12; 60],
                 addresses: vec![shared_addr],
+                versions: Vec::new(),
                 size: 1,
                 modified: 0,
                 trashed: 0,
@@ -748,5 +968,60 @@ mod tests {
 
         // Sample has 2 + 1 = 3 chunk hashes
         assert_eq!(hashes.len(), 3);
+    }
+
+    #[test]
+    fn drop_version() {
+        let mut manifest = Manifest::new();
+
+        manifest.insert(
+            "file",
+            Entry {
+                encrypted_pfk: [0x02; 60],
+                addresses: vec![[0xBBu8; 32]],
+                size: 20,
+                modified: 200,
+                trashed: 0,
+                versions: vec![Version {
+                    encrypted_pfk: [0x01; 60],
+                    addresses: vec![[0xAAu8; 32]],
+                    size: 10,
+                    modified: 100,
+                }],
+            },
+        );
+
+        let dropped = manifest.drop_version("file", 0).unwrap();
+
+        assert_eq!(dropped, vec![[0xAAu8; 32]]);
+        assert!(manifest.entries.get("file").unwrap().versions.is_empty());
+    }
+
+    #[test]
+    fn drop_version_skips_address_shared_with_active() {
+        let mut manifest = Manifest::new();
+        let shared = [0xAAu8; 32];
+
+        manifest.insert(
+            "file",
+            Entry {
+                encrypted_pfk: [0x02; 60],
+                addresses: vec![shared],
+                size: 10,
+                modified: 200,
+                trashed: 0,
+                versions: vec![Version {
+                    encrypted_pfk: [0x01; 60],
+                    addresses: vec![shared],
+                    size: 10,
+                    modified: 100,
+                }],
+            },
+        );
+
+        let dropped = manifest.drop_version("file", 0).unwrap();
+
+        // Must not delete the address since active still uses it
+        assert!(dropped.is_empty());
     }
 }

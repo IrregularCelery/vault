@@ -1,3 +1,4 @@
+// TODO: Add version-related commands
 #![no_std]
 
 use vault::{crypto::identity::Identity, session::Session, storage::local};
@@ -323,6 +324,7 @@ fn properties(args: &[String]) {
     match session.properties(&args[1]) {
         Some(p) => {
             println!("path: {}", args[1]);
+            println!("versions: {}", p.version_count);
             println!("size: {}", p.size);
             println!("chunks: {}", p.chunk_count);
             println!("modified: {}", p.modified);
