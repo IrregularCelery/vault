@@ -549,12 +549,12 @@ impl<S: storage::Backend> Session<S> {
     }
 
     fn flush_manifest(&self) -> Result<(), Error> {
+        let address = Manifest::address(&self.identity.public_key_bytes());
         let data = self
             .manifest
             .lock(&self.identity.encryption_key, |message| {
                 self.identity.sign(message)
             })?;
-        let address = Manifest::address(&self.identity.public_key_bytes());
 
         self.storage.overwrite(&address, &data)?;
 
