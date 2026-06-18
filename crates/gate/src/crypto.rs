@@ -332,7 +332,7 @@ pub mod bip39 {
         Ok(words)
     }
 
-    pub static WORDLIST: &[&str; 2048] = &[
+    pub const WORDLIST: &[&str; 2048] = &[
         "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
         "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic",
         "acquire", "across", "act", "action", "actor", "actress", "actual", "adapt", "add",
@@ -554,6 +554,26 @@ pub mod bip39 {
         "wrestle", "wrist", "write", "wrong", "yard", "year", "yellow", "you", "young", "youth",
         "zebra", "zero", "zone", "zoo",
     ];
+    pub const VECTORS: &[&str; 16] = &[
+        // 12-Word
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "cat swing flag economy stadium alone churn speed unique patch report train",
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+        "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
+        "scheme spot photo card baby mountain device kick cradle pact join borrow",
+        "vessel ladder alter error federal sibling chat ability sun glass valve picture",
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+        // 24-Word
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+        "all hour make first leader extend hole alien behind guard gospel lava path output census museum junior mass reopen famous sing advance salt reform",
+        "hamster diagram private dutch cause delay private meat slide toddler razor book happy fancy gospel tennis maple dilemma loan word shrug inflict delay length",
+        "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title",
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic bless",
+        "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft ostrich alcohol speed nation flash devote level hobby quick inner drive ghost inside",
+        "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold",
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
+    ];
 
     #[cfg(test)]
     mod tests {
@@ -646,6 +666,18 @@ pub mod bip39 {
         // Known BIP39 vectors (https://github.com/trezor/python-mnemonic/blob/master/vectors.json)
 
         #[test]
+        fn vectors() {
+            for vector in VECTORS {
+                let words: Vec<&str> = vector.split_whitespace().collect();
+
+                assert!(
+                    validate(&words).is_ok(),
+                    "validate rejected a known-good mnemonic"
+                );
+            }
+        }
+
+        #[test]
         fn vector_12_all_zeros() {
             assert_vector(
                 "00000000000000000000000000000000",
@@ -719,7 +751,6 @@ pub mod bip39 {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&entropy_hex[i..i + 2], 16).unwrap())
                 .collect();
-
             let words = entropy_to_mnemonic(&entropy).unwrap();
 
             assert_eq!(words, expected, "entropy_to_mnemonic mismatch");
