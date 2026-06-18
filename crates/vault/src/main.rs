@@ -109,12 +109,15 @@ fn main() {
 fn identity(args: &[String]) {
     if args.is_empty() {
         let mnemonic = bip39::generate(12).expect("entropy source failed");
-        let joined = mnemonic.join(" ");
+        let words: Vec<&str> = mnemonic.iter().map(|s| s.as_str()).collect();
 
         println!("Mnemonic ({} words):", mnemonic.len());
-        println!("  {}\n", joined);
 
-        let id = Identity::from_phrase(&joined).expect("key derivation failed");
+        for chunk in words.chunks(3) {
+            println!("  {:15} {:15} {:15}", chunk[0], chunk[1], chunk[2]);
+        }
+
+        let id = Identity::from_mnemonic(&words).expect("key derivation failed");
 
         println!("Public key: {}", bytes_to_hex(&id.public_key_bytes()));
 
@@ -138,7 +141,7 @@ fn identity(args: &[String]) {
         Ok(()) => {
             println!("Mnemonic valid");
 
-            let id = Identity::from_phrase(&words.join(" ")).expect("key derivation failed");
+            let id = Identity::from_mnemonic(&words).expect("key derivation failed");
 
             println!("Public key: {}", bytes_to_hex(&id.public_key_bytes()));
         }
@@ -661,7 +664,7 @@ fn create_session(mnemonic_file: &str) -> Session<local::Storage> {
         process::exit(1);
     });
 
-    let identity = Identity::from_phrase(&words.join(" ")).unwrap_or_else(|e| {
+    let identity = Identity::from_mnemonic(&words).unwrap_or_else(|e| {
         eprintln!("Key derivation failed: {}", e);
 
         process::exit(1);

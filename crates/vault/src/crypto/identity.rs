@@ -1,7 +1,7 @@
 use gate::{
     crypto::{
         argon2::{Algorithm, Argon2, Params, Version},
-        blake3,
+        bip39, blake3,
         ed25519::{Signature, Signer, SigningKey, Verifier, VerifyingKey},
     },
     sys::{macros::format, string::String},
@@ -11,6 +11,24 @@ const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
 const DOMAIN_ENCRYPTION: &[u8] = b"vault::encryption";
 const DOMAIN_SIGNING: &[u8] = b"vault::signing";
 
+#[derive(Debug)]
+pub enum Error {
+    UnsafeMnemonic,
+    Other(String),
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnsafeMnemonic => write!(
+                f,
+                "unsafe mnemonic detected! please generate a random mnemonic"
+            ),
+            Self::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
 pub struct Identity {
     pub encryption_key: [u8; 32],
     signing_key: SigningKey,
@@ -18,20 +36,38 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn from_phrase(phrase: &str) -> Result<Self, String> {
+    pub fn from_mnemonic(words: &[impl AsRef<str>]) -> Result<Self, Error> {
+        let iter = words.iter();
+
+        // On average 8 characters per word + 1 space per word
+        let mut phrase = String::with_capacity(words.len() * 8 + words.len());
+
+        for word in iter {
+            phrase.push_str(word.as_ref());
+            phrase.push(' ');
+        }
+
+        Self::from_phrase(phrase.trim())
+    }
+
+    fn from_phrase(phrase: &str) -> Result<Self, Error> {
+        if bip39::VECTORS.contains(&phrase.trim()) {
+            return Err(Error::UnsafeMnemonic);
+        }
+
         // --- Argon2id ---
         // Password -> UTF-8 bytes of the mnemonic phrase
         // Salt     -> Fixed salt (The mnemonic IS the key, no need for per-user salt)
         // Output   -> 64 bytes (32 for encryption key domain, 32 for signing key domain)
-        let params =
-            Params::new(64 * 1024, 3, 1, Some(64)).map_err(|e| format!("argon2 params: {}", e))?;
+        let params = Params::new(64 * 1024, 3, 1, Some(64))
+            .map_err(|e| Error::Other(format!("argon2 params: {}", e)))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let salt = KDF_SALT;
         let mut seed = [0u8; 64];
 
         argon2
             .hash_password_into(phrase.as_bytes(), salt, &mut seed)
-            .map_err(|e| format!("argon2 hash: {}", e))?;
+            .map_err(|e| Error::Other(format!("argon2 hash: {}", e)))?;
 
         // Separate domains by hashing each half with a domain tag
         let encryption_key = Self::derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
@@ -75,14 +111,11 @@ impl Identity {
 mod tests {
     use super::*;
 
-    const TEST_PHRASE1: &str = "abandon abandon abandon abandon abandon abandon \
-         abandon abandon abandon abandon abandon about";
-    const TEST_PHRASE2: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
-
     #[test]
     fn derivation_is_deterministic() {
-        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
-        let id2 = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id1 = Identity::from_mnemonic(&words).unwrap();
+        let id2 = Identity::from_mnemonic(&words).unwrap();
 
         assert_eq!(id1.public_key_bytes(), id2.public_key_bytes());
         assert_eq!(id1.encryption_key, id2.encryption_key);
@@ -90,15 +123,18 @@ mod tests {
 
     #[test]
     fn enc_and_sign_keys_are_different() {
-        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
 
         assert_ne!(id.encryption_key, id.signing_key.to_bytes());
     }
 
     #[test]
     fn different_mnemonics_produce_different_keys() {
-        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
-        let id2 = Identity::from_phrase(TEST_PHRASE2).unwrap();
+        let words1 = bip39::generate(12).unwrap();
+        let words2 = bip39::generate(12).unwrap();
+        let id1 = Identity::from_mnemonic(&words1).unwrap();
+        let id2 = Identity::from_mnemonic(&words2).unwrap();
 
         assert_ne!(id1.public_key_bytes(), id2.public_key_bytes());
         assert_ne!(id1.encryption_key, id2.encryption_key);
@@ -106,7 +142,8 @@ mod tests {
 
     #[test]
     fn sign_and_verify_roundtrip() {
-        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
         let challenge = b"challenge";
         let signature = id.sign(challenge);
 
@@ -115,7 +152,8 @@ mod tests {
 
     #[test]
     fn wrong_challenge_fails_verification() {
-        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
         let signature = id.sign(b"correct_nonce");
 
         assert!(!id.verify(b"wrong_nonce", &signature));
@@ -123,8 +161,10 @@ mod tests {
 
     #[test]
     fn cross_identity_verification_fails() {
-        let id1 = Identity::from_phrase(TEST_PHRASE1).unwrap();
-        let id2 = Identity::from_phrase(TEST_PHRASE2).unwrap();
+        let words1 = bip39::generate(12).unwrap();
+        let words2 = bip39::generate(12).unwrap();
+        let id1 = Identity::from_mnemonic(&words1).unwrap();
+        let id2 = Identity::from_mnemonic(&words2).unwrap();
         let sig = id1.sign(b"message");
 
         // id2 must not be able to verify id1's signature
@@ -133,7 +173,8 @@ mod tests {
 
     #[test]
     fn tampered_signature_fails() {
-        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
         let mut sig = id.sign(b"message");
 
         sig[0] ^= 0xFF; // flip bits in the first byte
@@ -143,7 +184,8 @@ mod tests {
 
     #[test]
     fn empty_message_roundtrip() {
-        let id = Identity::from_phrase(TEST_PHRASE1).unwrap();
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
         let sig = id.sign(b"");
 
         assert!(id.verify(b"", &sig));

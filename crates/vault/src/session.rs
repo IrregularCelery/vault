@@ -564,11 +564,14 @@ impl<S: storage::Backend> Session<S> {
 
 #[cfg(test)]
 mod tests {
-    use gate::sys::{
-        env,
-        macros::{format, vec},
-        path::PathBuf,
-        string::ToString,
+    use gate::{
+        crypto::bip39,
+        sys::{
+            env,
+            macros::{format, vec},
+            path::PathBuf,
+            string::ToString,
+        },
     };
 
     use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
@@ -584,22 +587,20 @@ mod tests {
         env::temp_dir().join(format!("vault_test_{}_{}", name, nanos))
     }
 
-    fn make_identity(phrase: &str) -> Identity {
-        Identity::from_phrase(phrase).unwrap()
+    fn make_words() -> Vec<String> {
+        bip39::generate(12).unwrap()
+    }
+
+    fn make_identity(words: &[impl AsRef<str>]) -> Identity {
+        Identity::from_mnemonic(words).unwrap()
     }
 
     fn session() -> Session<local::Storage> {
         let path = temp_storage_path("");
         let storage = local::Storage::new(&path).unwrap();
+        let words = make_words();
 
-        Session::new(
-            make_identity(
-                "abandon abandon abandon abandon abandon abandon \
-                    abandon abandon abandon abandon abandon about",
-            ),
-            storage,
-        )
-        .unwrap()
+        Session::new(make_identity(&words), storage).unwrap()
     }
 
     fn put_bytes(session: &mut Session<local::Storage>, path: &str, data: &[u8]) {
@@ -1238,19 +1239,18 @@ mod tests {
     #[test]
     fn persistent_data_across_sessions() {
         let path = temp_storage_path("persistent");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase), storage).unwrap();
+            let mut session = Session::new(make_identity(&words), storage).unwrap();
 
             put_bytes(&mut session, "persistant.txt", b"persistent data");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase), storage).unwrap();
+            let session = Session::new(make_identity(&words), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "persistant.txt"), b"persistent data");
         }
@@ -1276,10 +1276,9 @@ mod tests {
     #[test]
     fn verify_all_tampered_chunk() {
         let path = temp_storage_path("verify_all_tampered_chunk");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
         let storage = local::Storage::new(&path).unwrap();
-        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
 
         put_bytes(&mut session, "file", b"important data");
 
@@ -1299,10 +1298,9 @@ mod tests {
     #[test]
     fn verify_all_tampered_error() {
         let path = temp_storage_path("verify_all_tampered_error");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
         let storage = local::Storage::new(&path).unwrap();
-        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
 
         put_bytes(&mut session, "secret.txt", b"secret");
 
@@ -1323,10 +1321,9 @@ mod tests {
     #[test]
     fn verify_all_includes_trashed_entries() {
         let path = temp_storage_path("verify_trashed");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
         let storage = local::Storage::new(&path).unwrap();
-        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
 
         put_bytes(&mut session, "trashed.txt", b"will be trashed");
 
@@ -1349,10 +1346,9 @@ mod tests {
     #[test]
     fn verify_all_deduplicates_multi_chunk_path() {
         let path = temp_storage_path("verify_dedup");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
         let storage = local::Storage::new(&path).unwrap();
-        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
         let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
 
         put_bytes(&mut session, "large", &data);
@@ -1378,10 +1374,9 @@ mod tests {
     #[test]
     fn verify_all_shared_tampered_chunk() {
         let path = temp_storage_path("verify_shared_tampered");
-        let phrase = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
+        let words = make_words();
         let storage = local::Storage::new(&path).unwrap();
-        let mut session = Session::new(make_identity(phrase), storage).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
 
         put_bytes(&mut session, "file1", b"shared content");
         put_bytes(&mut session, "file2", b"shared content");
@@ -1426,20 +1421,19 @@ mod tests {
     #[test]
     fn wrong_key() {
         let path = temp_storage_path("wrongkey");
-        let phrase1 = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
-        let phrase2 = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+        let words1 = make_words();
+        let words2 = make_words();
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
+            let mut session = Session::new(make_identity(&words1), storage).unwrap();
 
             put_bytes(&mut session, "user1.txt", b"this data belongs to user 1");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase2), storage).unwrap();
+            let session = Session::new(make_identity(&words2), storage).unwrap();
             let mut buf = Vec::new();
 
             // User2 cannot access user1's data
@@ -1506,34 +1500,33 @@ mod tests {
     #[test]
     fn same_file_same_path_different_users() {
         let path = temp_storage_path("same_file_same_path_different_users");
-        let phrase1 = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
-        let phrase2 = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+        let words1 = make_words();
+        let words2 = make_words();
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
+            let mut session = Session::new(make_identity(&words1), storage).unwrap();
 
             put_bytes(&mut session, "file", b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase2), storage).unwrap();
+            let mut session = Session::new(make_identity(&words2), storage).unwrap();
 
             put_bytes(&mut session, "file", b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase1), storage).unwrap();
+            let session = Session::new(make_identity(&words1), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase2), storage).unwrap();
+            let session = Session::new(make_identity(&words2), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"same content");
         }
@@ -1542,34 +1535,33 @@ mod tests {
     #[test]
     fn same_file_different_paths_different_users() {
         let path = temp_storage_path("same_file_different_paths_different_users");
-        let phrase1 = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
-        let phrase2 = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+        let words1 = make_words();
+        let words2 = make_words();
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
+            let mut session = Session::new(make_identity(&words1), storage).unwrap();
 
             put_bytes(&mut session, "file1", b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase2), storage).unwrap();
+            let mut session = Session::new(make_identity(&words2), storage).unwrap();
 
             put_bytes(&mut session, "file2", b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase1), storage).unwrap();
+            let session = Session::new(make_identity(&words1), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file1"), b"same content");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase2), storage).unwrap();
+            let session = Session::new(make_identity(&words2), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file2"), b"same content");
         }
@@ -1578,34 +1570,33 @@ mod tests {
     #[test]
     fn different_files_same_path_different_users() {
         let path = temp_storage_path("different_files_same_path_different_users");
-        let phrase1 = "abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon about";
-        let phrase2 = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+        let words1 = make_words();
+        let words2 = make_words();
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase1), storage).unwrap();
+            let mut session = Session::new(make_identity(&words1), storage).unwrap();
 
             put_bytes(&mut session, "file", b"different content 1");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let mut session = Session::new(make_identity(phrase2), storage).unwrap();
+            let mut session = Session::new(make_identity(&words2), storage).unwrap();
 
             put_bytes(&mut session, "file", b"different content 2");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase1), storage).unwrap();
+            let session = Session::new(make_identity(&words1), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"different content 1");
         }
 
         {
             let storage = local::Storage::new(&path).unwrap();
-            let session = Session::new(make_identity(phrase2), storage).unwrap();
+            let session = Session::new(make_identity(&words2), storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"different content 2");
         }
