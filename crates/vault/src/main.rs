@@ -137,12 +137,9 @@ fn identity(args: &[String]) {
     });
     let words: Vec<&str> = content.split_whitespace().collect();
 
-    match bip39::validate(&words) {
-        Ok(()) => {
+    match Identity::from_mnemonic(&words) {
+        Ok(id) => {
             println!("Mnemonic valid");
-
-            let id = Identity::from_mnemonic(&words).expect("key derivation failed");
-
             println!("Public key: {}", bytes_to_hex(&id.public_key_bytes()));
         }
         Err(e) => {
@@ -658,14 +655,8 @@ fn create_session(mnemonic_file: &str) -> Session<local::Storage> {
     });
     let words: Vec<&str> = content.split_whitespace().collect();
 
-    bip39::validate(&words).unwrap_or_else(|e| {
-        eprintln!("Invalid mnemonic: {}", e);
-
-        process::exit(1);
-    });
-
     let identity = Identity::from_mnemonic(&words).unwrap_or_else(|e| {
-        eprintln!("Key derivation failed: {}", e);
+        eprintln!("Invalid identity: {}", e);
 
         process::exit(1);
     });

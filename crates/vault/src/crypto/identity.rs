@@ -4,7 +4,10 @@ use gate::{
         bip39, blake3,
         ed25519::{Signature, Signer, SigningKey, Verifier, VerifyingKey},
     },
-    sys::{macros::format, string::String},
+    sys::{
+        macros::{format, vec::Vec},
+        string::String,
+    },
 };
 
 const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
@@ -13,6 +16,7 @@ const DOMAIN_SIGNING: &[u8] = b"vault::signing";
 
 #[derive(Debug)]
 pub enum Error {
+    InvalidMnemonic,
     UnsafeMnemonic,
     Other(String),
 }
@@ -20,6 +24,7 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidMnemonic => write!(f, "please enter a valid mnemonic"),
             Self::UnsafeMnemonic => write!(
                 f,
                 "unsafe mnemonic detected! please generate a random mnemonic"
@@ -37,17 +42,15 @@ pub struct Identity {
 
 impl Identity {
     pub fn from_mnemonic(words: &[impl AsRef<str>]) -> Result<Self, Error> {
-        let iter = words.iter();
-
-        // On average 8 characters per word + 1 space per word
-        let mut phrase = String::with_capacity(words.len() * 8 + words.len());
-
-        for word in iter {
-            phrase.push_str(word.as_ref());
-            phrase.push(' ');
+        if words.is_empty() {
+            return Err(Error::InvalidMnemonic);
         }
 
-        Self::from_phrase(phrase.trim())
+        let words: Vec<&str> = words.iter().map(|w| w.as_ref()).collect();
+
+        bip39::validate(&words).map_err(|_| Error::InvalidMnemonic)?;
+
+        Self::from_phrase(&words.join(" "))
     }
 
     fn from_phrase(phrase: &str) -> Result<Self, Error> {
