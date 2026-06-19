@@ -35,7 +35,7 @@ impl core::fmt::Display for Error {
 }
 
 pub struct Identity {
-    pub encryption_key: [u8; 32],
+    encryption_key: [u8; 32],
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
 }
@@ -85,6 +85,10 @@ impl Identity {
         })
     }
 
+    pub fn encryption_key(&self) -> [u8; 32] {
+        self.encryption_key
+    }
+
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing_key.sign(message).to_bytes()
     }
@@ -95,7 +99,7 @@ impl Identity {
         self.verifying_key.verify(message, &signature).is_ok()
     }
 
-    pub fn public_key_bytes(&self) -> [u8; 32] {
+    pub fn public_key(&self) -> [u8; 32] {
         self.verifying_key.to_bytes()
     }
 
@@ -120,7 +124,7 @@ mod tests {
         let id1 = Identity::from_mnemonic(&words).unwrap();
         let id2 = Identity::from_mnemonic(&words).unwrap();
 
-        assert_eq!(id1.public_key_bytes(), id2.public_key_bytes());
+        assert_eq!(id1.public_key(), id2.public_key());
         assert_eq!(id1.encryption_key, id2.encryption_key);
     }
 
@@ -139,7 +143,7 @@ mod tests {
         let id1 = Identity::from_mnemonic(&words1).unwrap();
         let id2 = Identity::from_mnemonic(&words2).unwrap();
 
-        assert_ne!(id1.public_key_bytes(), id2.public_key_bytes());
+        assert_ne!(id1.public_key(), id2.public_key());
         assert_ne!(id1.encryption_key, id2.encryption_key);
     }
 

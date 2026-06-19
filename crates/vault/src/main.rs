@@ -119,7 +119,7 @@ fn identity(args: &[String]) {
 
         let id = Identity::from_mnemonic(&words).expect("key derivation failed");
 
-        println!("Public key: {}", bytes_to_hex(&id.public_key_bytes()));
+        println!("Public key: {}", bytes_to_hex(&id.public_key()));
 
         return;
     }
@@ -140,7 +140,7 @@ fn identity(args: &[String]) {
     match Identity::from_mnemonic(&words) {
         Ok(id) => {
             println!("Mnemonic valid");
-            println!("Public key: {}", bytes_to_hex(&id.public_key_bytes()));
+            println!("Public key: {}", bytes_to_hex(&id.public_key()));
         }
         Err(e) => {
             eprintln!("Error: invalid mnemonic: {}", e);

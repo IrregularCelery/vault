@@ -92,11 +92,11 @@ pub struct Session<S: storage::Backend> {
 
 impl<S: storage::Backend> Session<S> {
     pub fn new(identity: Identity, storage: S) -> Result<Self, Error> {
-        let manifest_key = Manifest::address(&identity.public_key_bytes());
+        let manifest_key = Manifest::address(&identity.public_key());
         let manifest = match storage.load_manifest(&manifest_key) {
             Ok(manifest) => Manifest::unlock(
                 &manifest,
-                &identity.encryption_key,
+                &identity.encryption_key(),
                 |message, signature_bytes| identity.verify(message, signature_bytes),
             )
             .map_err(|e| match e {
@@ -119,10 +119,10 @@ impl<S: storage::Backend> Session<S> {
         let mut entry_chunks = Vec::new();
 
         while let Some(chunk) = chunks.next_chunk()? {
-            let address = chunk.address(&self.identity.encryption_key);
-            let key = chunk.key(&self.identity.encryption_key);
+            let address = chunk.address(&self.identity.encryption_key());
+            let key = chunk.key(&self.identity.encryption_key());
             let encrypted_chunk_key =
-                cipher::encrypt(&self.identity.encryption_key, &key).map_err(Error::Cipher)?;
+                cipher::encrypt(&self.identity.encryption_key(), &key).map_err(Error::Cipher)?;
             let mut encrypted_key = [0u8; 60];
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
@@ -453,13 +453,13 @@ impl<S: storage::Backend> Session<S> {
 
     pub fn verify_all(&self) -> Vec<String> {
         let mut tampered = Vec::new();
-        let manifest_address = Manifest::address(&self.identity.public_key_bytes());
+        let manifest_address = Manifest::address(&self.identity.public_key());
 
         // Check the manifest blob itself
         if let Ok(blob) = self.storage.load_manifest(&manifest_address)
             && Manifest::unlock(
                 &blob,
-                &self.identity.encryption_key,
+                &self.identity.encryption_key(),
                 |message, signature_bytes| self.identity.verify(message, signature_bytes),
             )
             .is_err()
@@ -499,7 +499,7 @@ impl<S: storage::Backend> Session<S> {
         let mut size = 0u64;
 
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key, &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -528,7 +528,7 @@ impl<S: storage::Backend> Session<S> {
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key, &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -549,10 +549,10 @@ impl<S: storage::Backend> Session<S> {
     }
 
     fn flush_manifest(&self) -> Result<(), Error> {
-        let address = Manifest::address(&self.identity.public_key_bytes());
+        let address = Manifest::address(&self.identity.public_key());
         let data = self
             .manifest
-            .lock(&self.identity.encryption_key, |message| {
+            .lock(&self.identity.encryption_key(), |message| {
                 self.identity.sign(message)
             })?;
 
