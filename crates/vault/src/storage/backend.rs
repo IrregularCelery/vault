@@ -28,10 +28,12 @@ impl From<io::Error> for Error {
 }
 
 pub trait Backend {
-    fn put(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error>;
-    fn get(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error>;
-    fn overwrite(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error>;
-    fn exists(&self, hash: &[u8; 32]) -> Result<bool, Error>;
-    fn delete(&self, hash: &[u8; 32]) -> Result<(), Error>;
-    fn list(&self) -> Result<Vec<[u8; 32]>, Error>;
+    fn save_manifest(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error>;
+    fn load_manifest(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error>;
+
+    fn put_blob(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error>;
+    fn get_blob(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error>;
+    fn exists_blob(&self, hash: &[u8; 32]) -> Result<bool, Error>;
+    fn delete_blob(&self, hash: &[u8; 32]) -> Result<(), Error>;
+    fn list_blob(&self) -> Result<Vec<[u8; 32]>, Error>;
 }

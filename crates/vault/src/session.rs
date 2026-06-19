@@ -93,9 +93,9 @@ pub struct Session<S: storage::Backend> {
 impl<S: storage::Backend> Session<S> {
     pub fn new(identity: Identity, storage: S) -> Result<Self, Error> {
         let manifest_key = Manifest::address(&identity.public_key_bytes());
-        let manifest = match storage.get(&manifest_key) {
-            Ok(blob) => Manifest::unlock(
-                &blob,
+        let manifest = match storage.load_manifest(&manifest_key) {
+            Ok(manifest) => Manifest::unlock(
+                &manifest,
                 &identity.encryption_key,
                 |message, signature_bytes| identity.verify(message, signature_bytes),
             )
@@ -128,11 +128,11 @@ impl<S: storage::Backend> Session<S> {
 
             // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
             // though not entirely useless since we can avoid calling cipher::encrypt()
-            if !self.storage.exists(&address)? {
+            if !self.storage.exists_blob(&address)? {
                 let encrypted =
                     cipher::lock(&key, chunk.data, |message| self.identity.sign(message))?;
 
-                self.storage.put(&address, &encrypted)?;
+                self.storage.put_blob(&address, &encrypted)?;
             }
 
             entry_chunks.push(manifest::EntryChunk {
@@ -247,7 +247,7 @@ impl<S: storage::Backend> Session<S> {
         let dropped = self.manifest.drop_version(path, index)?;
 
         for address in dropped {
-            self.storage.delete(&address)?;
+            self.storage.delete_blob(&address)?;
         }
 
         self.flush_manifest()?;
@@ -277,7 +277,7 @@ impl<S: storage::Backend> Session<S> {
             .collect();
 
         for address in &addresses {
-            self.storage.delete(address)?;
+            self.storage.delete_blob(address)?;
         }
 
         self.flush_manifest()?;
@@ -368,7 +368,7 @@ impl<S: storage::Backend> Session<S> {
         let addresses = self.manifest.purge(path)?;
 
         for address in &addresses {
-            self.storage.delete(address)?;
+            self.storage.delete_blob(address)?;
         }
 
         self.flush_manifest()?;
@@ -381,7 +381,7 @@ impl<S: storage::Backend> Session<S> {
         let removed = addresses.len();
 
         for address in &addresses {
-            self.storage.delete(address)?;
+            self.storage.delete_blob(address)?;
         }
 
         self.flush_manifest()?;
@@ -456,7 +456,7 @@ impl<S: storage::Backend> Session<S> {
         let manifest_address = Manifest::address(&self.identity.public_key_bytes());
 
         // Check the manifest blob itself
-        if let Ok(blob) = self.storage.get(&manifest_address)
+        if let Ok(blob) = self.storage.load_manifest(&manifest_address)
             && Manifest::unlock(
                 &blob,
                 &self.identity.encryption_key,
@@ -505,7 +505,7 @@ impl<S: storage::Backend> Session<S> {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
-            let blob = self.storage.get(&chunk.address)?;
+            let blob = self.storage.get_blob(&chunk.address)?;
             let plaintext = cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
@@ -534,7 +534,7 @@ impl<S: storage::Backend> Session<S> {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
-            let blob = self.storage.get(&chunk.address)?;
+            let blob = self.storage.get_blob(&chunk.address)?;
 
             cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
@@ -556,7 +556,7 @@ impl<S: storage::Backend> Session<S> {
                 self.identity.sign(message)
             })?;
 
-        self.storage.overwrite(&address, &data)?;
+        self.storage.save_manifest(&address, &data)?;
 
         Ok(())
     }
@@ -567,9 +567,9 @@ mod tests {
     use gate::{
         crypto::bip39,
         sys::{
-            env,
+            env, fs,
             macros::{format, vec},
-            path::PathBuf,
+            path::{Path, PathBuf},
             string::ToString,
         },
     };
@@ -604,9 +604,7 @@ mod tests {
     }
 
     fn put_bytes(session: &mut Session<local::Storage>, path: &str, data: &[u8]) {
-        session
-            .put(path, io::Cursor::new(data), data.len() as u64)
-            .unwrap();
+        session.put(path, data, data.len() as u64).unwrap();
     }
 
     fn get_bytes(session: &Session<local::Storage>, path: &str) -> Vec<u8> {
@@ -615,6 +613,22 @@ mod tests {
         session.get(path, &mut buf).unwrap();
 
         buf
+    }
+
+    // Only used for tests, blob storage is immutable
+    fn overwrite_bytes(storage_path: &Path, address: &[u8; 32], data: &[u8]) {
+        // `bb` for `blobs` folder, see `storage/local.rs`
+        let hex: String = address.iter().map(|b| format!("{:02x}", b)).collect();
+        let path = storage_path
+            .join("bb")
+            .join(&hex[0..2])
+            .join(&hex[2..4])
+            .join(&hex[4..]);
+        let temp = path.with_extension("tmp");
+
+        // Atomic write
+        fs::write(&temp, data).unwrap();
+        fs::rename(&temp, &path).unwrap();
     }
 
     #[test]
@@ -639,9 +653,9 @@ mod tests {
 
         put_bytes(&mut session, "large", &data);
 
-        let blobs = session.storage.list().unwrap().len();
+        let blobs = session.storage.list_blob().unwrap().len();
 
-        assert_eq!(blobs, 4); // 3 data blobs + 1 manifest blob
+        assert_eq!(blobs, 3); // 3 data blobs
         assert_eq!(get_bytes(&session, "large"), data);
     }
 
@@ -664,11 +678,11 @@ mod tests {
 
         put_bytes(&mut session, "file1", &data1);
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         put_bytes(&mut session, "file2", &data2);
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         assert_eq!(blobs_after_second, blobs_after_first + 1); // Only one new chunk
         assert_eq!(get_bytes(&session, "file1"), data1);
@@ -687,9 +701,9 @@ mod tests {
 
         put_bytes(&mut session, "large", &data);
 
-        let blobs = session.storage.list().unwrap().len();
+        let blobs = session.storage.list_blob().unwrap().len();
 
-        assert_eq!(blobs, 3); // The file has 3 blobs but two are identical, so 2 + 1 for manifest
+        assert_eq!(blobs, 2); // The file has 3 blobs but 2 are identical
         assert_eq!(get_bytes(&session, "large"), data);
     }
 
@@ -771,11 +785,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"version one");
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         put_bytes(&mut session, "file", b"version two");
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         // A new chunk was added, nothing was removed
         assert!(blobs_after_second > blobs_after_first);
@@ -788,11 +802,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         // Identical content, no new chunk written
         assert_eq!(blobs_after_first, blobs_after_second);
@@ -869,11 +883,11 @@ mod tests {
         put_bytes(&mut session, "file", b"old content");
         put_bytes(&mut session, "file", b"new content");
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         // One chunk purged (the "old content" chunk)
         assert!(blobs_after < blobs_before);
@@ -894,11 +908,11 @@ mod tests {
         // Overwrite to create version
         put_bytes(&mut session, "file", &vec![0xBBu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         // A Chunk is shared with the active version, must not be deleted
         // Only one chunk is purged (the unshared one)
@@ -920,11 +934,11 @@ mod tests {
         // Overwrite file1 to create version
         put_bytes(&mut session, "file1", &vec![0xCCu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         session.drop_version("file1", 0).unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         // Chunk is shared with the active version, must not be deleted
         assert_eq!(blobs_before, blobs_after);
@@ -950,11 +964,11 @@ mod tests {
         put_bytes(&mut session, "file", b"v1");
         put_bytes(&mut session, "file", b"v2");
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         session.drop_version_current("file").unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         // v2 chunk was purged
         assert!(blobs_after < blobs_before);
@@ -1018,12 +1032,12 @@ mod tests {
         put_bytes(&mut session, "file", b"shared data");
         put_bytes(&mut session, "file", b"other data");
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         // Detach just references existing chunks, no new blobs written
         session.detach_version("file", 0, "detached").unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         assert_eq!(blobs_before, blobs_after);
     }
@@ -1090,7 +1104,7 @@ mod tests {
         session.trash("file.txt").unwrap();
 
         assert!(session.list().is_empty());
-        assert!(!session.storage.list().unwrap().is_empty());
+        assert!(!session.storage.list_blob().unwrap().is_empty());
         assert_eq!(session.list_trash(), vec!["file.txt"]);
     }
 
@@ -1116,12 +1130,12 @@ mod tests {
 
         session.trash("2.txt").unwrap();
 
-        let blobs_before_purge = session.storage.list().unwrap().len();
+        let blobs_before_purge = session.storage.list_blob().unwrap().len();
 
         session.purge("2.txt").unwrap();
 
         assert!(session.list_trash().is_empty());
-        assert!(session.storage.list().unwrap().len() < blobs_before_purge);
+        assert!(session.storage.list_blob().unwrap().len() < blobs_before_purge);
         assert_eq!(get_bytes(&session, "1.txt"), b"keep this");
     }
 
@@ -1135,11 +1149,11 @@ mod tests {
 
         session.trash("file2").unwrap();
 
-        let blobs_before = session.storage.list().unwrap().len();
+        let blobs_before = session.storage.list_blob().unwrap().len();
 
         session.purge("file2").unwrap();
 
-        let blobs_after = session.storage.list().unwrap().len();
+        let blobs_after = session.storage.list_blob().unwrap().len();
 
         // Both v1 and v2 chunks of file2 should be purged
         assert_eq!(blobs_before, blobs_after + 2);
@@ -1175,8 +1189,7 @@ mod tests {
 
         session.cleanup().unwrap();
 
-        // Only the manifest blob remains
-        assert_eq!(session.storage.list().unwrap().len(), 1);
+        assert_eq!(session.storage.list_blob().unwrap().len(), 0);
         assert!(session.list().is_empty());
     }
 
@@ -1204,7 +1217,7 @@ mod tests {
 
         put_bytes(&mut session, "file", &original);
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         // Since `chunk_a` is identical, it should not be re-uploaded
         let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
@@ -1212,7 +1225,7 @@ mod tests {
 
         put_bytes(&mut session, "file", &updated);
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
         assert_eq!(blobs_after_second, blobs_after_first + 1);
@@ -1284,11 +1297,11 @@ mod tests {
 
         let entry = session.manifest.entries.get("file").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get(&address).unwrap();
+        let mut blob = session.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        session.storage.overwrite(&address, &blob).unwrap();
+        overwrite_bytes(&path, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1306,11 +1319,11 @@ mod tests {
 
         let entry = session.manifest.entries.get("secret.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get(&address).unwrap();
+        let mut blob = session.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        session.storage.overwrite(&address, &blob).unwrap();
+        overwrite_bytes(&path, &address, &blob);
 
         let mut buf = Vec::new();
         let result = session.get("secret.txt", &mut buf);
@@ -1332,11 +1345,11 @@ mod tests {
         // Corrupt the trashed chunk
         let entry = session.manifest.entries.get("trashed.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get(&address).unwrap();
+        let mut blob = session.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        session.storage.overwrite(&address, &blob).unwrap();
+        overwrite_bytes(&path, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1358,11 +1371,11 @@ mod tests {
         let chunks = &entry.chunks;
 
         for chunk in chunks {
-            let mut blob = session.storage.get(&chunk.address).unwrap();
+            let mut blob = session.storage.get_blob(&chunk.address).unwrap();
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-            session.storage.overwrite(&chunk.address, &blob).unwrap();
+            overwrite_bytes(&path, &chunk.address, &blob);
         }
 
         let tampared = session.verify_all();
@@ -1383,11 +1396,11 @@ mod tests {
 
         let entry = session.manifest.entries.get("file1").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get(&address).unwrap();
+        let mut blob = session.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        session.storage.overwrite(&address, &blob).unwrap();
+        overwrite_bytes(&path, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1397,7 +1410,10 @@ mod tests {
 
     #[test]
     fn verify_all_catches_tampered_version() {
-        let mut session = session();
+        let path = temp_storage_path("verify_all_catches_tampered_version");
+        let words = make_words();
+        let storage = local::Storage::new(&path).unwrap();
+        let mut session = Session::new(make_identity(&words), storage).unwrap();
 
         put_bytes(&mut session, "file", b"v0");
         put_bytes(&mut session, "file", b"v1");
@@ -1406,11 +1422,11 @@ mod tests {
         // Corrupt the v1 (previous version) chunk
         let entry = session.manifest.entries.get("file").unwrap();
         let address = entry.versions[0].chunks[0].address; // Version 1
-        let mut blob = session.storage.get(&address).unwrap();
+        let mut blob = session.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        session.storage.overwrite(&address, &blob).unwrap();
+        overwrite_bytes(&path, &address, &blob);
 
         let tampered = session.verify_all();
 
@@ -1447,12 +1463,12 @@ mod tests {
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         // Basically a no-op
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&session, "file"), b"same content");
@@ -1464,11 +1480,11 @@ mod tests {
 
         put_bytes(&mut session, "file1", b"same content");
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         put_bytes(&mut session, "file2", b"same content");
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&session, "file1"), get_bytes(&session, "file2"));
@@ -1480,11 +1496,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"content");
 
-        let blobs_after_first = session.storage.list().unwrap().len();
+        let blobs_after_first = session.storage.list_blob().unwrap().len();
 
         put_bytes(&mut session, "file", b"different content");
 
-        let blobs_after_second = session.storage.list().unwrap().len();
+        let blobs_after_second = session.storage.list_blob().unwrap().len();
 
         // No unreferenced chunks, the old chunks are in a separate version
         assert!(blobs_after_second > blobs_after_first);
@@ -1492,7 +1508,7 @@ mod tests {
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after_version_drop = session.storage.list().unwrap().len();
+        let blobs_after_version_drop = session.storage.list_blob().unwrap().len();
 
         assert_eq!(blobs_after_version_drop, blobs_after_first);
     }
