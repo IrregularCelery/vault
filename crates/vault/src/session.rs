@@ -653,7 +653,7 @@ mod tests {
 
         put_bytes(&mut session, "large", &data);
 
-        let blobs = session.storage.list_blob().unwrap().len();
+        let blobs = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs, 3); // 3 data blobs
         assert_eq!(get_bytes(&session, "large"), data);
@@ -678,11 +678,11 @@ mod tests {
 
         put_bytes(&mut session, "file1", &data1);
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         put_bytes(&mut session, "file2", &data2);
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_second, blobs_after_first + 1); // Only one new chunk
         assert_eq!(get_bytes(&session, "file1"), data1);
@@ -701,7 +701,7 @@ mod tests {
 
         put_bytes(&mut session, "large", &data);
 
-        let blobs = session.storage.list_blob().unwrap().len();
+        let blobs = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs, 2); // The file has 3 blobs but 2 are identical
         assert_eq!(get_bytes(&session, "large"), data);
@@ -785,11 +785,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"version one");
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         put_bytes(&mut session, "file", b"version two");
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         // A new chunk was added, nothing was removed
         assert!(blobs_after_second > blobs_after_first);
@@ -802,11 +802,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         // Identical content, no new chunk written
         assert_eq!(blobs_after_first, blobs_after_second);
@@ -883,11 +883,11 @@ mod tests {
         put_bytes(&mut session, "file", b"old content");
         put_bytes(&mut session, "file", b"new content");
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         // One chunk purged (the "old content" chunk)
         assert!(blobs_after < blobs_before);
@@ -908,11 +908,11 @@ mod tests {
         // Overwrite to create version
         put_bytes(&mut session, "file", &vec![0xBBu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         // A Chunk is shared with the active version, must not be deleted
         // Only one chunk is purged (the unshared one)
@@ -934,11 +934,11 @@ mod tests {
         // Overwrite file1 to create version
         put_bytes(&mut session, "file1", &vec![0xCCu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         session.drop_version("file1", 0).unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         // Chunk is shared with the active version, must not be deleted
         assert_eq!(blobs_before, blobs_after);
@@ -964,11 +964,11 @@ mod tests {
         put_bytes(&mut session, "file", b"v1");
         put_bytes(&mut session, "file", b"v2");
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         session.drop_version_current("file").unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         // v2 chunk was purged
         assert!(blobs_after < blobs_before);
@@ -1032,12 +1032,12 @@ mod tests {
         put_bytes(&mut session, "file", b"shared data");
         put_bytes(&mut session, "file", b"other data");
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         // Detach just references existing chunks, no new blobs written
         session.detach_version("file", 0, "detached").unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_before, blobs_after);
     }
@@ -1104,7 +1104,7 @@ mod tests {
         session.trash("file.txt").unwrap();
 
         assert!(session.list().is_empty());
-        assert!(!session.storage.list_blob().unwrap().is_empty());
+        assert!(!session.storage.list_blobs().unwrap().is_empty());
         assert_eq!(session.list_trash(), vec!["file.txt"]);
     }
 
@@ -1130,12 +1130,12 @@ mod tests {
 
         session.trash("2.txt").unwrap();
 
-        let blobs_before_purge = session.storage.list_blob().unwrap().len();
+        let blobs_before_purge = session.storage.list_blobs().unwrap().len();
 
         session.purge("2.txt").unwrap();
 
         assert!(session.list_trash().is_empty());
-        assert!(session.storage.list_blob().unwrap().len() < blobs_before_purge);
+        assert!(session.storage.list_blobs().unwrap().len() < blobs_before_purge);
         assert_eq!(get_bytes(&session, "1.txt"), b"keep this");
     }
 
@@ -1149,11 +1149,11 @@ mod tests {
 
         session.trash("file2").unwrap();
 
-        let blobs_before = session.storage.list_blob().unwrap().len();
+        let blobs_before = session.storage.list_blobs().unwrap().len();
 
         session.purge("file2").unwrap();
 
-        let blobs_after = session.storage.list_blob().unwrap().len();
+        let blobs_after = session.storage.list_blobs().unwrap().len();
 
         // Both v1 and v2 chunks of file2 should be purged
         assert_eq!(blobs_before, blobs_after + 2);
@@ -1189,7 +1189,7 @@ mod tests {
 
         session.cleanup().unwrap();
 
-        assert_eq!(session.storage.list_blob().unwrap().len(), 0);
+        assert_eq!(session.storage.list_blobs().unwrap().len(), 0);
         assert!(session.list().is_empty());
     }
 
@@ -1217,7 +1217,7 @@ mod tests {
 
         put_bytes(&mut session, "file", &original);
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         // Since `chunk_a` is identical, it should not be re-uploaded
         let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
@@ -1225,7 +1225,7 @@ mod tests {
 
         put_bytes(&mut session, "file", &updated);
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
         assert_eq!(blobs_after_second, blobs_after_first + 1);
@@ -1463,12 +1463,12 @@ mod tests {
 
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         // Basically a no-op
         put_bytes(&mut session, "file", b"same content");
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&session, "file"), b"same content");
@@ -1480,11 +1480,11 @@ mod tests {
 
         put_bytes(&mut session, "file1", b"same content");
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         put_bytes(&mut session, "file2", b"same content");
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&session, "file1"), get_bytes(&session, "file2"));
@@ -1496,11 +1496,11 @@ mod tests {
 
         put_bytes(&mut session, "file", b"content");
 
-        let blobs_after_first = session.storage.list_blob().unwrap().len();
+        let blobs_after_first = session.storage.list_blobs().unwrap().len();
 
         put_bytes(&mut session, "file", b"different content");
 
-        let blobs_after_second = session.storage.list_blob().unwrap().len();
+        let blobs_after_second = session.storage.list_blobs().unwrap().len();
 
         // No unreferenced chunks, the old chunks are in a separate version
         assert!(blobs_after_second > blobs_after_first);
@@ -1508,7 +1508,7 @@ mod tests {
 
         session.drop_version("file", 0).unwrap();
 
-        let blobs_after_version_drop = session.storage.list_blob().unwrap().len();
+        let blobs_after_version_drop = session.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_version_drop, blobs_after_first);
     }

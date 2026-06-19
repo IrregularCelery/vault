@@ -117,7 +117,7 @@ impl Backend for Storage {
         }
     }
 
-    fn list_blob(&self) -> Result<Vec<[u8; 32]>, Error> {
+    fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error> {
         let mut hashes = Vec::new();
 
         // Must be 3 levels: ./xx/xx/xxxxxx...
@@ -293,7 +293,7 @@ mod tests {
         storage.put_blob(&hash1, b"a").unwrap();
         storage.put_blob(&hash2, b"b").unwrap();
 
-        let mut list = storage.list_blob().unwrap();
+        let mut list = storage.list_blobs().unwrap();
         let expected = vec![hash1, hash2];
 
         list.sort();
@@ -318,7 +318,7 @@ mod tests {
         // Revoke all permissions so read_dir fails
         fs::set_permissions(&broken_dir, Permissions::from_mode(0o000)).unwrap();
 
-        let result = storage.list_blob();
+        let result = storage.list_blobs();
 
         // Restore permissions so we can delete the temporary directory after the test
         let _ = fs::set_permissions(&broken_dir, Permissions::from_mode(0o755));

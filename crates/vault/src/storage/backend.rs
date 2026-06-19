@@ -35,5 +35,5 @@ pub trait Backend {
     fn get_blob(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error>;
     fn exists_blob(&self, hash: &[u8; 32]) -> Result<bool, Error>;
     fn delete_blob(&self, hash: &[u8; 32]) -> Result<(), Error>;
-    fn list_blob(&self) -> Result<Vec<[u8; 32]>, Error>;
+    fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error>;
 }
