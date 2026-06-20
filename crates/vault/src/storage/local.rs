@@ -1,67 +1,57 @@
 //! Storage layout is as follows:
 //!
-//!   [root]/af/a1b2c3d4e5...
-//!          ^        ^- encrypted manifest file
-//!          |_ manifests (af)
+//!   [root]/<u0:2>/<u2:4>/<u4:64>/manifest
+//!          |-------------------|    ^- encrypted manifest file
+//!                   ^- user address
 //!
-//!   [root]/bb/a1/b2/c3d4e5...
-//!          ^        ^- encrypted blob file
-//!          |_ blobs (bb, Content-Addressed Storage)
+//!   [root]/<u0:2>/<u2:4>/<u4:64>/blobs/<b0:2>/<b2:4>/<b4:64>
+//!          |-------------------|       |-------------------|
+//!                   ^- user address           ^- encrypted blob file (Content-Addressed Storage)
+//!
+//! Each `Storage` instance is scoped to a single user. The shared prefix is
+//! `Manifest::address(public_key)`.
+//! The same 2+2+60 hex split used for blob addresses (`HashPath`) is reused.
 //!
 //! Blob writes are atomic
 
-use crate::storage::{Backend, Error, hashpath::HashPath};
+use crate::storage::{Backend, Error, hashpath::HashPath, manifest::Manifest};
 
 use gate::sys::{fs, io, path::PathBuf, vec::Vec};
 
+const MANIFEST_FILENAME: &str = "manifest";
+const BLOBS_DIRNAME: &str = "blobs";
+
 pub struct Storage {
-    manifests: PathBuf,
-    blobs: PathBuf,
+    root: PathBuf,
 }
 
 impl Storage {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, Error> {
-        let root = root.into();
+    pub fn new(root: impl Into<PathBuf>, public_key: &[u8; 32]) -> Result<Self, Error> {
+        let user_address = Manifest::address(public_key);
+        let root = root
+            .into()
+            .join(PathBuf::from(HashPath::new(&user_address)));
 
-        // Folders are named after their first 2 hexadecimal letters
-        let manifests = root.join("af");
-        let blobs = root.join("bb");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(root.join(BLOBS_DIRNAME))?;
 
-        fs::create_dir_all(&manifests)?;
-        fs::create_dir_all(&blobs)?;
-
-        Ok(Self { manifests, blobs })
+        Ok(Self { root })
     }
 
-    fn manifest_path(&self, address: &[u8; 32]) -> PathBuf {
-        const LUT: &[u8; 16] = b"0123456789abcdef";
-
-        let mut hex = [0u8; 64];
-
-        for (i, &byte) in address.iter().enumerate() {
-            hex[i * 2] = LUT[(byte >> 4) as usize];
-            hex[i * 2 + 1] = LUT[(byte & 0x0f) as usize];
-        }
-
-        let path =
-            core::str::from_utf8(&hex).expect("slice to utf-8 failed: this should never happen");
-
-        self.manifests.join(path)
+    fn manifest_path(&self) -> PathBuf {
+        self.root.join(MANIFEST_FILENAME)
     }
 
     fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
-        self.blobs.join(PathBuf::from(HashPath::new(hash)))
+        self.root
+            .join(BLOBS_DIRNAME)
+            .join(PathBuf::from(HashPath::new(hash)))
     }
 }
 
 impl Backend for Storage {
-    fn save_manifest(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error> {
-        let path = self.manifest_path(address);
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
+    fn save_manifest(&self, data: &[u8]) -> Result<(), Error> {
+        let path = self.manifest_path();
         let temp = path.with_extension("tmp");
 
         // Atomic write
@@ -71,8 +61,8 @@ impl Backend for Storage {
         Ok(())
     }
 
-    fn load_manifest(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error> {
-        let path = self.manifest_path(address);
+    fn load_manifest(&self) -> Result<Vec<u8>, Error> {
+        let path = self.manifest_path();
 
         Ok(fs::read(&path)?)
     }
@@ -121,7 +111,7 @@ impl Backend for Storage {
         let mut hashes = Vec::new();
 
         // Must be 3 levels: ./xx/xx/xxxxxx...
-        let entries = match fs::read_dir(&self.blobs) {
+        let entries = match fs::read_dir(self.root.join(BLOBS_DIRNAME)) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
             Err(e) => return Err(Error::Io(e)),
@@ -203,19 +193,19 @@ mod tests {
             .unwrap()
             .subsec_nanos();
         let path = env::temp_dir().join(format!("vault_test_{}_{}", name, nanos));
+        let public_key = [0u8; 32];
 
-        Storage::new(path).unwrap()
+        Storage::new(path, &public_key).unwrap()
     }
 
     #[test]
     fn manifest_save_load_roundtrip() {
         let storage = temp_storage("manifest_roundtrip");
-        let address = [0; 32];
         let data = b"data";
 
-        storage.save_manifest(&address, data).unwrap();
+        storage.save_manifest(data).unwrap();
 
-        assert_eq!(storage.load_manifest(&address).unwrap(), data);
+        assert_eq!(storage.load_manifest().unwrap(), data);
     }
 
     #[test]
@@ -311,7 +301,7 @@ mod tests {
 
         storage.put_blob(&hash, b"accessible payload").unwrap();
 
-        let broken_dir = storage.blobs.join("ff");
+        let broken_dir = storage.root.join(BLOBS_DIRNAME).join("ff");
 
         fs::create_dir_all(&broken_dir).unwrap();
 

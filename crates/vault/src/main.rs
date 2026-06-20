@@ -660,7 +660,7 @@ fn create_session(mnemonic_file: &str) -> Session<local::Storage> {
 
         process::exit(1);
     });
-    let storage = local::Storage::new(VAULT_DIR).unwrap_or_else(|e| {
+    let storage = local::Storage::new(VAULT_DIR, &identity.public_key()).unwrap_or_else(|e| {
         eprintln!("Cannot open storage at `{}`: {}", VAULT_DIR, e);
 
         process::exit(1);

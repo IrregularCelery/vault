@@ -28,8 +28,8 @@ impl From<io::Error> for Error {
 }
 
 pub trait Backend {
-    fn save_manifest(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error>;
-    fn load_manifest(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error>;
+    fn save_manifest(&self, data: &[u8]) -> Result<(), Error>;
+    fn load_manifest(&self) -> Result<Vec<u8>, Error>;
 
     fn put_blob(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error>;
     fn get_blob(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error>;
