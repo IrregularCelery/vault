@@ -780,6 +780,11 @@ pub mod ed25519 {
     pub use ed25519_dalek::VerifyingKey;
 }
 
+pub mod x25519 {
+    pub use x25519_dalek::PublicKey;
+    pub use x25519_dalek::StaticSecret;
+}
+
 pub mod blake3 {
     pub use blake3::Hasher;
     pub use blake3::hash;
