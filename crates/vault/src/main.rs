@@ -119,7 +119,7 @@ fn identity(args: &[String]) {
 
         let id = Identity::from_mnemonic(&words).expect("key derivation failed");
 
-        println!("Public key: {}", bytes_to_hex(&id.public_key()));
+        println!("Public key: {}", bytes_to_hex(&id.public_signing_key()));
 
         return;
     }
@@ -140,7 +140,7 @@ fn identity(args: &[String]) {
     match Identity::from_mnemonic(&words) {
         Ok(id) => {
             println!("Mnemonic valid");
-            println!("Public key: {}", bytes_to_hex(&id.public_key()));
+            println!("Public key: {}", bytes_to_hex(&id.public_signing_key()));
         }
         Err(e) => {
             eprintln!("Error: invalid mnemonic: {}", e);
@@ -660,11 +660,12 @@ fn create_session(mnemonic_file: &str) -> Session<local::Storage> {
 
         process::exit(1);
     });
-    let storage = local::Storage::new(VAULT_DIR, &identity.public_key()).unwrap_or_else(|e| {
-        eprintln!("Cannot open storage at `{}`: {}", VAULT_DIR, e);
+    let storage =
+        local::Storage::new(VAULT_DIR, &identity.public_signing_key()).unwrap_or_else(|e| {
+            eprintln!("Cannot open storage at `{}`: {}", VAULT_DIR, e);
 
-        process::exit(1);
-    });
+            process::exit(1);
+        });
 
     Session::new(identity, storage).unwrap_or_else(|e| {
         eprintln!("Cannot create session: {}", e);

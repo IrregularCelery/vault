@@ -275,11 +275,11 @@ impl Manifest {
         purged
     }
 
-    pub fn address(public_key: &[u8; 32]) -> [u8; 32] {
+    pub fn address(public_signing_key: &[u8; 32]) -> [u8; 32] {
         let mut input = Vec::with_capacity(DOMAIN_MANIFEST.len() + 32);
 
         input.extend_from_slice(DOMAIN_MANIFEST);
-        input.extend_from_slice(public_key);
+        input.extend_from_slice(public_signing_key);
 
         // storage key for the manifest blob
         *blake3::hash(&input).as_bytes()
@@ -477,21 +477,21 @@ impl Manifest {
 
     pub fn lock(
         &self,
-        encryption_key: &[u8; 32],
+        master_key: &[u8; 32],
         sign: impl Fn(&[u8]) -> [u8; 64],
     ) -> Result<Vec<u8>, Error> {
         let plaintext = self.serialize();
-        let locked = cipher::lock(encryption_key, &plaintext, sign)?;
+        let locked = cipher::lock(master_key, &plaintext, sign)?;
 
         Ok(locked)
     }
 
     pub fn unlock(
         blob: &[u8],
-        encryption_key: &[u8; 32],
+        master_key: &[u8; 32],
         verify: impl Fn(&[u8], &[u8; 64]) -> bool,
     ) -> Result<Self, Error> {
-        let unlocked = cipher::unlock(encryption_key, blob, verify)?;
+        let unlocked = cipher::unlock(master_key, blob, verify)?;
 
         Self::deserialize(&unlocked)
     }
@@ -808,11 +808,11 @@ mod tests {
 
     #[test]
     fn deterministic_address() {
-        let public_key = [0xFFu8; 32];
+        let public_signing_key = [0xFFu8; 32];
 
         assert_eq!(
-            Manifest::address(&public_key),
-            Manifest::address(&public_key)
+            Manifest::address(&public_signing_key),
+            Manifest::address(&public_signing_key)
         );
     }
 

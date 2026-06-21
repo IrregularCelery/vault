@@ -95,7 +95,7 @@ impl<S: storage::Backend> Session<S> {
         let manifest = match storage.load_manifest() {
             Ok(manifest) => Manifest::unlock(
                 &manifest,
-                &identity.encryption_key(),
+                &identity.master_key(),
                 |message, signature_bytes| identity.verify(message, signature_bytes),
             )
             .map_err(|e| match e {
@@ -118,10 +118,10 @@ impl<S: storage::Backend> Session<S> {
         let mut entry_chunks = Vec::new();
 
         while let Some(chunk) = chunks.next_chunk()? {
-            let address = chunk.address(&self.identity.encryption_key());
-            let key = chunk.key(&self.identity.encryption_key());
+            let address = chunk.address(&self.identity.master_key());
+            let key = chunk.key(&self.identity.master_key());
             let encrypted_chunk_key =
-                cipher::encrypt(&self.identity.encryption_key(), &key).map_err(Error::Cipher)?;
+                cipher::encrypt(&self.identity.master_key(), &key).map_err(Error::Cipher)?;
             let mut encrypted_key = [0u8; 60];
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
@@ -457,7 +457,7 @@ impl<S: storage::Backend> Session<S> {
         if let Ok(blob) = self.storage.load_manifest()
             && Manifest::unlock(
                 &blob,
-                &self.identity.encryption_key(),
+                &self.identity.master_key(),
                 |message, signature_bytes| self.identity.verify(message, signature_bytes),
             )
             .is_err()
@@ -497,7 +497,7 @@ impl<S: storage::Backend> Session<S> {
         let mut size = 0u64;
 
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.master_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -526,7 +526,7 @@ impl<S: storage::Backend> Session<S> {
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.master_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -547,11 +547,9 @@ impl<S: storage::Backend> Session<S> {
     }
 
     fn flush_manifest(&self) -> Result<(), Error> {
-        let data = self
-            .manifest
-            .lock(&self.identity.encryption_key(), |message| {
-                self.identity.sign(message)
-            })?;
+        let data = self.manifest.lock(&self.identity.master_key(), |message| {
+            self.identity.sign(message)
+        })?;
 
         self.storage.save_manifest(&data)?;
 
@@ -596,7 +594,7 @@ mod tests {
         let path = temp_storage_path("");
         let words = make_words();
         let identity = make_identity(&words);
-        let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
 
         Session::new(identity, storage).unwrap()
     }
@@ -616,11 +614,11 @@ mod tests {
     // Only used for tests, blob storage is immutable
     fn overwrite_bytes(
         storage_path: &Path,
-        public_key: &[u8; 32],
+        public_signing_key: &[u8; 32],
         address: &[u8; 32],
         data: &[u8],
     ) {
-        let user_hex: String = Manifest::address(public_key)
+        let user_hex: String = Manifest::address(public_signing_key)
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
@@ -1264,7 +1262,7 @@ mod tests {
 
         {
             let identity = make_identity(&words);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "persistant.txt", b"persistent data");
@@ -1272,7 +1270,7 @@ mod tests {
 
         {
             let identity = make_identity(&words);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "persistant.txt"), b"persistent data");
@@ -1301,8 +1299,8 @@ mod tests {
         let path = temp_storage_path("verify_all_tampered_chunk");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
 
         put_bytes(&mut session, "file", b"important data");
@@ -1313,7 +1311,7 @@ mod tests {
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1325,8 +1323,8 @@ mod tests {
         let path = temp_storage_path("verify_all_tampered_error");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
 
         put_bytes(&mut session, "secret.txt", b"secret");
@@ -1337,7 +1335,7 @@ mod tests {
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let mut buf = Vec::new();
         let result = session.get("secret.txt", &mut buf);
@@ -1350,8 +1348,8 @@ mod tests {
         let path = temp_storage_path("verify_trashed");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
 
         put_bytes(&mut session, "trashed.txt", b"will be trashed");
@@ -1365,7 +1363,7 @@ mod tests {
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1377,8 +1375,8 @@ mod tests {
         let path = temp_storage_path("verify_dedup");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
         let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
 
@@ -1393,7 +1391,7 @@ mod tests {
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-            overwrite_bytes(&path, &public_key, &chunk.address, &blob);
+            overwrite_bytes(&path, &public_signing_key, &chunk.address, &blob);
         }
 
         let tampared = session.verify_all();
@@ -1407,8 +1405,8 @@ mod tests {
         let path = temp_storage_path("verify_shared_tampered");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
 
         put_bytes(&mut session, "file1", b"shared content");
@@ -1420,7 +1418,7 @@ mod tests {
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let tampared = session.verify_all();
 
@@ -1433,8 +1431,8 @@ mod tests {
         let path = temp_storage_path("verify_all_catches_tampered_version");
         let words = make_words();
         let identity = make_identity(&words);
-        let public_key = identity.public_key();
-        let storage = local::Storage::new(&path, &public_key).unwrap();
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
         let mut session = Session::new(identity, storage).unwrap();
 
         put_bytes(&mut session, "file", b"v0");
@@ -1448,7 +1446,7 @@ mod tests {
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let tampered = session.verify_all();
 
@@ -1464,7 +1462,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "user1.txt", b"this data belongs to user 1");
@@ -1472,7 +1470,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
             let mut buf = Vec::new();
 
@@ -1545,7 +1543,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file", b"same content");
@@ -1553,7 +1551,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file", b"same content");
@@ -1561,7 +1559,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"same content");
@@ -1569,7 +1567,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"same content");
@@ -1584,7 +1582,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file1", b"same content");
@@ -1592,7 +1590,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file2", b"same content");
@@ -1600,7 +1598,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file1"), b"same content");
@@ -1608,7 +1606,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file2"), b"same content");
@@ -1623,7 +1621,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file", b"different content 1");
@@ -1631,7 +1629,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut session = Session::new(identity, storage).unwrap();
 
             put_bytes(&mut session, "file", b"different content 2");
@@ -1639,7 +1637,7 @@ mod tests {
 
         {
             let identity = make_identity(&words1);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"different content 1");
@@ -1647,7 +1645,7 @@ mod tests {
 
         {
             let identity = make_identity(&words2);
-            let storage = local::Storage::new(&path, &identity.public_key()).unwrap();
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let session = Session::new(identity, storage).unwrap();
 
             assert_eq!(get_bytes(&session, "file"), b"different content 2");

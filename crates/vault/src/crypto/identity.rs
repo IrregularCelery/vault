@@ -11,7 +11,7 @@ use gate::{
 };
 
 const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
-const DOMAIN_ENCRYPTION: &[u8] = b"vault::encryption";
+const DOMAIN_MASTER: &[u8] = b"vault::encryption";
 const DOMAIN_SIGNING: &[u8] = b"vault::signing";
 
 #[derive(Debug)]
@@ -35,9 +35,10 @@ impl core::fmt::Display for Error {
 }
 
 pub struct Identity {
-    encryption_key: [u8; 32],
-    signing_key: SigningKey,
-    verifying_key: VerifyingKey,
+    master_key: [u8; 32],
+
+    public_signing_key: VerifyingKey,
+    private_signing_key: SigningKey,
 }
 
 impl Identity {
@@ -61,7 +62,7 @@ impl Identity {
         // --- Argon2id ---
         // Password -> UTF-8 bytes of the mnemonic phrase
         // Salt     -> Fixed salt (The mnemonic IS the key, no need for per-user salt)
-        // Output   -> 64 bytes (32 for encryption key domain, 32 for signing key domain)
+        // Output   -> 64 bytes (32 for master key domain, 32 for signing key domain)
         let params = Params::new(64 * 1024, 3, 1, Some(64))
             .map_err(|e| Error::Other(format!("argon2 params: {}", e)))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -73,34 +74,34 @@ impl Identity {
             .map_err(|e| Error::Other(format!("argon2 hash: {}", e)))?;
 
         // Separate domains by hashing each half with a domain tag
-        let encryption_key = Self::derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
+        let master_key = Self::derive_subkey(&seed[..32], DOMAIN_MASTER);
         let signing_seed = Self::derive_subkey(&seed[32..], DOMAIN_SIGNING);
-        let signing_key = SigningKey::from_bytes(&signing_seed);
-        let verifying_key = signing_key.verifying_key();
+        let private_signing_key = SigningKey::from_bytes(&signing_seed);
+        let public_signing_key = private_signing_key.verifying_key();
 
         Ok(Self {
-            encryption_key,
-            signing_key,
-            verifying_key,
+            master_key,
+            public_signing_key,
+            private_signing_key,
         })
     }
 
-    pub fn encryption_key(&self) -> [u8; 32] {
-        self.encryption_key
+    pub fn master_key(&self) -> [u8; 32] {
+        self.master_key
+    }
+
+    pub fn public_signing_key(&self) -> [u8; 32] {
+        self.public_signing_key.to_bytes()
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        self.signing_key.sign(message).to_bytes()
+        self.private_signing_key.sign(message).to_bytes()
     }
 
     pub fn verify(&self, message: &[u8], signature_bytes: &[u8; 64]) -> bool {
         let signature = Signature::from_bytes(signature_bytes);
 
-        self.verifying_key.verify(message, &signature).is_ok()
-    }
-
-    pub fn public_key(&self) -> [u8; 32] {
-        self.verifying_key.to_bytes()
+        self.public_signing_key.verify(message, &signature).is_ok()
     }
 
     fn derive_subkey(material: &[u8], domain: &[u8]) -> [u8; 32] {
@@ -124,8 +125,8 @@ mod tests {
         let id1 = Identity::from_mnemonic(&words).unwrap();
         let id2 = Identity::from_mnemonic(&words).unwrap();
 
-        assert_eq!(id1.public_key(), id2.public_key());
-        assert_eq!(id1.encryption_key, id2.encryption_key);
+        assert_eq!(id1.public_signing_key(), id2.public_signing_key());
+        assert_eq!(id1.master_key, id2.master_key);
     }
 
     #[test]
@@ -133,7 +134,7 @@ mod tests {
         let words = bip39::generate(12).unwrap();
         let id = Identity::from_mnemonic(&words).unwrap();
 
-        assert_ne!(id.encryption_key, id.signing_key.to_bytes());
+        assert_ne!(id.master_key, id.private_signing_key.to_bytes());
     }
 
     #[test]
@@ -143,8 +144,8 @@ mod tests {
         let id1 = Identity::from_mnemonic(&words1).unwrap();
         let id2 = Identity::from_mnemonic(&words2).unwrap();
 
-        assert_ne!(id1.public_key(), id2.public_key());
-        assert_ne!(id1.encryption_key, id2.encryption_key);
+        assert_ne!(id1.public_signing_key(), id2.public_signing_key());
+        assert_ne!(id1.master_key, id2.master_key);
     }
 
     #[test]
