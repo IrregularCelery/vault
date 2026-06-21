@@ -3,6 +3,7 @@ use gate::{
         argon2::{Algorithm, Argon2, Params, Version},
         bip39, blake3,
         ed25519::{Signature, Signer, SigningKey, Verifier, VerifyingKey},
+        x25519::{PublicKey, StaticSecret},
     },
     sys::{
         macros::{format, vec::Vec},
@@ -13,6 +14,7 @@ use gate::{
 const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
 const DOMAIN_ENCRYPTION: &str = "vault::encryption";
 const DOMAIN_SIGNING: &str = "vault::signing";
+const DOMAIN_EXCHANGE: &str = "vault::exchange";
 
 #[derive(Debug)]
 pub enum Error {
@@ -39,6 +41,9 @@ pub struct Identity {
 
     public_signing_key: VerifyingKey,
     private_signing_key: SigningKey,
+
+    public_exchange_key: PublicKey,
+    private_exchange_key: StaticSecret,
 }
 
 impl Identity {
@@ -63,14 +68,20 @@ impl Identity {
     pub fn from_seed(seed: &[u8; 64]) -> Self {
         let encryption_key = blake3::derive_key(DOMAIN_ENCRYPTION, seed);
         let signing_seed = blake3::derive_key(DOMAIN_SIGNING, seed);
+        let exchange_seed = blake3::derive_key(DOMAIN_EXCHANGE, seed);
 
         let private_signing_key = SigningKey::from_bytes(&signing_seed);
         let public_signing_key = private_signing_key.verifying_key();
+
+        let private_exchange_key = StaticSecret::from(exchange_seed);
+        let public_exchange_key = PublicKey::from(&private_exchange_key);
 
         Self {
             encryption_key,
             public_signing_key,
             private_signing_key,
+            public_exchange_key,
+            private_exchange_key,
         }
     }
 
@@ -100,6 +111,10 @@ impl Identity {
         self.public_signing_key.to_bytes()
     }
 
+    pub fn public_exchange_key(&self) -> [u8; 32] {
+        self.public_exchange_key.to_bytes()
+    }
+
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.private_signing_key.sign(message).to_bytes()
     }
@@ -121,16 +136,31 @@ mod tests {
         let id1 = Identity::from_mnemonic(&words).unwrap();
         let id2 = Identity::from_mnemonic(&words).unwrap();
 
-        assert_eq!(id1.public_signing_key(), id2.public_signing_key());
         assert_eq!(id1.encryption_key, id2.encryption_key);
+        assert_eq!(id1.public_signing_key(), id2.public_signing_key());
+        assert_eq!(id1.public_exchange_key(), id2.public_exchange_key());
     }
 
     #[test]
-    fn enc_and_sign_keys_are_different() {
+    fn encryption_and_signing_keys_are_different() {
         let words = bip39::generate(12).unwrap();
         let id = Identity::from_mnemonic(&words).unwrap();
 
         assert_ne!(id.encryption_key, id.private_signing_key.to_bytes());
+    }
+
+    #[test]
+    fn signing_exchange_keys_are_different() {
+        let words = bip39::generate(12).unwrap();
+        let id = Identity::from_mnemonic(&words).unwrap();
+
+        assert_ne!(id.public_signing_key(), id.public_exchange_key());
+        assert_ne!(
+            id.private_signing_key.to_bytes(),
+            id.private_exchange_key.to_bytes()
+        );
+        assert_ne!(id.public_signing_key(), id.private_exchange_key.to_bytes());
+        assert_ne!(id.private_signing_key.to_bytes(), id.public_exchange_key());
     }
 
     #[test]
@@ -169,29 +199,29 @@ mod tests {
         let words2 = bip39::generate(12).unwrap();
         let id1 = Identity::from_mnemonic(&words1).unwrap();
         let id2 = Identity::from_mnemonic(&words2).unwrap();
-        let sig = id1.sign(b"message");
+        let signature = id1.sign(b"message");
 
         // id2 must not be able to verify id1's signature
-        assert!(!id2.verify(b"message", &sig));
+        assert!(!id2.verify(b"message", &signature));
     }
 
     #[test]
     fn tampered_signature_fails() {
         let words = bip39::generate(12).unwrap();
         let id = Identity::from_mnemonic(&words).unwrap();
-        let mut sig = id.sign(b"message");
+        let mut signature = id.sign(b"message");
 
-        sig[0] ^= 0xFF; // flip bits in the first byte
+        signature[0] ^= 0xFF; // flip bits in the first byte
 
-        assert!(!id.verify(b"message", &sig));
+        assert!(!id.verify(b"message", &signature));
     }
 
     #[test]
     fn empty_message_roundtrip() {
         let words = bip39::generate(12).unwrap();
         let id = Identity::from_mnemonic(&words).unwrap();
-        let sig = id.sign(b"");
+        let signature = id.sign(b"");
 
-        assert!(id.verify(b"", &sig));
+        assert!(id.verify(b"", &signature));
     }
 }
