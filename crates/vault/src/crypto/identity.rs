@@ -11,7 +11,7 @@ use gate::{
 };
 
 const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
-const DOMAIN_MASTER: &[u8] = b"vault::encryption";
+const DOMAIN_ENCRYPTION: &[u8] = b"vault::encryption";
 const DOMAIN_SIGNING: &[u8] = b"vault::signing";
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl core::fmt::Display for Error {
 }
 
 pub struct Identity {
-    master_key: [u8; 32],
+    encryption_key: [u8; 32],
 
     public_signing_key: VerifyingKey,
     private_signing_key: SigningKey,
@@ -62,7 +62,7 @@ impl Identity {
         // --- Argon2id ---
         // Password -> UTF-8 bytes of the mnemonic phrase
         // Salt     -> Fixed salt (The mnemonic IS the key, no need for per-user salt)
-        // Output   -> 64 bytes (32 for master key domain, 32 for signing key domain)
+        // Output   -> 64 bytes (32 for encryption key domain, 32 for signing key domain)
         let params = Params::new(64 * 1024, 3, 1, Some(64))
             .map_err(|e| Error::Other(format!("argon2 params: {}", e)))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -74,20 +74,20 @@ impl Identity {
             .map_err(|e| Error::Other(format!("argon2 hash: {}", e)))?;
 
         // Separate domains by hashing each half with a domain tag
-        let master_key = Self::derive_subkey(&seed[..32], DOMAIN_MASTER);
+        let encryption_key = Self::derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
         let signing_seed = Self::derive_subkey(&seed[32..], DOMAIN_SIGNING);
         let private_signing_key = SigningKey::from_bytes(&signing_seed);
         let public_signing_key = private_signing_key.verifying_key();
 
         Ok(Self {
-            master_key,
+            encryption_key,
             public_signing_key,
             private_signing_key,
         })
     }
 
-    pub fn master_key(&self) -> [u8; 32] {
-        self.master_key
+    pub fn encryption_key(&self) -> [u8; 32] {
+        self.encryption_key
     }
 
     pub fn public_signing_key(&self) -> [u8; 32] {
@@ -108,6 +108,7 @@ impl Identity {
         // BLAKE3 hashing key needs exactly 32-bytes for the key
         let mut key = [0u8; 32];
         let len = material.len().min(32);
+
         key[..len].copy_from_slice(&material[..len]);
 
         // Use domain as the input so the output is bound to both the key material and the domain
@@ -126,7 +127,7 @@ mod tests {
         let id2 = Identity::from_mnemonic(&words).unwrap();
 
         assert_eq!(id1.public_signing_key(), id2.public_signing_key());
-        assert_eq!(id1.master_key, id2.master_key);
+        assert_eq!(id1.encryption_key, id2.encryption_key);
     }
 
     #[test]
@@ -134,7 +135,7 @@ mod tests {
         let words = bip39::generate(12).unwrap();
         let id = Identity::from_mnemonic(&words).unwrap();
 
-        assert_ne!(id.master_key, id.private_signing_key.to_bytes());
+        assert_ne!(id.encryption_key, id.private_signing_key.to_bytes());
     }
 
     #[test]
@@ -145,7 +146,7 @@ mod tests {
         let id2 = Identity::from_mnemonic(&words2).unwrap();
 
         assert_ne!(id1.public_signing_key(), id2.public_signing_key());
-        assert_ne!(id1.master_key, id2.master_key);
+        assert_ne!(id1.encryption_key, id2.encryption_key);
     }
 
     #[test]

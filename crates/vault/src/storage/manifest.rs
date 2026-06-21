@@ -477,21 +477,21 @@ impl Manifest {
 
     pub fn lock(
         &self,
-        master_key: &[u8; 32],
+        encryption_key: &[u8; 32],
         sign: impl Fn(&[u8]) -> [u8; 64],
     ) -> Result<Vec<u8>, Error> {
         let plaintext = self.serialize();
-        let locked = cipher::lock(master_key, &plaintext, sign)?;
+        let locked = cipher::lock(encryption_key, &plaintext, sign)?;
 
         Ok(locked)
     }
 
     pub fn unlock(
         blob: &[u8],
-        master_key: &[u8; 32],
+        encryption_key: &[u8; 32],
         verify: impl Fn(&[u8], &[u8; 64]) -> bool,
     ) -> Result<Self, Error> {
-        let unlocked = cipher::unlock(master_key, blob, verify)?;
+        let unlocked = cipher::unlock(encryption_key, blob, verify)?;
 
         Self::deserialize(&unlocked)
     }

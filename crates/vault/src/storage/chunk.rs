@@ -33,12 +33,12 @@ impl<'a> Chunk<'a> {
         Self { data }
     }
 
-    pub fn address(&self, master_key: &[u8; 32]) -> [u8; 32] {
-        *blake3::keyed_hash(master_key, self.data).as_bytes()
+    pub fn address(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
+        *blake3::keyed_hash(encryption_key, self.data).as_bytes()
     }
 
-    pub fn key(&self, master_key: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_keyed(master_key);
+    pub fn key(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_keyed(encryption_key);
 
         hasher.update(DOMAIN_CHUNK_KEY);
         hasher.update(self.data);

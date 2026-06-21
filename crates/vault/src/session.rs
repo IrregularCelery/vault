@@ -95,7 +95,7 @@ impl<S: storage::Backend> Session<S> {
         let manifest = match storage.load_manifest() {
             Ok(manifest) => Manifest::unlock(
                 &manifest,
-                &identity.master_key(),
+                &identity.encryption_key(),
                 |message, signature_bytes| identity.verify(message, signature_bytes),
             )
             .map_err(|e| match e {
@@ -118,10 +118,10 @@ impl<S: storage::Backend> Session<S> {
         let mut entry_chunks = Vec::new();
 
         while let Some(chunk) = chunks.next_chunk()? {
-            let address = chunk.address(&self.identity.master_key());
-            let key = chunk.key(&self.identity.master_key());
+            let address = chunk.address(&self.identity.encryption_key());
+            let key = chunk.key(&self.identity.encryption_key());
             let encrypted_chunk_key =
-                cipher::encrypt(&self.identity.master_key(), &key).map_err(Error::Cipher)?;
+                cipher::encrypt(&self.identity.encryption_key(), &key).map_err(Error::Cipher)?;
             let mut encrypted_key = [0u8; 60];
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
@@ -457,7 +457,7 @@ impl<S: storage::Backend> Session<S> {
         if let Ok(blob) = self.storage.load_manifest()
             && Manifest::unlock(
                 &blob,
-                &self.identity.master_key(),
+                &self.identity.encryption_key(),
                 |message, signature_bytes| self.identity.verify(message, signature_bytes),
             )
             .is_err()
@@ -497,7 +497,7 @@ impl<S: storage::Backend> Session<S> {
         let mut size = 0u64;
 
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.master_key(), &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -526,7 +526,7 @@ impl<S: storage::Backend> Session<S> {
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.master_key(), &chunk.encrypted_key)
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
                 .map_err(Error::Cipher)?;
             let key = chunk_key
                 .as_slice()
@@ -547,9 +547,11 @@ impl<S: storage::Backend> Session<S> {
     }
 
     fn flush_manifest(&self) -> Result<(), Error> {
-        let data = self.manifest.lock(&self.identity.master_key(), |message| {
-            self.identity.sign(message)
-        })?;
+        let data = self
+            .manifest
+            .lock(&self.identity.encryption_key(), |message| {
+                self.identity.sign(message)
+            })?;
 
         self.storage.save_manifest(&data)?;
 
