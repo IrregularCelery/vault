@@ -11,8 +11,8 @@ use gate::{
 };
 
 const KDF_SALT: &[u8] = b"vault::kdf::v1::salt";
-const DOMAIN_ENCRYPTION: &[u8] = b"vault::encryption";
-const DOMAIN_SIGNING: &[u8] = b"vault::signing";
+const DOMAIN_ENCRYPTION: &str = "vault::encryption";
+const DOMAIN_SIGNING: &str = "vault::signing";
 
 #[derive(Debug)]
 pub enum Error {
@@ -51,14 +51,30 @@ impl Identity {
 
         bip39::validate(&words).map_err(|_| Error::InvalidMnemonic)?;
 
-        Self::from_phrase(&words.join(" "))
-    }
+        let phrase = words.join(" ");
 
-    fn from_phrase(phrase: &str) -> Result<Self, Error> {
-        if bip39::VECTORS.contains(&phrase.trim()) {
+        if bip39::VECTORS.contains(&phrase.as_str()) {
             return Err(Error::UnsafeMnemonic);
         }
 
+        Self::from_phrase(&phrase)
+    }
+
+    pub fn from_seed(seed: &[u8; 64]) -> Self {
+        let encryption_key = blake3::derive_key(DOMAIN_ENCRYPTION, seed);
+        let signing_seed = blake3::derive_key(DOMAIN_SIGNING, seed);
+
+        let private_signing_key = SigningKey::from_bytes(&signing_seed);
+        let public_signing_key = private_signing_key.verifying_key();
+
+        Self {
+            encryption_key,
+            public_signing_key,
+            private_signing_key,
+        }
+    }
+
+    fn from_phrase(phrase: &str) -> Result<Self, Error> {
         // --- Argon2id ---
         // Password -> UTF-8 bytes of the mnemonic phrase
         // Salt     -> Fixed salt (The mnemonic IS the key, no need for per-user salt)
@@ -73,17 +89,7 @@ impl Identity {
             .hash_password_into(phrase.as_bytes(), salt, &mut seed)
             .map_err(|e| Error::Other(format!("argon2 hash: {}", e)))?;
 
-        // Separate domains by hashing each half with a domain tag
-        let encryption_key = Self::derive_subkey(&seed[..32], DOMAIN_ENCRYPTION);
-        let signing_seed = Self::derive_subkey(&seed[32..], DOMAIN_SIGNING);
-        let private_signing_key = SigningKey::from_bytes(&signing_seed);
-        let public_signing_key = private_signing_key.verifying_key();
-
-        Ok(Self {
-            encryption_key,
-            public_signing_key,
-            private_signing_key,
-        })
+        Ok(Self::from_seed(&seed))
     }
 
     pub fn encryption_key(&self) -> [u8; 32] {
@@ -102,17 +108,6 @@ impl Identity {
         let signature = Signature::from_bytes(signature_bytes);
 
         self.public_signing_key.verify(message, &signature).is_ok()
-    }
-
-    fn derive_subkey(material: &[u8], domain: &[u8]) -> [u8; 32] {
-        // BLAKE3 hashing key needs exactly 32-bytes for the key
-        let mut key = [0u8; 32];
-        let len = material.len().min(32);
-
-        key[..len].copy_from_slice(&material[..len]);
-
-        // Use domain as the input so the output is bound to both the key material and the domain
-        *blake3::keyed_hash(&key, domain).as_bytes()
     }
 }
 
