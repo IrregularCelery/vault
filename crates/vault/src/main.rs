@@ -1,6 +1,6 @@
 #![no_std]
 
-use vault::{crypto::identity::Identity, session::Session, storage::local};
+use vault::{identity::Identity, session::Session, storage::local};
 
 use gate::{
     crypto::bip39,

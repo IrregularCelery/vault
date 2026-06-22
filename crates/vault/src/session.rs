@@ -7,7 +7,8 @@ use gate::sys::{
 };
 
 use crate::{
-    crypto::{cipher, identity::Identity},
+    crypto::cipher,
+    identity::Identity,
     storage::{
         self,
         chunk::{self, Chunks},
