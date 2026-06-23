@@ -26,6 +26,7 @@
 use crate::crypto::cipher;
 
 use gate::{
+    codec::binary,
     crypto::blake3,
     sys::{
         collections::btree_map::BTreeMap,
@@ -42,6 +43,7 @@ const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
 pub enum Error {
     Cipher(cipher::Error),
     Corrupted(&'static str),
+    Codec(&'static str),
     UnsupportedVersion(u16),
     NotFound,
     NotTrashed,
@@ -55,6 +57,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
+            Self::Codec(e) => write!(f, "codec: {}", e),
             Self::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {}", v),
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
@@ -70,6 +73,15 @@ impl From<cipher::Error> for Error {
         match value {
             cipher::Error::InvalidSignature => Self::Tampered,
             other => Self::Cipher(other),
+        }
+    }
+}
+
+impl From<binary::Error> for Error {
+    fn from(value: binary::Error) -> Self {
+        match value {
+            binary::Error::OutOfBounds => Self::Codec("binary codec buffer boundary violation"),
+            binary::Error::InvalidUtf8 => Self::Codec("invalid UTF-8 string"),
         }
     }
 }
@@ -285,183 +297,114 @@ impl Manifest {
         *blake3::hash(&input).as_bytes()
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        fn write_u16(buf: &mut Vec<u8>, value: u16) {
-            buf.extend_from_slice(&value.to_be_bytes());
-        }
-        fn write_u32(buf: &mut Vec<u8>, value: u32) {
-            buf.extend_from_slice(&value.to_be_bytes());
-        }
-        fn write_u64(buf: &mut Vec<u8>, value: u64) {
-            buf.extend_from_slice(&value.to_be_bytes());
-        }
-        fn write_chunks(buf: &mut Vec<u8>, chunks: &[EntryChunk]) {
-            write_u32(buf, chunks.len() as u32);
+    pub fn serialize(&self) -> Result<Vec<u8>, Error> {
+        // Estimated size for each entry, 2 chunks, no versions
+        let mut writer = binary::Writer::with_capacity(self.entries.len() * 256);
 
-            for c in chunks {
-                buf.extend_from_slice(&c.address);
-                buf.extend_from_slice(&c.encrypted_key);
-            }
-        }
-
-        let mut buf = Vec::new();
-
-        write_u16(&mut buf, MANIFEST_VERSION);
-        write_u32(&mut buf, self.entries.len() as u32);
+        writer.write_u16(MANIFEST_VERSION);
+        writer.write_u32(self.entries.len() as u32);
 
         for (path, entry) in &self.entries {
-            let path_bytes = path.as_bytes();
+            writer
+                .write_str_u16(path)
+                .map_err(|_| Error::Codec("path string size bounds exceeds u16 limits"))?;
+            writer.write_u32(entry.chunks.len() as u32);
 
-            write_u16(&mut buf, path_bytes.len() as u16);
-
-            buf.extend_from_slice(path_bytes);
-
-            write_chunks(&mut buf, &entry.chunks);
-            write_u32(&mut buf, entry.versions.len() as u32);
-
-            for version in &entry.versions {
-                write_chunks(&mut buf, &version.chunks);
-                write_u64(&mut buf, version.size);
-                write_u64(&mut buf, version.modified);
+            for chunk in &entry.chunks {
+                writer.write_bytes(&chunk.address);
+                writer.write_bytes(&chunk.encrypted_key);
             }
 
-            write_u64(&mut buf, entry.size);
-            write_u64(&mut buf, entry.modified);
-            write_u64(&mut buf, entry.trashed);
+            writer.write_u32(entry.versions.len() as u32);
+
+            for version in &entry.versions {
+                writer.write_u32(version.chunks.len() as u32);
+
+                for version_chunk in &version.chunks {
+                    writer.write_bytes(&version_chunk.address);
+                    writer.write_bytes(&version_chunk.encrypted_key);
+                }
+
+                writer.write_u64(version.size);
+                writer.write_u64(version.modified);
+            }
+
+            writer.write_u64(entry.size);
+            writer.write_u64(entry.modified);
+            writer.write_u64(entry.trashed);
         }
 
-        buf
+        Ok(writer.finish())
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
-        fn read_u16(data: &[u8], current: &mut usize) -> Result<u16, Error> {
-            let end = *current + 2;
-
-            if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading u16"));
-            }
-
-            let mut bytes = [0u8; 2];
-
-            bytes.copy_from_slice(&data[*current..end]);
-
-            *current = end;
-
-            Ok(u16::from_be_bytes(bytes))
-        }
-        fn read_u32(data: &[u8], current: &mut usize) -> Result<u32, Error> {
-            let end = *current + 4;
-
-            if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading u32"));
-            }
-
-            let mut bytes = [0u8; 4];
-
-            bytes.copy_from_slice(&data[*current..end]);
-
-            *current = end;
-
-            Ok(u32::from_be_bytes(bytes))
-        }
-        fn read_u64(data: &[u8], current: &mut usize) -> Result<u64, Error> {
-            let end = *current + 8;
-
-            if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading u64"));
-            }
-
-            let mut bytes = [0u8; 8];
-
-            bytes.copy_from_slice(&data[*current..end]);
-
-            *current = end;
-
-            Ok(u64::from_be_bytes(bytes))
-        }
-        fn read_bytes<const N: usize>(data: &[u8], current: &mut usize) -> Result<[u8; N], Error> {
-            let end = *current + N;
-
-            if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading bytes"));
-            }
-
-            let bytes = data[*current..end]
-                .try_into()
-                .map_err(|_| Error::Corrupted("failed to convert to array"))?;
-
-            *current = end;
-
-            Ok(bytes)
-        }
-        fn read_str(data: &[u8], current: &mut usize, len: usize) -> Result<String, Error> {
-            let end = *current + len;
-
-            if end > data.len() {
-                return Err(Error::Corrupted("unexpected end reading string"));
-            }
-
-            let string = core::str::from_utf8(&data[*current..end])
-                .map_err(|_| Error::Corrupted("invalid UTF-8 in path"))?
-                .into();
-
-            *current = end;
-
-            Ok(string)
-        }
-        fn read_chunks(data: &[u8], current: &mut usize) -> Result<Vec<EntryChunk>, Error> {
-            let count = read_u32(data, current)? as usize;
-            let mut chunks = Vec::with_capacity(count);
-
-            for _ in 0..count {
-                let address = read_bytes(data, current)?;
-                let encrypted_key = read_bytes(data, current)?;
-
-                chunks.push(EntryChunk {
-                    address,
-                    encrypted_key,
-                });
-            }
-
-            Ok(chunks)
-        }
-
-        let mut current = 0usize;
-        let version = read_u16(data, &mut current)?;
+        let mut reader = binary::Reader::new(data);
+        let version = reader.read_u16()?;
 
         // NOTE: If we ever bump the version, this should gracefully handle data migration.
         if version != MANIFEST_VERSION {
             return Err(Error::UnsupportedVersion(version));
         }
 
-        let entry_count = read_u32(data, &mut current)? as usize;
+        let entry_count = reader.read_u32()? as usize;
         let mut entries = BTreeMap::new();
 
         for _ in 0..entry_count {
-            let path_len = read_u16(data, &mut current)? as usize;
-            let path = read_str(data, &mut current, path_len)?;
-            let chunks = read_chunks(data, &mut current)?;
-            let version_count = read_u32(data, &mut current)? as usize;
+            let path = reader.read_str_u16()?;
+            let chunk_count = reader.read_u32()? as usize;
+
+            if chunk_count * 92 /* address + encrypted_key */ > reader.remaining() {
+                return Err(Error::Codec(
+                    "chunk count specifies more data than what remains in the buffer",
+                ));
+            }
+
+            let mut chunks = Vec::with_capacity(chunk_count);
+
+            for _ in 0..chunk_count {
+                chunks.push(EntryChunk {
+                    address: *reader.read_bytes()?,
+                    encrypted_key: *reader.read_bytes()?,
+                });
+            }
+
+            let version_count = reader.read_u32()? as usize;
             let mut versions = Vec::with_capacity(version_count);
 
             for _ in 0..version_count {
-                let chunks = read_chunks(data, &mut current)?;
-                let size = read_u64(data, &mut current)?;
-                let modified = read_u64(data, &mut current)?;
+                let version_chunk_count = reader.read_u32()? as usize;
+
+                if version_chunk_count * 92 /* address + encrypted_key */ > reader.remaining() {
+                    return Err(Error::Codec(
+                        "chunk count specifies more data than what remains in the buffer",
+                    ));
+                }
+
+                let mut version_chunks = Vec::with_capacity(version_chunk_count);
+
+                for _ in 0..version_chunk_count {
+                    version_chunks.push(EntryChunk {
+                        address: *reader.read_bytes()?,
+                        encrypted_key: *reader.read_bytes()?,
+                    });
+                }
+
+                let size = reader.read_u64()?;
+                let modified = reader.read_u64()?;
 
                 versions.push(Version {
-                    chunks,
+                    chunks: version_chunks,
                     size,
                     modified,
                 });
             }
 
-            let size = read_u64(data, &mut current)?;
-            let modified = read_u64(data, &mut current)?;
-            let trashed = read_u64(data, &mut current)?;
+            let size = reader.read_u64()?;
+            let modified = reader.read_u64()?;
+            let trashed = reader.read_u64()?;
 
             entries.insert(
-                path,
+                path.into(),
                 Entry {
                     chunks,
                     versions,
@@ -480,7 +423,7 @@ impl Manifest {
         encryption_key: &[u8; 32],
         sign: impl Fn(&[u8]) -> [u8; 64],
     ) -> Result<Vec<u8>, Error> {
-        let plaintext = self.serialize();
+        let plaintext = self.serialize()?;
         let locked = cipher::lock(encryption_key, &plaintext, sign)?;
 
         Ok(locked)
@@ -637,7 +580,7 @@ mod tests {
     #[test]
     fn serialize_deserialize_roundtrip() {
         let manifest = manifest();
-        let bytes = manifest.serialize();
+        let bytes = manifest.serialize().unwrap();
         let deserialized = Manifest::deserialize(&bytes).unwrap();
 
         assert_eq!(manifest, deserialized);
@@ -649,7 +592,7 @@ mod tests {
 
         manifest.trash("photos/image.png").unwrap();
 
-        let deserialized = Manifest::deserialize(&manifest.serialize()).unwrap();
+        let deserialized = Manifest::deserialize(&manifest.serialize().unwrap()).unwrap();
 
         assert_eq!(manifest, deserialized);
         assert_ne!(
@@ -687,7 +630,7 @@ mod tests {
             },
         );
 
-        let bytes = manifest.serialize();
+        let bytes = manifest.serialize().unwrap();
         let deserialized = Manifest::deserialize(&bytes).unwrap();
 
         assert_eq!(manifest, deserialized);
@@ -746,7 +689,7 @@ mod tests {
     #[test]
     fn version_mismatch() {
         let manifest = manifest();
-        let mut bytes = manifest.serialize();
+        let mut bytes = manifest.serialize().unwrap();
 
         // Change the version bytes
         bytes[0] = 0xFF;
