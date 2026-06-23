@@ -42,10 +42,10 @@ impl Storage {
         self.root.join(MANIFEST_FILENAME)
     }
 
-    fn blob_path(&self, hash: &[u8; 32]) -> PathBuf {
+    fn blob_path(&self, address: &[u8; 32]) -> PathBuf {
         self.root
             .join(BLOBS_DIRNAME)
-            .join(PathBuf::from(HashPath::new(hash)))
+            .join(PathBuf::from(HashPath::new(address)))
     }
 }
 
@@ -67,8 +67,8 @@ impl Backend for Storage {
         Ok(fs::read(&path)?)
     }
 
-    fn put_blob(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error> {
-        let path = self.blob_path(hash);
+    fn put_blob(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error> {
+        let path = self.blob_path(address);
 
         if path.exists() {
             return Ok(()); // No-op in content-addressed, file already exists
@@ -87,18 +87,18 @@ impl Backend for Storage {
         Ok(())
     }
 
-    fn get_blob(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error> {
-        let path = self.blob_path(hash);
+    fn get_blob(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error> {
+        let path = self.blob_path(address);
 
         Ok(fs::read(&path)?)
     }
 
-    fn exists_blob(&self, hash: &[u8; 32]) -> Result<bool, Error> {
-        Ok(self.blob_path(hash).exists())
+    fn exists_blob(&self, address: &[u8; 32]) -> Result<bool, Error> {
+        Ok(self.blob_path(address).exists())
     }
 
-    fn delete_blob(&self, hash: &[u8; 32]) -> Result<(), Error> {
-        let path = self.blob_path(hash);
+    fn delete_blob(&self, address: &[u8; 32]) -> Result<(), Error> {
+        let path = self.blob_path(address);
 
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -108,32 +108,32 @@ impl Backend for Storage {
     }
 
     fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error> {
-        let mut hashes = Vec::new();
+        let mut addresses = Vec::new();
 
         // Must be 3 levels: ./xx/xx/xxxxxx...
         let entries = match fs::read_dir(self.root.join(BLOBS_DIRNAME)) {
             Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(hashes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(addresses),
             Err(e) => return Err(Error::Io(e)),
         };
 
-        fn path_to_hash(dir: &str, subdir: &str, file: &str) -> Option<[u8; 32]> {
+        fn path_to_address(dir: &str, subdir: &str, file: &str) -> Option<[u8; 32]> {
             if dir.len() != 2 || subdir.len() != 2 || file.len() != 60 {
                 return None;
             }
 
-            let mut hash = [0u8; 32];
+            let mut address = [0u8; 32];
 
-            hash[0] = u8::from_str_radix(dir, 16).ok()?;
-            hash[1] = u8::from_str_radix(subdir, 16).ok()?;
+            address[0] = u8::from_str_radix(dir, 16).ok()?;
+            address[1] = u8::from_str_radix(subdir, 16).ok()?;
 
             for (i, chunk) in file.as_bytes().chunks(2).enumerate() {
                 let chunk_str = core::str::from_utf8(chunk).ok()?;
 
-                hash[2 + i] = u8::from_str_radix(chunk_str, 16).ok()?;
+                address[2 + i] = u8::from_str_radix(chunk_str, 16).ok()?;
             }
 
-            Some(hash)
+            Some(address)
         }
 
         for dir in entries.flatten() {
@@ -165,15 +165,15 @@ impl Backend for Storage {
                         dir.file_name().to_str(),
                         subdir.file_name().to_str(),
                         file.file_name().to_str(),
-                    ) && let Some(hash) = path_to_hash(dir, subdir, file)
+                    ) && let Some(address) = path_to_address(dir, subdir, file)
                     {
-                        hashes.push(hash);
+                        addresses.push(address);
                     }
                 }
             }
         }
 
-        Ok(hashes)
+        Ok(addresses)
     }
 }
 
@@ -211,32 +211,32 @@ mod tests {
     #[test]
     fn put_get_roundtrip() {
         let storage = temp_storage("roundtrip");
-        let hash = [0; 32];
+        let address = [0; 32];
         let data = b"data";
 
-        storage.put_blob(&hash, data).unwrap();
+        storage.put_blob(&address, data).unwrap();
 
-        assert_eq!(storage.get_blob(&hash).unwrap(), data);
+        assert_eq!(storage.get_blob(&address).unwrap(), data);
     }
 
     #[test]
     fn exists() {
         let storage = temp_storage("exists");
-        let hash = [1; 32];
+        let address = [1; 32];
         let data = b"data";
 
-        assert!(!storage.exists_blob(&hash).unwrap());
+        assert!(!storage.exists_blob(&address).unwrap());
 
-        storage.put_blob(&hash, data).unwrap();
+        storage.put_blob(&address, data).unwrap();
 
-        assert!(storage.exists_blob(&hash).unwrap());
+        assert!(storage.exists_blob(&address).unwrap());
     }
 
     #[test]
     fn not_found() {
         let storage = temp_storage("not_found");
-        let hash = [2; 32];
-        let got = storage.get_blob(&hash);
+        let address = [2; 32];
+        let got = storage.get_blob(&address);
 
         assert!(matches!(got, Err(Error::NotFound)));
     }
@@ -244,47 +244,47 @@ mod tests {
     #[test]
     fn no_op_put() {
         let storage = temp_storage("no_op_put");
-        let hash = [3; 32];
+        let address = [3; 32];
 
-        storage.put_blob(&hash, b"first write").unwrap();
+        storage.put_blob(&address, b"first write").unwrap();
         storage
-            .put_blob(&hash, b"second write - should be ignored")
+            .put_blob(&address, b"second write - should be ignored")
             .unwrap();
 
-        // Same hash so the second put is a no-op, original data preserved
-        assert_eq!(storage.get_blob(&hash).unwrap(), b"first write");
+        // Same address so the second put is a no-op, original data preserved
+        assert_eq!(storage.get_blob(&address).unwrap(), b"first write");
     }
 
     #[test]
     fn delete() {
         let storage = temp_storage("delete");
-        let hash = [4; 32];
+        let address = [4; 32];
 
-        storage.put_blob(&hash, b"gonna get deleted").unwrap();
-        storage.delete_blob(&hash).unwrap();
+        storage.put_blob(&address, b"gonna get deleted").unwrap();
+        storage.delete_blob(&address).unwrap();
 
-        assert!(!storage.exists_blob(&hash).unwrap());
+        assert!(!storage.exists_blob(&address).unwrap());
     }
 
     #[test]
     fn delete_non_existent() {
         let storage = temp_storage("delete_non_existent");
-        let hash = [5; 32];
+        let address = [5; 32];
 
-        assert!(storage.delete_blob(&hash).is_ok());
+        assert!(storage.delete_blob(&address).is_ok());
     }
 
     #[test]
     fn list() {
         let storage = temp_storage("list");
-        let hash1 = [6; 32];
-        let hash2 = [7; 32];
+        let address1 = [6; 32];
+        let address2 = [7; 32];
 
-        storage.put_blob(&hash1, b"a").unwrap();
-        storage.put_blob(&hash2, b"b").unwrap();
+        storage.put_blob(&address1, b"a").unwrap();
+        storage.put_blob(&address2, b"b").unwrap();
 
         let mut list = storage.list_blobs().unwrap();
-        let expected = vec![hash1, hash2];
+        let expected = vec![address1, address2];
 
         list.sort();
 
@@ -297,9 +297,9 @@ mod tests {
         use gate::sys::{fs::Permissions, os::unix::fs::PermissionsExt};
 
         let storage = temp_storage("list_inaccessible");
-        let hash = [8; 32];
+        let address = [8; 32];
 
-        storage.put_blob(&hash, b"accessible payload").unwrap();
+        storage.put_blob(&address, b"accessible payload").unwrap();
 
         let broken_dir = storage.root.join(BLOBS_DIRNAME).join("ff");
 
@@ -320,7 +320,7 @@ mod tests {
             "Should have skipped the broken directory instead of failing"
         );
         assert_eq!(
-            list[0], hash,
+            list[0], address,
             "The valid chunk must still be collected safely"
         );
     }

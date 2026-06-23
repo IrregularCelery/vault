@@ -31,9 +31,9 @@ pub trait Backend {
     fn save_manifest(&self, data: &[u8]) -> Result<(), Error>;
     fn load_manifest(&self) -> Result<Vec<u8>, Error>;
 
-    fn put_blob(&self, hash: &[u8; 32], data: &[u8]) -> Result<(), Error>;
-    fn get_blob(&self, hash: &[u8; 32]) -> Result<Vec<u8>, Error>;
-    fn exists_blob(&self, hash: &[u8; 32]) -> Result<bool, Error>;
-    fn delete_blob(&self, hash: &[u8; 32]) -> Result<(), Error>;
+    fn put_blob(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error>;
+    fn get_blob(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error>;
+    fn exists_blob(&self, address: &[u8; 32]) -> Result<bool, Error>;
+    fn delete_blob(&self, address: &[u8; 32]) -> Result<(), Error>;
     fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error>;
 }
