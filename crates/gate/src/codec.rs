@@ -4,7 +4,20 @@ pub mod binary {
     #[derive(Debug)]
     pub enum Error {
         OutOfBounds,
+        InvalidBool,
         InvalidUtf8,
+        Other(&'static str),
+    }
+
+    impl core::fmt::Display for Error {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::OutOfBounds => write!(f, "binary codec buffer boundary violation"),
+                Self::InvalidBool => write!(f, "invalid bool byte"),
+                Self::InvalidUtf8 => write!(f, "invalid UTF-8 string"),
+                Self::Other(e) => write!(f, "codec: {}", e),
+            }
+        }
     }
 
     pub struct Writer {
@@ -19,7 +32,7 @@ pub mod binary {
         }
 
         pub fn write_u8(&mut self, value: u8) {
-            self.output.extend_from_slice(&value.to_be_bytes());
+            self.output.push(value);
         }
 
         pub fn write_u16(&mut self, value: u16) {
@@ -34,6 +47,16 @@ pub mod binary {
             self.output.extend_from_slice(&value.to_be_bytes());
         }
 
+        pub fn write_bool(&mut self, value: bool) {
+            if value {
+                self.write_u8(0x01);
+
+                return;
+            }
+
+            self.write_u8(0x00);
+        }
+
         pub fn write_bytes(&mut self, value: &[u8]) {
             self.output.extend_from_slice(value);
         }
@@ -45,6 +68,20 @@ pub mod binary {
 
             self.write_u32(value.len() as u32);
             self.write_bytes(value);
+
+            Ok(())
+        }
+
+        pub fn write_str(&mut self, value: impl AsRef<str>) -> Result<(), Error> {
+            let str = value.as_ref();
+            let bytes = str.as_bytes();
+
+            if bytes.len() > u32::MAX as usize {
+                return Err(Error::OutOfBounds);
+            }
+
+            self.write_u32(bytes.len() as u32);
+            self.write_bytes(bytes);
 
             Ok(())
         }
@@ -79,19 +116,15 @@ pub mod binary {
         }
 
         pub fn read_u8(&mut self) -> Result<u8, Error> {
-            let end = self.offset + 1;
-
-            if end > self.input.len() {
+            if self.offset >= self.input.len() {
                 return Err(Error::OutOfBounds);
             }
 
-            let mut bytes = [0u8; 1];
+            let byte = self.input[self.offset];
 
-            bytes.copy_from_slice(&self.input[self.offset..end]);
+            self.offset += 1;
 
-            self.offset = end;
-
-            Ok(u8::from_be_bytes(bytes))
+            Ok(byte)
         }
 
         pub fn read_u16(&mut self) -> Result<u16, Error> {
@@ -142,6 +175,14 @@ pub mod binary {
             Ok(u64::from_be_bytes(bytes))
         }
 
+        pub fn read_bool(&mut self) -> Result<bool, Error> {
+            match self.read_u8()? {
+                0x00 => Ok(false),
+                0x01 => Ok(true),
+                _ => Err(Error::InvalidBool),
+            }
+        }
+
         pub fn read_bytes<const N: usize>(&mut self) -> Result<&'a [u8; N], Error> {
             let end = self.offset + N;
 
@@ -169,6 +210,21 @@ pub mod binary {
             self.offset = end;
 
             Ok(bytes)
+        }
+
+        pub fn read_str(&mut self) -> Result<&'a str, Error> {
+            let len = self.read_u32()? as usize;
+            let end = self.offset + len;
+
+            if end > self.input.len() {
+                return Err(Error::OutOfBounds);
+            }
+
+            let bytes = &self.input[self.offset..end];
+
+            self.offset = end;
+
+            core::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
         }
 
         pub fn read_str_u16(&mut self) -> Result<&'a str, Error> {
@@ -274,6 +330,18 @@ pub mod binary {
             let mut reader = Reader::new(&data);
 
             assert!(matches!(reader.read_blob(), Err(Error::OutOfBounds)));
+        }
+
+        #[test]
+        fn invalid_bool() {
+            let mut writer = Writer::with_capacity(1);
+
+            writer.write_u8(0x69);
+
+            let data = writer.finish();
+            let mut reader = Reader::new(&data);
+
+            assert!(matches!(reader.read_bool(), Err(Error::InvalidBool)));
         }
 
         #[test]
