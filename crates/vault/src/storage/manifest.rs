@@ -42,8 +42,8 @@ const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
 #[derive(Debug)]
 pub enum Error {
     Cipher(cipher::Error),
+    Codec(binary::Error),
     Corrupted(&'static str),
-    Codec(&'static str),
     UnsupportedVersion(u16),
     NotFound,
     NotTrashed,
@@ -79,10 +79,7 @@ impl From<cipher::Error> for Error {
 
 impl From<binary::Error> for Error {
     fn from(value: binary::Error) -> Self {
-        match value {
-            binary::Error::OutOfBounds => Self::Codec("binary codec buffer boundary violation"),
-            binary::Error::InvalidUtf8 => Self::Codec("invalid UTF-8 string"),
-        }
+        Self::Codec(value)
     }
 }
 
@@ -305,9 +302,11 @@ impl Manifest {
         writer.write_u32(self.entries.len() as u32);
 
         for (path, entry) in &self.entries {
-            writer
-                .write_str_u16(path)
-                .map_err(|_| Error::Codec("path string size bounds exceeds u16 limits"))?;
+            writer.write_str_u16(path).map_err(|_| {
+                Error::Codec(binary::Error::Other(
+                    "path string size bounds exceeds u16 limits",
+                ))
+            })?;
             writer.write_u32(entry.chunks.len() as u32);
 
             for chunk in &entry.chunks {
@@ -354,9 +353,9 @@ impl Manifest {
             let chunk_count = reader.read_u32()? as usize;
 
             if chunk_count * 92 /* address + encrypted_key */ > reader.remaining() {
-                return Err(Error::Codec(
+                return Err(Error::Codec(binary::Error::Other(
                     "chunk count specifies more data than what remains in the buffer",
-                ));
+                )));
             }
 
             let mut chunks = Vec::with_capacity(chunk_count);
@@ -375,9 +374,9 @@ impl Manifest {
                 let version_chunk_count = reader.read_u32()? as usize;
 
                 if version_chunk_count * 92 /* address + encrypted_key */ > reader.remaining() {
-                    return Err(Error::Codec(
+                    return Err(Error::Codec(binary::Error::Other(
                         "chunk count specifies more data than what remains in the buffer",
-                    ));
+                    )));
                 }
 
                 let mut version_chunks = Vec::with_capacity(version_chunk_count);

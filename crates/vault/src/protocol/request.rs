@@ -2,16 +2,13 @@ use gate::{codec::binary, sys::vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
-    Codec(&'static str),
+    Codec(binary::Error),
     UnknownTag(u8),
 }
 
 impl From<binary::Error> for Error {
     fn from(value: binary::Error) -> Self {
-        match value {
-            binary::Error::OutOfBounds => Self::Codec("binary codec buffer boundary violation"),
-            binary::Error::InvalidUtf8 => Self::Codec("invalid UTF-8 string"),
-        }
+        Self::Codec(value)
     }
 }
 
@@ -40,8 +37,8 @@ impl<'a> Request<'a> {
 
         match self {
             Request::SaveManifest { data } => {
-                // Add `4` for data length prefix (u32)
                 // Add `1` for tag
+                // Add `4` for data length prefix (u32)
                 writer = binary::Writer::with_capacity(1 + 4 + data.len());
                 writer.write_u8(Self::TAG_SAVE_MANIFEST);
                 writer.write_blob(data)?;
@@ -52,31 +49,31 @@ impl<'a> Request<'a> {
                 writer.write_u8(Self::TAG_LOAD_MANIFEST);
             }
             Request::PutBlob { address, data } => {
-                // Add `4` for data length prefix (u32)
-                // Add `32` for address
                 // Add `1` for tag
+                // Add `32` for address
+                // Add `4` for data length prefix (u32)
                 writer = binary::Writer::with_capacity(1 + 32 + 4 + data.len());
                 writer.write_u8(Self::TAG_PUT_BLOB);
                 writer.write_bytes(address);
                 writer.write_blob(data)?;
             }
             Request::GetBlob { address } => {
-                // Add `32` for address
                 // Add `1` for tag
+                // Add `32` for address
                 writer = binary::Writer::with_capacity(1 + 32);
                 writer.write_u8(Self::TAG_GET_BLOB);
                 writer.write_bytes(address);
             }
             Request::ExistsBlob { address } => {
-                // Add `32` for address
                 // Add `1` for tag
+                // Add `32` for address
                 writer = binary::Writer::with_capacity(1 + 32);
                 writer.write_u8(Self::TAG_EXISTS_BLOB);
                 writer.write_bytes(address);
             }
             Request::DeleteBlob { address } => {
-                // Add `32` for address
                 // Add `1` for tag
+                // Add `32` for address
                 writer = binary::Writer::with_capacity(1 + 32);
                 writer.write_u8(Self::TAG_DELETE_BLOB);
                 writer.write_bytes(address);
@@ -93,7 +90,7 @@ impl<'a> Request<'a> {
 
     pub fn deserialize(data: &'a [u8]) -> Result<Self, Error> {
         if data.is_empty() {
-            return Err(Error::Codec("empty message"));
+            return Err(Error::Codec(binary::Error::Other("empty message")));
         }
 
         let mut reader = binary::Reader::new(data);
@@ -156,7 +153,7 @@ mod tests {
     fn deserialize_empty_message() {
         assert!(matches!(
             Request::deserialize(&[]),
-            Err(Error::Codec("empty message"))
+            Err(Error::Codec(binary::Error::Other("empty message")))
         ));
     }
 
