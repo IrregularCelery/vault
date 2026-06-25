@@ -15,7 +15,7 @@ pub mod binary {
                 Self::OutOfBounds => write!(f, "binary codec buffer boundary violation"),
                 Self::InvalidBool => write!(f, "invalid bool byte"),
                 Self::InvalidUtf8 => write!(f, "invalid UTF-8 string"),
-                Self::Other(e) => write!(f, "codec: {}", e),
+                Self::Other(e) => write!(f, "{}", e),
             }
         }
     }
