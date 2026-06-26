@@ -462,9 +462,9 @@ pub struct VersionProperties {
 
 #[cfg(test)]
 mod tests {
-    use gate::sys::macros::vec;
-
     use super::*;
+
+    use gate::sys::macros::vec;
 
     fn manifest() -> Manifest {
         let mut manifest = Manifest::new();

@@ -93,9 +93,9 @@ pub fn unlock(
 
 #[cfg(test)]
 mod tests {
-    use gate::sys::macros::vec;
-
     use super::*;
+
+    use gate::sys::macros::vec;
 
     fn sign(data: &[u8]) -> [u8; 64] {
         let mut sig = [0u8; 64];

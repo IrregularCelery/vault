@@ -1,11 +1,3 @@
-use gate::sys::{
-    io,
-    macros::format,
-    string::String,
-    time::{SystemTime, UNIX_EPOCH},
-    vec::Vec,
-};
-
 use crate::{
     crypto::cipher,
     identity::Identity,
@@ -14,6 +6,14 @@ use crate::{
         chunk::{self, Chunks},
         manifest::{self, Manifest, Properties, VersionProperties},
     },
+};
+
+use gate::sys::{
+    io,
+    macros::format,
+    string::String,
+    time::{SystemTime, UNIX_EPOCH},
+    vec::Vec,
 };
 
 #[derive(Debug)]
@@ -562,6 +562,10 @@ impl<S: storage::Backend> Session<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
+
+    use super::*;
+
     use gate::{
         crypto::bip39,
         sys::{
@@ -571,10 +575,6 @@ mod tests {
             string::ToString,
         },
     };
-
-    use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
-
-    use super::*;
 
     fn temp_storage_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

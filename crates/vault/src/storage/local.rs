@@ -179,13 +179,13 @@ impl Backend for Storage {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use gate::sys::{
         env,
         macros::{format, vec},
         time::{SystemTime, UNIX_EPOCH},
     };
-
-    use super::*;
 
     fn temp_storage(name: &str) -> Storage {
         let nanos = SystemTime::now()
