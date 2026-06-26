@@ -1,16 +1,6 @@
+use super::Error;
+
 use gate::{codec::binary, sys::vec::Vec};
-
-#[derive(Debug)]
-pub enum Error {
-    Codec(binary::Error),
-    UnknownTag(u8),
-}
-
-impl From<binary::Error> for Error {
-    fn from(value: binary::Error) -> Self {
-        Self::Codec(value)
-    }
-}
 
 #[derive(Debug, PartialEq)]
 pub enum Request<'a> {
@@ -122,9 +112,9 @@ impl<'a> Request<'a> {
 
 #[cfg(test)]
 mod tests {
-    use gate::sys::macros::vec;
-
     use super::*;
+
+    use gate::sys::macros::vec;
 
     #[test]
     fn request_variants_roundtrip() {

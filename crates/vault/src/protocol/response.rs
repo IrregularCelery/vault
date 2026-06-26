@@ -1,29 +1,20 @@
+use super::Error;
+
 use gate::{
     codec::binary,
     sys::{
+        borrow::Cow,
         string::{String, ToString},
         vec::Vec,
     },
 };
 
-#[derive(Debug)]
-pub enum Error {
-    Codec(binary::Error),
-    UnknownTag(u8),
-}
-
-impl From<binary::Error> for Error {
-    fn from(value: binary::Error) -> Self {
-        Self::Codec(value)
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub enum Response<'a> {
     Ok,
-    Manifest(&'a [u8]),
+    Manifest(Cow<'a, [u8]>),
     Addresses(Vec<[u8; 32]>),
-    Blob(&'a [u8]),
+    Blob(Cow<'a, [u8]>),
     Exists(bool),
     NotFound,
     Error(String),
@@ -110,7 +101,7 @@ impl<'a> Response<'a> {
             Self::TAG_MANIFEST => {
                 let manifest = reader.read_blob()?;
 
-                Self::Manifest(manifest)
+                Self::Manifest(Cow::Borrowed(manifest))
             }
             Self::TAG_ADDRESSES => {
                 let count = reader.read_u32()? as usize;
@@ -127,7 +118,7 @@ impl<'a> Response<'a> {
             Self::TAG_BLOB => {
                 let blob = reader.read_blob()?;
 
-                Self::Blob(blob)
+                Self::Blob(Cow::Borrowed(blob))
             }
             Self::TAG_EXISTS => {
                 let exists = reader.read_bool()?;
@@ -147,17 +138,17 @@ impl<'a> Response<'a> {
 
 #[cfg(test)]
 mod tests {
-    use gate::sys::macros::vec;
-
     use super::*;
+
+    use gate::sys::macros::vec;
 
     #[test]
     fn response_variants_roundtrip() {
         let responses = vec![
             Response::Ok,
-            Response::Manifest(&[1, 2]),
+            Response::Manifest(Cow::Borrowed(&[1, 2])),
             Response::Addresses(vec![[1u8; 32], [2u8; 32]]),
-            Response::Blob(&[3, 4]),
+            Response::Blob(Cow::Borrowed(&[3, 4])),
             Response::Exists(true),
             Response::Exists(false),
             Response::NotFound,
