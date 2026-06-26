@@ -1,10 +1,13 @@
-use gate::sys::{io, vec::Vec};
+use crate::transport;
+
+use gate::sys::{borrow::Cow, io, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
     NotFound,
     Io(io::Error),
-    Other(&'static str),
+    Transport(transport::Error),
+    Other(Cow<'static, str>),
 }
 
 impl core::fmt::Display for Error {
@@ -12,6 +15,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::NotFound => write!(f, "blob not found"),
             Self::Io(e) => write!(f, "I/O: {}", e),
+            Self::Transport(e) => write!(f, "transport: {}", e),
             Self::Other(e) => write!(f, "{}", e),
         }
     }
@@ -24,6 +28,12 @@ impl From<io::Error> for Error {
         }
 
         Self::Io(value)
+    }
+}
+
+impl From<transport::Error> for Error {
+    fn from(value: transport::Error) -> Self {
+        Self::Transport(value)
     }
 }
 
