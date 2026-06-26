@@ -1,6 +1,6 @@
-mod protocol;
+mod codec;
 
 pub mod request;
 pub mod response;
 
-pub use protocol::*;
+pub use codec::*;
