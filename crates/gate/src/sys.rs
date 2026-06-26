@@ -69,6 +69,20 @@ pub mod net {
 
 pub mod time {
     pub use super::std::time::*;
+
+    pub fn current_secs() -> Option<u64> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+    }
+
+    pub fn current_nanos() -> Option<u128> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_nanos())
+    }
 }
 
 pub mod thread {
