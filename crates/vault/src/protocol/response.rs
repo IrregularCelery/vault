@@ -3,24 +3,23 @@ use super::Error;
 use gate::{
     codec::binary,
     sys::{
-        borrow::Cow,
         string::{String, ToString},
         vec::Vec,
     },
 };
 
 #[derive(Debug, PartialEq)]
-pub enum Response<'a> {
+pub enum Response {
     Ok,
-    Manifest(Cow<'a, [u8]>),
+    Manifest(Vec<u8>),
     Addresses(Vec<[u8; 32]>),
-    Blob(Cow<'a, [u8]>),
+    Blob(Vec<u8>),
     Exists(bool),
     NotFound,
     Error(String),
 }
 
-impl<'a> Response<'a> {
+impl Response {
     const TAG_OK: u8 = 0;
     const TAG_MANIFEST: u8 = 1;
     const TAG_ADDRESSES: u8 = 2;
@@ -88,12 +87,12 @@ impl<'a> Response<'a> {
         Ok(writer.finish())
     }
 
-    pub fn deserialize(data: &'a [u8]) -> Result<Self, Error> {
+    pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         if data.is_empty() {
             return Err(Error::Codec(binary::Error::Other("empty message")));
         }
 
-        let mut reader = binary::Reader::new(data);
+        let mut reader = binary::Reader::new(&data);
         let tag = reader.read_u8()?;
 
         Ok(match tag {
@@ -101,7 +100,7 @@ impl<'a> Response<'a> {
             Self::TAG_MANIFEST => {
                 let manifest = reader.read_blob()?;
 
-                Self::Manifest(Cow::Borrowed(manifest))
+                Self::Manifest(manifest.to_vec())
             }
             Self::TAG_ADDRESSES => {
                 let count = reader.read_u32()? as usize;
@@ -118,7 +117,7 @@ impl<'a> Response<'a> {
             Self::TAG_BLOB => {
                 let blob = reader.read_blob()?;
 
-                Self::Blob(Cow::Borrowed(blob))
+                Self::Blob(blob.to_vec())
             }
             Self::TAG_EXISTS => {
                 let exists = reader.read_bool()?;
@@ -146,9 +145,9 @@ mod tests {
     fn response_variants_roundtrip() {
         let responses = vec![
             Response::Ok,
-            Response::Manifest(Cow::Borrowed(&[1, 2])),
+            Response::Manifest(vec![1, 2]),
             Response::Addresses(vec![[1u8; 32], [2u8; 32]]),
-            Response::Blob(Cow::Borrowed(&[3, 4])),
+            Response::Blob(vec![3, 4]),
             Response::Exists(true),
             Response::Exists(false),
             Response::NotFound,
