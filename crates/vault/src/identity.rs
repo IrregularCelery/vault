@@ -6,8 +6,8 @@ use gate::{
         x25519::{PublicKey, StaticSecret},
     },
     sys::{
+        borrow::Cow,
         macros::{format, vec::Vec},
-        string::String,
     },
 };
 
@@ -20,7 +20,7 @@ const DOMAIN_EXCHANGE: &str = "vault::exchange";
 pub enum Error {
     InvalidMnemonic,
     UnsafeMnemonic,
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 impl core::fmt::Display for Error {
@@ -91,14 +91,14 @@ impl Identity {
         // Salt     -> Fixed salt (The mnemonic IS the key, no need for per-user salt)
         // Output   -> 64 bytes (32 for encryption key domain, 32 for signing key domain)
         let params = Params::new(64 * 1024, 3, 1, Some(64))
-            .map_err(|e| Error::Other(format!("argon2 params: {}", e)))?;
+            .map_err(|e| Error::Other(format!("argon2 params: {}", e).into()))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let salt = KDF_SALT;
         let mut seed = [0u8; 64];
 
         argon2
             .hash_password_into(phrase.as_bytes(), salt, &mut seed)
-            .map_err(|e| Error::Other(format!("argon2 hash: {}", e)))?;
+            .map_err(|e| Error::Other(format!("argon2 hash: {}", e).into()))?;
 
         Ok(Self::from_seed(&seed))
     }
@@ -111,8 +111,16 @@ impl Identity {
         self.public_signing_key.to_bytes()
     }
 
+    pub fn private_signing_key(&self) -> [u8; 32] {
+        self.private_signing_key.to_bytes()
+    }
+
     pub fn public_exchange_key(&self) -> [u8; 32] {
         self.public_exchange_key.to_bytes()
+    }
+
+    pub fn private_exchange_key(&self) -> [u8; 32] {
+        self.private_exchange_key.to_bytes()
     }
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
@@ -123,6 +131,19 @@ impl Identity {
         let signature = Signature::from_bytes(signature_bytes);
 
         self.public_signing_key.verify(message, &signature).is_ok()
+    }
+
+    pub fn verify_with_key(
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature_bytes: &[u8; 64],
+    ) -> bool {
+        let Ok(public_signing_key) = VerifyingKey::from_bytes(public_key) else {
+            return false;
+        };
+        let signature = Signature::from_bytes(signature_bytes);
+
+        public_signing_key.verify(message, &signature).is_ok()
     }
 }
 
