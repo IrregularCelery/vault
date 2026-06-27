@@ -28,23 +28,18 @@ use crate::crypto::cipher;
 use gate::{
     codec::binary,
     crypto::blake3,
-    sys::{
-        collections::btree_map::BTreeMap,
-        string::String,
-        time::{SystemTime, UNIX_EPOCH},
-        vec::Vec,
-    },
+    sys::{collections::btree_map::BTreeMap, string::String, time, vec::Vec},
 };
 
 const MANIFEST_VERSION: u16 = 1;
-const DOMAIN_MANIFEST: &[u8] = b"vault::manifest";
+const DOMAIN_MANIFEST: &str = "vault::manifest";
 
 #[derive(Debug)]
 pub enum Error {
     Cipher(cipher::Error),
     Codec(binary::Error),
     Corrupted(&'static str),
-    UnsupportedVersion(u16),
+    UnsupportedManifestVersion(u16),
     NotFound,
     NotTrashed,
     AlreadyTrashed,
@@ -58,7 +53,7 @@ impl core::fmt::Display for Error {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
             Self::Codec(e) => write!(f, "codec: {}", e),
-            Self::UnsupportedVersion(v) => write!(f, "unsupported manifest version: {}", v),
+            Self::UnsupportedManifestVersion(v) => write!(f, "unsupported manifest version: {}", v),
             Self::NotFound => write!(f, "file not found"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
@@ -183,10 +178,8 @@ impl Manifest {
             return Err(Error::AlreadyTrashed);
         }
 
-        entry.trashed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(1); // 1 instead of 0 so it's never mistaken for "live"
+        // `1` instead of `0` so it's never mistaken for "live"
+        entry.trashed = time::current_secs().unwrap_or(1);
 
         Ok(())
     }
@@ -285,13 +278,8 @@ impl Manifest {
     }
 
     pub fn address(public_signing_key: &[u8; 32]) -> [u8; 32] {
-        let mut input = Vec::with_capacity(DOMAIN_MANIFEST.len() + 32);
-
-        input.extend_from_slice(DOMAIN_MANIFEST);
-        input.extend_from_slice(public_signing_key);
-
         // storage key for the manifest blob
-        *blake3::hash(&input).as_bytes()
+        blake3::derive_key(DOMAIN_MANIFEST, public_signing_key)
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
@@ -342,7 +330,7 @@ impl Manifest {
 
         // NOTE: If we ever bump the version, this should gracefully handle data migration.
         if version != MANIFEST_VERSION {
-            return Err(Error::UnsupportedVersion(version));
+            return Err(Error::UnsupportedManifestVersion(version));
         }
 
         let entry_count = reader.read_u32()? as usize;
@@ -698,7 +686,7 @@ mod tests {
 
         assert!(matches!(
             deserialized,
-            Err(Error::UnsupportedVersion(0xFFFF))
+            Err(Error::UnsupportedManifestVersion(0xFFFF))
         ));
     }
 

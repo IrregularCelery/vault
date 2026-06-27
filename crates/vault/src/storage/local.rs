@@ -184,14 +184,11 @@ mod tests {
     use gate::sys::{
         env,
         macros::{format, vec},
-        time::{SystemTime, UNIX_EPOCH},
+        time,
     };
 
     fn temp_storage(name: &str) -> Storage {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
+        let nanos = time::current_nanos().unwrap();
         let path = env::temp_dir().join(format!("vault_test_{}_{}", name, nanos));
         let public_key = [0u8; 32];
 

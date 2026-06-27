@@ -8,13 +8,7 @@ use crate::{
     },
 };
 
-use gate::sys::{
-    io,
-    macros::format,
-    string::String,
-    time::{SystemTime, UNIX_EPOCH},
-    vec::Vec,
-};
+use gate::sys::{borrow::Cow, io, macros::format, string::String, time, vec::Vec};
 
 #[derive(Debug)]
 pub enum Error {
@@ -28,7 +22,7 @@ pub enum Error {
     AlreadyTrashed,
     VersionNotFound,
     Tampered(String),
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 impl core::fmt::Display for Error {
@@ -152,10 +146,7 @@ impl<S: storage::Backend> Session<S> {
         }
 
         let chunk_count = entry_chunks.len();
-        let modified = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let modified = time::current_secs().unwrap_or(0);
 
         if let Some(existing) = self.manifest.entries.get_mut(path) {
             existing.push_version(entry_chunks, size, modified);
@@ -562,9 +553,9 @@ impl<S: storage::Backend> Session<S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
-
     use super::*;
+
+    use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
 
     use gate::{
         crypto::bip39,
@@ -573,14 +564,12 @@ mod tests {
             macros::{format, vec},
             path::{Path, PathBuf},
             string::ToString,
+            time,
         },
     };
 
     fn temp_storage_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
+        let nanos = time::current_nanos().unwrap();
 
         env::temp_dir().join(format!("vault_test_{}_{}", name, nanos))
     }
