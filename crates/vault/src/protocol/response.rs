@@ -92,7 +92,7 @@ impl Response {
             return Err(Error::Codec(binary::Error::Other("empty message")));
         }
 
-        let mut reader = binary::Reader::new(&data);
+        let mut reader = binary::Reader::new(data);
         let tag = reader.read_u8()?;
 
         Ok(match tag {

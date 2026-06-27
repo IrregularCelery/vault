@@ -79,4 +79,28 @@ impl ClientInit {
             signature,
         })
     }
+
+    pub fn build_signing_message(&self, protocol_hash: &[u8; 32]) -> [u8; 121] {
+        // `+ 2` for the `PROTOCOL_VERSION` bytes (u16)
+        // `- 64` to ignore `signature` field
+        // `+ 32` for the `protocol_hash`
+        let mut out = [0u8; DOMAIN_PROTOCOL.len() + 2 + (core::mem::size_of::<Self>() - 64) + 32];
+        let mut offset = 0;
+
+        let mut append = |slice: &[u8]| {
+            let len = slice.len();
+
+            out[offset..offset + len].copy_from_slice(slice);
+            offset += len;
+        };
+
+        append(DOMAIN_PROTOCOL);
+        append(&PROTOCOL_VERSION.to_be_bytes());
+        append(&self.signing_key);
+        append(&self.exchange_key);
+        append(&self.timestamp.to_be_bytes());
+        append(protocol_hash);
+
+        out
+    }
 }
