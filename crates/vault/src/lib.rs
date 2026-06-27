@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod client;
 pub mod crypto;
 pub mod identity;
 pub mod protocol;

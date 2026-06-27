@@ -1,30 +1,25 @@
 use crate::{
     identity::Identity,
-    protocol::{request::Request, response::Response},
+    protocol::{ClientInit, request::Request, response::Response},
     storage::{self, Backend, local},
     transport,
 };
 
-use gate::sys::{
-    borrow::Cow,
-    macros::format,
-    path::PathBuf,
-    string::{String, ToString},
-};
+use gate::sys::{borrow::Cow, macros::format, path::PathBuf, string::ToString};
 
 #[derive(Debug)]
 pub enum Error {
     Transport(transport::Error),
     Storage(storage::Error),
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Error::Transport(e) => write!(f, "transport: {}", e),
-            Error::Storage(e) => write!(f, "storage: {}", e),
-            Error::Other(e) => write!(f, "{}", e),
+            Self::Transport(e) => write!(f, "transport: {}", e),
+            Self::Storage(e) => write!(f, "storage: {}", e),
+            Self::Other(e) => write!(f, "{}", e),
         }
     }
 }
@@ -55,14 +50,19 @@ impl Server {
     }
 
     pub fn accept<T: transport::Backend>(&self, mut transport: T) -> Result<(), Error> {
-        // TODO: Do a client identity check claim here. (public signing and exchange keys)
-        // Client must provide a [`ClientInit`] for the first message after a successful handshake,
-        // and there's an artifact that both the server and the client can independently derive from
-        // the handshake, and can verify the user's claimed keys.
+        // Retrieve `ClientInit` message
+        let raw = transport.recv()?;
+        let init = ClientInit::deserialize(&raw).map_err(|e| Error::Other(e.to_string().into()))?;
+        let handshake_hash = transport.handshake_hash();
+        let message = init.build_signing_message(&handshake_hash);
 
-        let client_public_signing_key = [0x0u8; 32];
+        if !Identity::verify_with_key(&init.signing_key, &message, &init.signature) {
+            return Err(Error::Transport(transport::Error::Handshake(
+                "client init signature does not match claimed identity",
+            )));
+        }
 
-        let storage = local::Storage::new(&self.storage_root, &client_public_signing_key)?;
+        let storage = local::Storage::new(&self.storage_root, &init.signing_key)?;
 
         loop {
             let raw = match transport.recv() {
@@ -77,7 +77,7 @@ impl Server {
                         Err(e) => Response::Error(e.to_string()),
                     },
                     Request::LoadManifest => match storage.load_manifest() {
-                        Ok(data) => Response::Manifest(Cow::Owned(data)),
+                        Ok(data) => Response::Manifest(data),
                         Err(storage::Error::NotFound) => Response::NotFound,
                         Err(e) => Response::Error(e.to_string()),
                     },
@@ -86,7 +86,7 @@ impl Server {
                         Err(e) => Response::Error(e.to_string()),
                     },
                     Request::GetBlob { address } => match storage.get_blob(&address) {
-                        Ok(data) => Response::Blob(Cow::Owned(data)),
+                        Ok(data) => Response::Blob(data),
                         Err(storage::Error::NotFound) => Response::NotFound,
                         Err(e) => Response::Error(e.to_string()),
                     },
@@ -109,8 +109,12 @@ impl Server {
             transport.send(
                 &response
                     .serialize()
-                    .map_err(|e| Error::Other(e.to_string()))?,
+                    .map_err(|e| Error::Other(e.to_string().into()))?,
             )?;
         }
+    }
+
+    pub fn identity(&self) -> &Identity {
+        &self.identity
     }
 }
