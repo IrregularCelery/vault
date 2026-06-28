@@ -1,4 +1,4 @@
-use super::Error;
+use crate::protocol::Error;
 
 use gate::{
     codec::binary,

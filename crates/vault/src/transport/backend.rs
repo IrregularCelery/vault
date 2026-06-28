@@ -4,6 +4,7 @@ use gate::sys::{io, macros::vec::Vec};
 pub enum Error {
     Handshake(&'static str),
     Io(io::Error),
+    MessageTooLarge,
     Closed,
     Other(&'static str),
 }
@@ -13,9 +14,16 @@ impl core::fmt::Display for Error {
         match self {
             Self::Handshake(e) => write!(f, "handshake failed: {}", e),
             Self::Io(e) => write!(f, "I/O: {}", e),
+            Self::MessageTooLarge => write!(f, "message is too large"),
             Self::Closed => write!(f, "connection closed"),
             Self::Other(e) => write!(f, "{}", e),
         }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(value: gate::sys::io::Error) -> Self {
+        Self::Io(value)
     }
 }
 
