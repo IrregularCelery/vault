@@ -1,4 +1,4 @@
-//! Encrypted manifest as blob index lookup
+//! Encrypted manifest as blob index lookup.
 //!
 //! Binary serialization format (big-endian):
 //!
@@ -31,19 +31,38 @@ use gate::{
     sys::{collections::btree_map::BTreeMap, string::String, time, vec::Vec},
 };
 
+/// Binary format version tag written at the start of every serialised manifest.
 const MANIFEST_VERSION: u16 = 1;
+/// BLAKE3 domain tag used to derive the storage address of a user's manifest blob
+/// from their public signing key.
 const DOMAIN_MANIFEST: &str = "vault::manifest";
 
+/// Errors that can occur when processing a [`Manifest`].
 #[derive(Debug)]
 pub enum Error {
+    /// An encryption or decryption error.
     Cipher(cipher::Error),
+
+    /// A binary serialisation or deserialisation error.
     Codec(binary::Error),
-    Corrupted(&'static str),
+
+    /// The leading version field does not match [`MANIFEST_VERSION`]. The value is the version
+    /// that was actually found.
     UnsupportedManifestVersion(u16),
+
+    /// The requested path does not exist in the manifest.
     NotFound,
+
+    /// A [`Manifest::restore`] was attempted on an entry that is not currently trashed.
     NotTrashed,
+
+    /// A [`Manifest::trash`] was attempted on an entry that has already been trashed.
     AlreadyTrashed,
+
+    /// The requested version index doesn not exist for an entry.
     VersionNotFound,
+
+    /// The manifest's signature did not match the ciphertext, the blob was tampered with.
     Tampered,
 }
 
@@ -51,7 +70,6 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Cipher(e) => write!(f, "cipher: {}", e),
-            Self::Corrupted(e) => write!(f, "corrupted manifest: {}", e),
             Self::Codec(e) => write!(f, "codec: {}", e),
             Self::UnsupportedManifestVersion(v) => write!(f, "unsupported manifest version: {}", v),
             Self::NotFound => write!(f, "file not found"),
@@ -78,29 +96,56 @@ impl From<binary::Error> for Error {
     }
 }
 
+/// A reference to one content-addressed encrypted chunk within an entry.
 #[derive(Debug, PartialEq, Clone)]
 pub struct EntryChunk {
+    /// Content-addressed storage key for this chunk's encrypted blob (32-byte BLAKE3 hash).
     pub address: [u8; 32],
-    pub encrypted_key: [u8; 60], // 12 (nonce) + 16 (tag) + 32 (key)
+
+    /// The Per-chunk plaintext encryption key, itself encrypted using user's encryption key.
+    /// Layout: `nonce (12) || key ciphertext (32) || tag (16)` = 60 bytes.
+    pub encrypted_key: [u8; 60],
 }
 
+/// A snapshot of a previous file revision, created when a file at a path is overwritten.
 #[derive(Debug, PartialEq)]
 pub struct Version {
+    /// List of chunks for this revision.
     pub chunks: Vec<EntryChunk>,
+
+    /// Total plaintext size of this version in bytes.
     pub size: u64,
+
+    /// Unix timestamp (seconds) when this version was written.
     pub modified: u64,
 }
 
+/// Metadata and chunk references for a single file tracked by the manifest.
 #[derive(Debug, PartialEq)]
 pub struct Entry {
+    /// List of chunks for the currently active (latest) revision of this file.
     pub chunks: Vec<EntryChunk>,
+
+    /// Chronologically ordered list of previous revisions, oldest first.
+    /// The active revision is not included here.
     pub versions: Vec<Version>,
+
+    /// Total plaintext size of the active revision in bytes.
     pub size: u64,
+
+    /// Unix timestamp (seconds) of the last write to the active revision.
     pub modified: u64,
+
+    /// `0` if the entry is live. A non-zero value is the Unix timestamp when the entry was
+    /// moved to the trash, and is used to distinguish "live" from "trashed".
     pub trashed: u64,
 }
 
 impl Entry {
+    /// Snapshots the current state into a new [`Version`] and installs `new_chunks` as active.
+    ///
+    /// The current chunks, size, and modified timestamp are appended to `self.versions`
+    /// before being replaced, preserving full linear history.
     pub fn push_version(&mut self, new_chunks: Vec<EntryChunk>, new_size: u64, new_modified: u64) {
         let snapshot = Version {
             chunks: core::mem::take(&mut self.chunks),
@@ -115,26 +160,44 @@ impl Entry {
     }
 }
 
+// TODO: Perhaps it's better not to hold the entire user's manifest in memory?
+
+/// The file index, mapping virtual paths to their versioned chunk lists.
+///
+/// Tracks current chunks, historical versions, timestamps, size, and a soft-delete (trash)
+/// timestamp per entry. Serialised, encrypted, and signed before being persisted to
+/// the storage backend.
 #[derive(Debug, PartialEq)]
 pub struct Manifest {
+    /// All tracked file entries, keyed by their virtual path (e.g. `"photos/image.png"`).
+    /// Includes both live and trashed entries.
     pub entries: BTreeMap<String, Entry>,
 }
 
 impl Manifest {
+    /// Creates an empty manifest with no entries.
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
         }
     }
 
+    /// Inserts or replaces the entry at `path`.
+    /// Overwrites any existing entry without versioning. Must call [`Entry::push_version`] beofre
+    /// inserting to preserve history.
     pub fn insert(&mut self, path: &str, entry: Entry) {
         self.entries.insert(path.into(), entry);
     }
 
+    /// Returns the live (non-trashed) entry at `path`, or `None` if absent or trashed.
     pub fn get(&self, path: &str) -> Option<&Entry> {
         self.entries.get(path).filter(|e| e.trashed == 0)
     }
 
+    /// Collects all blob addresses referenced by live (non-trashed) entries, including their
+    /// version history.
+    ///
+    /// Any address absent from this set is safe to delete during garbage collection and cleanups.
     pub fn addresses(&self) -> Vec<[u8; 32]> {
         self.entries
             .values()
@@ -149,6 +212,7 @@ impl Manifest {
             .collect()
     }
 
+    /// Collects all blob addresses referenced by trashed entries and their version history.
     pub fn addresses_trashed(&self) -> Vec<[u8; 32]> {
         self.entries
             .values()
@@ -163,6 +227,11 @@ impl Manifest {
             .collect()
     }
 
+    /// Moves the entry from `old_path` to `new_path`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]: if `old_path` is absent.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
         let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
 
@@ -171,6 +240,12 @@ impl Manifest {
         Ok(())
     }
 
+    /// Marks an entry as trashed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]: if `path` is absent.
+    /// [`Error::AlreadyTrashed`]: if the entry is already trashed.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -184,6 +259,12 @@ impl Manifest {
         Ok(())
     }
 
+    /// Untrashes an entry, making it live again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]: if `path` is absent.
+    /// [`Error::NotTrashed`]: if the entry is not currently trashed.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -196,6 +277,15 @@ impl Manifest {
         Ok(())
     }
 
+    /// Removes the version at `index` from `path`'s history.
+    ///
+    /// Returns the blob addresses that are now unreferenced and safe to delete.
+    /// Addresses still referenced by the active version or other files are excluded.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]: if `path` is absent.
+    /// [`Error::VersionNotFound`]: if the version index didn't exist.
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -225,6 +315,14 @@ impl Manifest {
             .collect())
     }
 
+    /// Permanently removes a trashed entry from the manifest.
+    ///
+    /// Returns the blob addresses that are no longer referenced by any live entry.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]: if `path` is absent.
+    /// [`Error::NotTrashed`]: if the entry is not currently trashed.
     pub fn purge(&mut self, path: &str) -> Result<Vec<[u8; 32]>, Error> {
         match self.entries.get(path) {
             None => return Err(Error::NotFound),
@@ -247,6 +345,7 @@ impl Manifest {
         Err(Error::NotFound)
     }
 
+    /// Permanently removes all trashed entries and returns all now-unreferenced addresses.
     pub fn purge_all(&mut self) -> Vec<[u8; 32]> {
         let live = self.addresses();
         let paths: Vec<String> = self
@@ -277,11 +376,19 @@ impl Manifest {
         purged
     }
 
+    /// Derives a storage manifest address from a `public_signing_key`.
+    ///
+    /// Computed as `BLAKE3(context=DOMAIN_MANIFEST, public_signing_key)`.
     pub fn address(public_signing_key: &[u8; 32]) -> [u8; 32] {
         // storage key for the manifest blob
         blake3::derive_key(DOMAIN_MANIFEST, public_signing_key)
     }
 
+    /// Serializes the manifest into the binary wire format described in the module doc.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Codec`]: if serialization process fails.
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         // Estimated size for each entry, 2 chunks, no versions
         let mut writer = binary::Writer::with_capacity(self.entries.len() * 256);
@@ -324,6 +431,13 @@ impl Manifest {
         Ok(writer.finish())
     }
 
+    /// Deserializes from the binary wire format described in the module doc.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Codec`]: if deserialization process fails.
+    /// [`Error::UnsupportedManifestVersion`]: if the leading version field does not match
+    /// [`MANIFEST_VERSION`].
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         let mut reader = binary::Reader::new(data);
         let version = reader.read_u16()?;
@@ -405,6 +519,14 @@ impl Manifest {
         Ok(Self { entries })
     }
 
+    /// Serializes, encrypts, and signs the manifest.
+    ///
+    /// The signature covers the ciphertext, not the plaintext.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cipher`]: if encryption process fails.
+    /// [`Error::Codec`]: if serialization process fails.
     pub fn lock(
         &self,
         encryption_key: &[u8; 32],
@@ -416,6 +538,13 @@ impl Manifest {
         Ok(locked)
     }
 
+    /// Verifies the signature and decrypts the manifest blob, then deserialises it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cipher`]: if decryption process fails.
+    /// [`Error::Codec`]: if deserialization process fails.
+    /// [`Error::Tampered`]: if signature verification fails.
     pub fn unlock(
         blob: &[u8],
         encryption_key: &[u8; 32],
@@ -433,18 +562,36 @@ impl Default for Manifest {
     }
 }
 
+/// File entry metadata.
 pub struct Properties {
+    /// Number of content-addressed chunks in the active revision.
     pub chunk_count: usize,
+
+    /// Total plaintext size of the active revision in bytes.
     pub size: u64,
+
+    /// Unix timestamp (seconds) of the last write to this entry.
     pub modified: u64,
+
+    /// `0` if live, or the Unix timestamp when the entry was trashed.
     pub trashed: u64,
+
+    /// Number of historical revisions stored for this entry (not counting the active one).
     pub version_count: usize,
 }
 
+/// Historical version metadata.
 pub struct VersionProperties {
+    /// Index of this version within the entry's `versions` list.
     pub index: usize,
+
+    /// Number of chunks in this version.
     pub chunk_count: usize,
+
+    /// Total plaintext size of this revision in bytes.
     pub size: u64,
+
+    /// Unix timestamp (seconds) when this revision was written.
     pub modified: u64,
 }
 
