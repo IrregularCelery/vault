@@ -1,3 +1,5 @@
+//! Local storage backend.
+//!
 //! Storage layout is as follows:
 //!
 //!   [root]/<u0:2>/<u2:4>/<u4:64>/manifest
@@ -8,9 +10,9 @@
 //!          |-------------------|       |-------------------|
 //!                   ^- user address           ^- encrypted blob file (Content-Addressed Storage)
 //!
-//! Each `Storage` instance is scoped to a single user. The shared prefix is
+//! Each [`Storage`] instance is scoped to a single user. The shared prefix is
 //! `Manifest::address(public_key)`.
-//! The same 2+2+60 hex split used for blob addresses (`HashPath`) is reused.
+//! The same 2+2+60 hex split used for blob addresses [`HashPath`] is reused.
 //!
 //! Blob writes are atomic
 
@@ -18,14 +20,24 @@ use crate::storage::{Backend, Error, hashpath::HashPath, manifest::Manifest};
 
 use gate::sys::{fs, io, path::PathBuf, vec::Vec};
 
+/// Filename used for the encrypted manifest blob within a user's storage directory.
 const MANIFEST_FILENAME: &str = "manifest";
+/// Name of the subdirectory inside each user's directory that contains content-addressed blobs.
 const BLOBS_DIRNAME: &str = "blobs";
 
+/// A filesystem-backed, user-scoped blob and manifest store.
+///
+/// All data lives under a nested hex directory tree derived from the user's public signing key,
+/// ensuring storage isolation between users sharing the same root directory. All blobs and
+/// manifests writes are atomic; Data is staged to a `.tmp` file and renamed into place.
 pub struct Storage {
+    /// Absolute path to this user's scoped storage root (i.e. `[base_root]/xx/xx/xxxxxx...`).
+    /// All manifest and blob paths are derived relative to this directory.
     root: PathBuf,
 }
 
 impl Storage {
+    /// Creates a new [`Storage`] instance rooted at `root`, scoped to `public_key`.
     pub fn new(root: impl Into<PathBuf>, public_key: &[u8; 32]) -> Result<Self, Error> {
         let user_address = Manifest::address(public_key);
         let root = root
@@ -38,10 +50,12 @@ impl Storage {
         Ok(Self { root })
     }
 
+    /// Returns the absolute path to this user's manifest file.
     fn manifest_path(&self) -> PathBuf {
         self.root.join(MANIFEST_FILENAME)
     }
 
+    /// Returns the absolute path for a blob file at its 32-byte content address.
     fn blob_path(&self, address: &[u8; 32]) -> PathBuf {
         self.root
             .join(BLOBS_DIRNAME)
@@ -117,6 +131,10 @@ impl Backend for Storage {
             Err(e) => return Err(Error::Io(e)),
         };
 
+        /// Reconstructs a 32-byte blob address from its three hex path segments
+        /// (`dir` = 2 chars, `subdir` = 2 chars, `file` = 60 chars).
+        ///
+        /// Returns `None` if any segment has an unexpected length or contains non-hex characters.
         fn path_to_address(dir: &str, subdir: &str, file: &str) -> Option<[u8; 32]> {
             if dir.len() != 2 || subdir.len() != 2 || file.len() != 60 {
                 return None;
