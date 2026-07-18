@@ -1,3 +1,7 @@
+//! Remote storage backend that proxies all storage operations over a [`transport::Backend`].
+//!
+//! Each method serializes a [`Request`], sends it, and deserializes the [`Response`].
+
 use gate::sys::{macros::format, vec::Vec};
 
 use crate::{
@@ -6,17 +10,22 @@ use crate::{
     transport,
 };
 
+/// A storage backend that delegates all operations to a remote server.
 pub struct Storage<T: transport::Backend> {
+    /// The underlying transport channel.
     transport: core::cell::RefCell<T>,
 }
 
 impl<T: transport::Backend> Storage<T> {
+    /// Creates a new [`Storage`] instance and wraps a successfully established `transport`.
     pub fn new(transport: T) -> Self {
         Self {
             transport: core::cell::RefCell::new(transport),
         }
     }
 
+    /// Serializes `request`, sends it over the transport, waits for the response, and deserialize
+    /// it. Propagates codec and transport failures as [`Error`].
     fn roundtrip(&self, request: Request) -> Result<Response, Error> {
         let mut transport = self.transport.borrow_mut();
 
