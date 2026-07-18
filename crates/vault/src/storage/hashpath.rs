@@ -1,12 +1,26 @@
+//! Converts a 32-byte hash into a three-level `xx/xx/xxxxxx...` hex directory path.
+//!
+//! The first byte encodes the top-level directory (2 hex chars), the second bytes
+//! the subdirectory (2 hex chars), and the remaining 30 bytes the filename (60 hex chars).
+
 use gate::sys::path::PathBuf;
 
+/// A content-addressed filesystem path derived from a 32-byte hash.
+///
+/// All three components are stored as fixed-size byte arrays of ASCII hex digits.
 pub struct HashPath {
+    /// First byte of the hash encoded as 2 lowercase hex ASCII digits, the top-level directory name.
     dir: [u8; 2],
+
+    /// Second byte of the hash encoded as 2 lowercase hex ASCII digits, the subdirectory name.
     subdir: [u8; 2],
+
+    /// Remaining 30 bytes (bytes 2–31) encoded as 60 lowercase hex ASCII digits, the filename.
     file: [u8; 60],
 }
 
 impl HashPath {
+    /// Encodes `hash` into three hex path components and creates a [`HashPath`].
     pub fn new(hash: &[u8; 32]) -> Self {
         const LUT: &[u8; 16] = b"0123456789abcdef";
 
@@ -28,6 +42,7 @@ impl HashPath {
         Self { dir, subdir, file }
     }
 
+    /// Returns the three path components as UTF-8 string slices.
     fn as_str_parts(&self) -> (&str, &str, &str) {
         // All bytes are ASCII hex digits (0-9, a-f) produced only by the `LUT` in the `new` method
 
