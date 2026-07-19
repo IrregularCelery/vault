@@ -16,7 +16,7 @@ pub enum Error {
     /// An error from the remote transport backend.
     Transport(transport::Error),
 
-    /// Specific message error
+    /// Specific message error.
     Other(Cow<'static, str>),
 }
 

@@ -24,7 +24,7 @@ pub enum Error {
     /// The source ended before a complete fixed-size read could be satisfied.
     UnexpectedEof,
 
-    /// Specific message error
+    /// Specific message error.
     Other(&'static str),
 }
 
