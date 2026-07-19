@@ -1,16 +1,28 @@
+//! This module provides AEAD encryption (ChaCha20-Poly1305) and signature-bound blob locking
+//! to detect tampering.
+//!
 //! Encrypted blobs are as follows:
-//!   `[ 12-bytes nonce ] + [ ciphertext ] + [ 16-bytes tag ]`
+//!   `[ 64-byte signature ] + [ 12-byte nonce ] + [ ciphertext ] + [ 16-byte tag ]`
 
 use gate::{
     crypto::chacha20poly1305::{Aead, AeadCore, ChaCha20Poly1305, Key, KeyInit, Nonce},
     sys::{macros::vec::Vec, random::OsRng},
 };
 
+/// Errors from encryption and decryption operations.
 #[derive(Debug)]
 pub enum Error {
+    /// The underlying AEAD encryption operation failed.
     EncryptFailed,
+
+    /// Decryption failed, either the key is wrong or the ciphertext is corrupted.
     DecryptFailed,
+
+    /// The blob is shorter than the minimum valid size.
     InvalidLength,
+
+    /// The prepended signature did not match the ciphertext due to tampering or use of wrong
+    /// identity.
     InvalidSignature,
 }
 
@@ -25,13 +37,23 @@ impl core::fmt::Display for Error {
     }
 }
 
+/// Encrypts `plaintext` with ChaCha20-Poly1305 under `key`, prepending a randomly generated
+/// 12-byte nonce.
+///
+/// Output format:
+/// `[ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
+///
+/// # Errors
+///
+/// - [`Error::EncryptFailed`]: if the underlying AEAD cipher fails to encrypt or authenticate
+///   the payload.
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
         .map_err(|_| Error::EncryptFailed)?;
-    let mut out = Vec::with_capacity(12 + ciphertext.len()); // 12-bytes nonce
+    let mut out = Vec::with_capacity(12 + ciphertext.len()); // 12-byte nonce
 
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
@@ -39,8 +61,17 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Decrypts `blob` using ChaCha20-Poly1305 under `key`, extracting the prepended 12-byte nonce.
+///
+/// Expected input format:
+/// `[ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
+///
+/// # Errors
+///
+/// - [`Error::DecryptFailed`]: if the ciphertext or tag authentication check fails.
+/// - [`Error::InvalidLength`]: if the input `blob` is less than 28 bytes (nonce + tag).
 pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
-    // 12-bytes nonce + 16-bytes tag
+    // 12-byte nonce + 16-byte tag
     if blob.len() < 28 {
         return Err(Error::InvalidLength);
     }
@@ -54,6 +85,16 @@ pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::DecryptFailed)
 }
 
+/// Encrypts `plaintext` with ChaCha20-Poly1305 under `key`, then signs the resulting payload
+/// using the provided `sign` function, prepending the 64-byte signature.
+///
+/// Output format:
+/// `[ 64-byte signature ] + [ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
+///
+/// # Errors
+///
+/// - [`Error::EncryptFailed`]: if the underlying AEAD cipher fails to encrypt or authenticate
+///   the payload.
 pub fn lock(
     key: &[u8; 32],
     plaintext: &[u8],
@@ -61,7 +102,7 @@ pub fn lock(
 ) -> Result<Vec<u8>, Error> {
     let encrypted = encrypt(key, plaintext)?;
     let signature = sign(&encrypted);
-    let mut out = Vec::with_capacity(64 + encrypted.len()); // 64-bytes signature
+    let mut out = Vec::with_capacity(64 + encrypted.len()); // 64-byte signature
 
     out.extend_from_slice(&signature);
     out.extend_from_slice(&encrypted);
@@ -69,12 +110,23 @@ pub fn lock(
     Ok(out)
 }
 
+/// Verifies the signature of a `blob` using the provided `verify` function, then decrypts
+/// the payload using ChaCha20-Poly1305 under `key`.
+///
+/// Expected input format:
+/// `[ 64-byte signature ] + [ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
+///
+/// # Errors
+///
+/// - [`Error::DecryptFailed`]: if the payload authentication check or decryption fails.
+/// - [`Error::InvalidLength`]: if the input `blob` is less than 92 bytes (signature + nonce + tag).
+/// - [`Error::InvalidSignature`]: if the cryptographic signature verification fails.
 pub fn unlock(
     key: &[u8; 32],
     blob: &[u8],
     verify: impl Fn(&[u8], &[u8; 64]) -> bool,
 ) -> Result<Vec<u8>, Error> {
-    // 64-bytes signature + 12-bytes nonce + 16-bytes tag
+    // 64-byte signature + 12-byte nonce + 16-byte tag
     if blob.len() < 92 {
         return Err(Error::InvalidLength);
     }
