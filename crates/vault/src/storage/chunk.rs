@@ -112,7 +112,7 @@ impl<R: io::Read> Chunks<R> {
                         break;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, // EINTR, retry
                 Err(e) => return Err(Error::Io(e)),
             }
         }

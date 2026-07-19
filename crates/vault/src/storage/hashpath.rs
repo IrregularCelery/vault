@@ -70,6 +70,7 @@ impl core::fmt::Display for HashPath {
 impl From<HashPath> for PathBuf {
     fn from(value: HashPath) -> Self {
         let (dir, subdir, file) = value.as_str_parts();
+        // 2 (dir) + 1 (sep) + 2 (subdir) + 1 (sep) + 60 (file) = 66
         let mut path = PathBuf::with_capacity(66);
 
         path.push(dir);

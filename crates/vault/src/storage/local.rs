@@ -142,12 +142,15 @@ impl Backend for Storage {
 
             let mut address = [0u8; 32];
 
+            // dir
             address[0] = u8::from_str_radix(dir, 16).ok()?;
+            // subdir
             address[1] = u8::from_str_radix(subdir, 16).ok()?;
 
             for (i, chunk) in file.as_bytes().chunks(2).enumerate() {
                 let chunk_str = core::str::from_utf8(chunk).ok()?;
 
+                // file
                 address[2 + i] = u8::from_str_radix(chunk_str, 16).ok()?;
             }
 

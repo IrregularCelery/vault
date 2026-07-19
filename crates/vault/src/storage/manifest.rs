@@ -2,26 +2,26 @@
 //!
 //! Binary serialization format (big-endian):
 //!
-//!   [2-bytes] version (u16)
-//!   [4-bytes] entry_count (u32)
+//!   [2-byte] version (u16)
+//!   [4-byte] entry_count (u32)
 //!   each entry:
-//!     [2-bytes]             path_len (u16)
+//!     [2-byte]             path_len (u16)
 //!     [path_len bytes]      path (UTF-8)
-//!     [4-bytes]             chunk_count (u32)
+//!     [4-byte]             chunk_count (u32)
 //!     each chunk:
-//!       [32-bytes]          address (hash)
-//!       [60-bytes]          encrypted_key (nonce=12 + tag=16 + key=32)
-//!     [4-bytes]             version_count
+//!       [32-byte]          address (hash)
+//!       [60-byte]          encrypted_key (nonce=12 + tag=16 + key=32)
+//!     [4-byte]             version_count
 //!     each version:
-//!       [4-bytes]             chunk_count
+//!       [4-byte]             chunk_count
 //!       each chunk:
-//!         [32-bytes]          address
-//!         [60-bytes]          encrypted_key
-//!       [8-bytes]             size
-//!       [8-bytes]             modified
-//!     [8-bytes]             size (u64)
-//!     [8-bytes]             modified (u64)
-//!     [8-bytes]             trashed (u64, 0 = live, unix timestapms = trashed)
+//!         [32-byte]          address
+//!         [60-byte]          encrypted_key
+//!       [8-byte]             size
+//!       [8-byte]             modified
+//!     [8-byte]             size (u64)
+//!     [8-byte]             modified (u64)
+//!     [8-byte]             trashed (u64, 0 = live, unix timestapms = trashed)
 
 use crate::crypto::cipher;
 
@@ -231,7 +231,7 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`]: if `old_path` is absent.
+    /// - [`Error::NotFound`]: if `old_path` is absent.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
         let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
 
@@ -244,8 +244,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`]: if `path` is absent.
-    /// [`Error::AlreadyTrashed`]: if the entry is already trashed.
+    /// - [`Error::NotFound`]: if `path` is absent.
+    /// - [`Error::AlreadyTrashed`]: if the entry is already trashed.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -263,8 +263,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`]: if `path` is absent.
-    /// [`Error::NotTrashed`]: if the entry is not currently trashed.
+    /// - [`Error::NotFound`]: if `path` is absent.
+    /// - [`Error::NotTrashed`]: if the entry is not currently trashed.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -284,8 +284,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`]: if `path` is absent.
-    /// [`Error::VersionNotFound`]: if the version index didn't exist.
+    /// - [`Error::NotFound`]: if `path` is absent.
+    /// - [`Error::VersionNotFound`]: if the version index didn't exist.
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -321,8 +321,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`]: if `path` is absent.
-    /// [`Error::NotTrashed`]: if the entry is not currently trashed.
+    /// - [`Error::NotFound`]: if `path` is absent.
+    /// - [`Error::NotTrashed`]: if the entry is not currently trashed.
     pub fn purge(&mut self, path: &str) -> Result<Vec<[u8; 32]>, Error> {
         match self.entries.get(path) {
             None => return Err(Error::NotFound),
@@ -388,7 +388,7 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::Codec`]: if serialization process fails.
+    /// - [`Error::Codec`]: if serialization process fails.
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         // Estimated size for each entry, 2 chunks, no versions
         let mut writer = binary::Writer::with_capacity(self.entries.len() * 256);
@@ -435,9 +435,9 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::Codec`]: if deserialization process fails.
-    /// [`Error::UnsupportedManifestVersion`]: if the leading version field does not match
-    /// [`MANIFEST_VERSION`].
+    /// - [`Error::Codec`]: if deserialization process fails.
+    /// - [`Error::UnsupportedManifestVersion`]: if the leading version field does not match
+    ///   [`MANIFEST_VERSION`].
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         let mut reader = binary::Reader::new(data);
         let version = reader.read_u16()?;
@@ -525,8 +525,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::Cipher`]: if encryption process fails.
-    /// [`Error::Codec`]: if serialization process fails.
+    /// - [`Error::Cipher`]: if encryption process fails.
+    /// - [`Error::Codec`]: if serialization process fails.
     pub fn lock(
         &self,
         encryption_key: &[u8; 32],
@@ -542,9 +542,9 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::Cipher`]: if decryption process fails.
-    /// [`Error::Codec`]: if deserialization process fails.
-    /// [`Error::Tampered`]: if signature verification fails.
+    /// - [`Error::Cipher`]: if decryption process fails.
+    /// - [`Error::Codec`]: if deserialization process fails.
+    /// - [`Error::Tampered`]: if signature verification fails.
     pub fn unlock(
         blob: &[u8],
         encryption_key: &[u8; 32],
