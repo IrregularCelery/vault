@@ -1,9 +1,9 @@
 use crate::{
     identity::Identity,
     protocol::ClientInit,
-    session::{self, Session},
     storage::remote,
     transport,
+    vault::{self, Vault},
 };
 
 use gate::sys::{borrow::Cow, string::ToString, time};
@@ -11,7 +11,7 @@ use gate::sys::{borrow::Cow, string::ToString, time};
 #[derive(Debug)]
 pub enum Error {
     Transport(transport::Error),
-    Session(session::Error),
+    Vault(vault::Error),
     Other(Cow<'static, str>),
 }
 
@@ -19,7 +19,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Transport(e) => write!(f, "transport: {}", e),
-            Self::Session(e) => write!(f, "session: {}", e),
+            Self::Vault(e) => write!(f, "vault: {}", e),
             Self::Other(e) => write!(f, "{}", e),
         }
     }
@@ -31,28 +31,28 @@ impl From<transport::Error> for Error {
     }
 }
 
-impl From<session::Error> for Error {
-    fn from(value: session::Error) -> Self {
-        Self::Session(value)
+impl From<vault::Error> for Error {
+    fn from(value: vault::Error) -> Self {
+        Self::Vault(value)
     }
 }
 
 pub struct ConnectedClient<T: transport::Backend> {
-    session: Session<remote::Storage<T>>,
+    vault: Vault<remote::Storage<T>>,
     server_static_key: [u8; 32],
 }
 
 impl<T: transport::Backend> ConnectedClient<T> {
-    pub fn into_session(self) -> Session<remote::Storage<T>> {
-        self.session
+    pub fn into_vault(self) -> Vault<remote::Storage<T>> {
+        self.vault
     }
 
-    pub fn session(&self) -> &Session<remote::Storage<T>> {
-        &self.session
+    pub fn vault(&self) -> &Vault<remote::Storage<T>> {
+        &self.vault
     }
 
-    pub fn session_mut(&mut self) -> &mut Session<remote::Storage<T>> {
-        &mut self.session
+    pub fn vault_mut(&mut self) -> &mut Vault<remote::Storage<T>> {
+        &mut self.vault
     }
 
     pub fn server_static_key(&self) -> &[u8; 32] {
@@ -115,10 +115,10 @@ impl Client {
 
         let server_static_key = transport.peer_static_key();
         let storage = remote::Storage::new(transport);
-        let session = Session::new(self.identity, storage)?;
+        let vault = Vault::open(self.identity, storage)?;
 
         Ok(ConnectedClient {
-            session,
+            vault,
             server_static_key,
         })
     }

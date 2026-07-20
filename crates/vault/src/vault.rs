@@ -79,14 +79,14 @@ impl From<manifest::Error> for Error {
     }
 }
 
-pub struct Session<S: storage::Backend> {
+pub struct Vault<S: storage::Backend> {
     identity: Identity,
     storage: S,
     manifest: Manifest,
 }
 
-impl<S: storage::Backend> Session<S> {
-    pub fn new(identity: Identity, storage: S) -> Result<Self, Error> {
+impl<S: storage::Backend> Vault<S> {
+    pub fn open(identity: Identity, storage: S) -> Result<Self, Error> {
         let manifest = match storage.load_manifest() {
             Ok(manifest) => Manifest::unlock(
                 &manifest,
@@ -582,23 +582,23 @@ mod tests {
         Identity::from_mnemonic(words).unwrap()
     }
 
-    fn session() -> Session<local::Storage> {
+    fn vault() -> Vault<local::Storage> {
         let path = temp_storage_path("");
         let words = make_words();
         let identity = make_identity(&words);
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
 
-        Session::new(identity, storage).unwrap()
+        Vault::open(identity, storage).unwrap()
     }
 
-    fn put_bytes(session: &mut Session<local::Storage>, path: &str, data: &[u8]) {
-        session.put(path, data, data.len() as u64).unwrap();
+    fn put_bytes(vault: &mut Vault<local::Storage>, path: &str, data: &[u8]) {
+        vault.put(path, data, data.len() as u64).unwrap();
     }
 
-    fn get_bytes(session: &Session<local::Storage>, path: &str) -> Vec<u8> {
+    fn get_bytes(vault: &Vault<local::Storage>, path: &str) -> Vec<u8> {
         let mut buf = Vec::new();
 
-        session.get(path, &mut buf).unwrap();
+        vault.get(path, &mut buf).unwrap();
 
         buf
     }
@@ -631,17 +631,17 @@ mod tests {
 
     #[test]
     fn put_get_small_data_roundtrip() {
-        let mut session = session();
+        let mut vault = vault();
         let data = b"small data";
 
-        put_bytes(&mut session, "notes/small.txt", data);
+        put_bytes(&mut vault, "notes/small.txt", data);
 
-        assert_eq!(get_bytes(&session, "notes/small.txt"), data);
+        assert_eq!(get_bytes(&vault, "notes/small.txt"), data);
     }
 
     #[test]
     fn put_get_large_data_roundtrip() {
-        let mut session = session();
+        let mut vault = vault();
         let data = [
             vec![0xAAu8; CHUNK_SIZE],
             vec![0xBBu8; CHUNK_SIZE],
@@ -649,17 +649,17 @@ mod tests {
         ]
         .concat();
 
-        put_bytes(&mut session, "large", &data);
+        put_bytes(&mut vault, "large", &data);
 
-        let blobs = session.storage.list_blobs().unwrap().len();
+        let blobs = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs, 3); // 3 data blobs
-        assert_eq!(get_bytes(&session, "large"), data);
+        assert_eq!(get_bytes(&vault, "large"), data);
     }
 
     #[test]
     fn per_user_per_chunk_deduplication() {
-        let mut session = session();
+        let mut vault = vault();
         let data1 = [
             vec![0xAAu8; CHUNK_SIZE],
             vec![0xBBu8; CHUNK_SIZE],
@@ -674,22 +674,22 @@ mod tests {
         ]
         .concat();
 
-        put_bytes(&mut session, "file1", &data1);
+        put_bytes(&mut vault, "file1", &data1);
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
-        put_bytes(&mut session, "file2", &data2);
+        put_bytes(&mut vault, "file2", &data2);
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_second, blobs_after_first + 1); // Only one new chunk
-        assert_eq!(get_bytes(&session, "file1"), data1);
-        assert_eq!(get_bytes(&session, "file2"), data2);
+        assert_eq!(get_bytes(&vault, "file1"), data1);
+        assert_eq!(get_bytes(&vault, "file2"), data2);
     }
 
     #[test]
     fn deduplicate_chunks() {
-        let mut session = session();
+        let mut vault = vault();
         let data = [
             vec![0xAAu8; chunk::CHUNK_SIZE],
             vec![0xAAu8; chunk::CHUNK_SIZE],
@@ -697,81 +697,81 @@ mod tests {
         ]
         .concat();
 
-        put_bytes(&mut session, "large", &data);
+        put_bytes(&mut vault, "large", &data);
 
-        let blobs = session.storage.list_blobs().unwrap().len();
+        let blobs = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs, 2); // The file has 3 blobs but 2 are identical
-        assert_eq!(get_bytes(&session, "large"), data);
+        assert_eq!(get_bytes(&vault, "large"), data);
     }
 
     #[test]
     fn put_get_empty_file_roundtrip() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "notes/empty.txt", b"");
+        put_bytes(&mut vault, "notes/empty.txt", b"");
 
-        assert_eq!(get_bytes(&session, "notes/empty.txt"), b"");
+        assert_eq!(get_bytes(&vault, "notes/empty.txt"), b"");
     }
 
     #[test]
     fn get_version() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"first");
-        put_bytes(&mut session, "file", b"second");
-        put_bytes(&mut session, "file", b"third");
+        put_bytes(&mut vault, "file", b"first");
+        put_bytes(&mut vault, "file", b"second");
+        put_bytes(&mut vault, "file", b"third");
 
         // Versions: [0 = "first", 1 = "second"], active = "third"
         let mut buf = Vec::new();
 
-        session.get_version("file", 0, &mut buf).unwrap();
+        vault.get_version("file", 0, &mut buf).unwrap();
 
         assert_eq!(buf, b"first");
 
         let mut buf = Vec::new();
 
-        session.get_version("file", 1, &mut buf).unwrap();
+        vault.get_version("file", 1, &mut buf).unwrap();
 
         assert_eq!(buf, b"second");
     }
 
     #[test]
     fn get_version_not_found() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"only one version");
+        put_bytes(&mut vault, "file", b"only one version");
 
         // No previous versions exist yet
         let mut buf = Vec::new();
-        let result = session.get_version("file", 0, &mut buf);
+        let result = vault.get_version("file", 0, &mut buf);
 
         assert!(matches!(result, Err(Error::VersionNotFound)));
     }
 
     #[test]
     fn overwrite() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"version one");
-        put_bytes(&mut session, "file", b"version two");
+        put_bytes(&mut vault, "file", b"version one");
+        put_bytes(&mut vault, "file", b"version two");
 
         // Data in path is overwritten, but the old version is kept until dropped
-        assert_eq!(get_bytes(&session, "file"), b"version two");
+        assert_eq!(get_bytes(&vault, "file"), b"version two");
     }
 
     #[test]
     fn overwrite_creates_version() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"version one");
-        put_bytes(&mut session, "file", b"version two");
+        put_bytes(&mut vault, "file", b"version one");
+        put_bytes(&mut vault, "file", b"version two");
 
         // Active content is the latest
-        assert_eq!(get_bytes(&session, "file"), b"version two");
+        assert_eq!(get_bytes(&vault, "file"), b"version two");
 
         // One previous version was created
-        let versions = session.versions("file").unwrap();
+        let versions = vault.versions("file").unwrap();
 
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].size, b"version one".len() as u64);
@@ -779,15 +779,15 @@ mod tests {
 
     #[test]
     fn overwrite_no_unreferenced_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"version one");
+        put_bytes(&mut vault, "file", b"version one");
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
-        put_bytes(&mut session, "file", b"version two");
+        put_bytes(&mut vault, "file", b"version two");
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         // A new chunk was added, nothing was removed
         assert!(blobs_after_second > blobs_after_first);
@@ -796,434 +796,434 @@ mod tests {
 
     #[test]
     fn overwrite_same_content_no_new_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"same content");
+        put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
-        put_bytes(&mut session, "file", b"same content");
+        put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         // Identical content, no new chunk written
         assert_eq!(blobs_after_first, blobs_after_second);
 
         // No-op, no new version recorded
-        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().len(), 0);
     }
 
     #[test]
     fn multiple_overwrites_accumulate_versions() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
-        put_bytes(&mut session, "file", b"v3");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v3");
 
-        assert_eq!(get_bytes(&session, "file"), b"v3");
-        assert_eq!(session.versions("file").unwrap().len(), 2);
+        assert_eq!(get_bytes(&vault, "file"), b"v3");
+        assert_eq!(vault.versions("file").unwrap().len(), 2);
     }
 
     #[test]
     fn revert() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"original");
-        put_bytes(&mut session, "file", b"overwritten");
+        put_bytes(&mut vault, "file", b"original");
+        put_bytes(&mut vault, "file", b"overwritten");
 
         // Revert to index 0 ("original")
-        session.revert("file", 0).unwrap();
+        vault.revert("file", 0).unwrap();
 
-        assert_eq!(get_bytes(&session, "file"), b"original");
+        assert_eq!(get_bytes(&vault, "file"), b"original");
     }
 
     #[test]
     fn revert_preserves_full_history() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
 
         // Before revert: versions = ["v1"], active = "v2"
-        session.revert("file", 0).unwrap();
+        vault.revert("file", 0).unwrap();
 
         // After revert: active = "v1", versions = ["v2"]
-        assert_eq!(get_bytes(&session, "file"), b"v1");
+        assert_eq!(get_bytes(&vault, "file"), b"v1");
 
-        let versions = session.versions("file").unwrap();
+        let versions = vault.versions("file").unwrap();
 
         assert_eq!(versions.len(), 1);
 
         let mut buf = Vec::new();
 
-        session.get_version("file", 0, &mut buf).unwrap();
+        vault.get_version("file", 0, &mut buf).unwrap();
 
         assert_eq!(buf, b"v2");
     }
 
     #[test]
     fn revert_version_not_found() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"data");
+        put_bytes(&mut vault, "file", b"data");
 
         assert!(matches!(
-            session.revert("file", 0),
+            vault.revert("file", 0),
             Err(Error::VersionNotFound)
         ));
     }
 
     #[test]
     fn drop_version() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"old content");
-        put_bytes(&mut session, "file", b"new content");
+        put_bytes(&mut vault, "file", b"old content");
+        put_bytes(&mut vault, "file", b"new content");
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
-        session.drop_version("file", 0).unwrap();
+        vault.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         // One chunk purged (the "old content" chunk)
         assert!(blobs_after < blobs_before);
-        assert_eq!(session.versions("file").unwrap().len(), 0);
-        assert_eq!(get_bytes(&session, "file"), b"new content");
+        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(get_bytes(&vault, "file"), b"new content");
     }
 
     #[test]
     fn drop_version_skips_shared_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
         put_bytes(
-            &mut session,
+            &mut vault,
             "file",
             &[vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat(),
         );
 
         // Overwrite to create version
-        put_bytes(&mut session, "file", &vec![0xBBu8; CHUNK_SIZE]);
+        put_bytes(&mut vault, "file", &vec![0xBBu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
-        session.drop_version("file", 0).unwrap();
+        vault.drop_version("file", 0).unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         // A Chunk is shared with the active version, must not be deleted
         // Only one chunk is purged (the unshared one)
         assert!(blobs_after < blobs_before);
-        assert_eq!(get_bytes(&session, "file"), vec![0xBBu8; CHUNK_SIZE]);
+        assert_eq!(get_bytes(&vault, "file"), vec![0xBBu8; CHUNK_SIZE]);
     }
 
     #[test]
     fn drop_version_skips_shared_chunks_across_files() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file1", &vec![0xAAu8; CHUNK_SIZE]);
+        put_bytes(&mut vault, "file1", &vec![0xAAu8; CHUNK_SIZE]);
         put_bytes(
-            &mut session,
+            &mut vault,
             "file2",
             &[vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat(),
         );
 
         // Overwrite file1 to create version
-        put_bytes(&mut session, "file1", &vec![0xCCu8; CHUNK_SIZE]);
+        put_bytes(&mut vault, "file1", &vec![0xCCu8; CHUNK_SIZE]);
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
-        session.drop_version("file1", 0).unwrap();
+        vault.drop_version("file1", 0).unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         // Chunk is shared with the active version, must not be deleted
         assert_eq!(blobs_before, blobs_after);
-        assert_eq!(get_bytes(&session, "file1"), vec![0xCCu8; CHUNK_SIZE]);
+        assert_eq!(get_bytes(&vault, "file1"), vec![0xCCu8; CHUNK_SIZE]);
     }
 
     #[test]
     fn drop_version_not_found() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"data");
+        put_bytes(&mut vault, "file", b"data");
 
         assert!(matches!(
-            session.drop_version("file", 0),
+            vault.drop_version("file", 0),
             Err(Error::VersionNotFound)
         ));
     }
 
     #[test]
     fn drop_current() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
-        session.drop_version_current("file").unwrap();
+        vault.drop_version_current("file").unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         // v2 chunk was purged
         assert!(blobs_after < blobs_before);
 
         // v1 is now active
-        assert_eq!(get_bytes(&session, "file"), b"v1");
-        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(get_bytes(&vault, "file"), b"v1");
+        assert_eq!(vault.versions("file").unwrap().len(), 0);
     }
 
     #[test]
     fn drop_current_no_versions_deletes_file() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"data");
+        put_bytes(&mut vault, "file", b"data");
 
-        session.drop_version_current("file").unwrap();
+        vault.drop_version_current("file").unwrap();
 
         assert!(matches!(
-            session.get("file", &mut Vec::new()),
+            vault.get("file", &mut Vec::new()),
             Err(Error::NotFound)
         ));
     }
 
     #[test]
     fn detach_version() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"original");
-        put_bytes(&mut session, "file", b"accidentally overwritten");
+        put_bytes(&mut vault, "file", b"original");
+        put_bytes(&mut vault, "file", b"accidentally overwritten");
 
-        session.detach_version("file", 0, "original").unwrap();
+        vault.detach_version("file", 0, "original").unwrap();
 
-        assert_eq!(get_bytes(&session, "original"), b"original");
-        assert_eq!(get_bytes(&session, "file"), b"accidentally overwritten");
+        assert_eq!(get_bytes(&vault, "original"), b"original");
+        assert_eq!(get_bytes(&vault, "file"), b"accidentally overwritten");
     }
 
     #[test]
     fn detach_version_removes_from_source_history() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
 
-        session.detach_version("file", 0, "file_v1").unwrap();
+        vault.detach_version("file", 0, "file_v1").unwrap();
 
         // Version was removed from source
-        assert_eq!(session.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().len(), 0);
 
         // Detached entry has no history of its own
-        assert_eq!(session.versions("file_v1").unwrap().len(), 0);
+        assert_eq!(vault.versions("file_v1").unwrap().len(), 0);
 
         // Both paths are independently readable
-        assert_eq!(get_bytes(&session, "file"), b"v2");
-        assert_eq!(get_bytes(&session, "file_v1"), b"v1");
+        assert_eq!(get_bytes(&vault, "file"), b"v2");
+        assert_eq!(get_bytes(&vault, "file_v1"), b"v1");
     }
 
     #[test]
     fn detach_version_no_chunk_duplication() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"shared data");
-        put_bytes(&mut session, "file", b"other data");
+        put_bytes(&mut vault, "file", b"shared data");
+        put_bytes(&mut vault, "file", b"other data");
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
         // Detach just references existing chunks, no new blobs written
-        session.detach_version("file", 0, "detached").unwrap();
+        vault.detach_version("file", 0, "detached").unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_before, blobs_after);
     }
 
     #[test]
     fn detach_version_not_found() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"data");
+        put_bytes(&mut vault, "file", b"data");
 
         assert!(matches!(
-            session.detach_version("file", 0, "new"),
+            vault.detach_version("file", 0, "new"),
             Err(Error::VersionNotFound)
         ));
     }
 
     #[test]
     fn detach_current() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
 
-        session.detach_version_current("file", "file_v2").unwrap();
+        vault.detach_version_current("file", "file_v2").unwrap();
 
-        assert_eq!(get_bytes(&session, "file_v2"), b"v2");
-        assert_eq!(get_bytes(&session, "file"), b"v1");
-        assert_eq!(session.versions("file").unwrap().len(), 0);
-        assert_eq!(session.versions("file_v2").unwrap().len(), 0);
+        assert_eq!(get_bytes(&vault, "file_v2"), b"v2");
+        assert_eq!(get_bytes(&vault, "file"), b"v1");
+        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file_v2").unwrap().len(), 0);
     }
 
     #[test]
     fn detach_current_no_versions_is_rename() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"data");
+        put_bytes(&mut vault, "file", b"data");
 
-        session.detach_version_current("file", "renamed").unwrap();
+        vault.detach_version_current("file", "renamed").unwrap();
 
-        assert_eq!(get_bytes(&session, "renamed"), b"data");
+        assert_eq!(get_bytes(&vault, "renamed"), b"data");
         assert!(matches!(
-            session.get("file", &mut Vec::new()),
+            vault.get("file", &mut Vec::new()),
             Err(Error::NotFound)
         ));
     }
 
     #[test]
     fn rename() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "old/file", b"data");
+        put_bytes(&mut vault, "old/file", b"data");
 
-        session.rename("old/file", "new/file").unwrap();
+        vault.rename("old/file", "new/file").unwrap();
 
-        assert_eq!(get_bytes(&session, "new/file"), b"data");
+        assert_eq!(get_bytes(&vault, "new/file"), b"data");
     }
 
     #[test]
     fn trash() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file.txt", b"data");
+        put_bytes(&mut vault, "file.txt", b"data");
 
-        session.trash("file.txt").unwrap();
+        vault.trash("file.txt").unwrap();
 
-        assert!(session.list().is_empty());
-        assert!(!session.storage.list_blobs().unwrap().is_empty());
-        assert_eq!(session.list_trash(), vec!["file.txt"]);
+        assert!(vault.list().is_empty());
+        assert!(!vault.storage.list_blobs().unwrap().is_empty());
+        assert_eq!(vault.list_trash(), vec!["file.txt"]);
     }
 
     #[test]
     fn restore() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file.txt", b"data");
+        put_bytes(&mut vault, "file.txt", b"data");
 
-        session.trash("file.txt").unwrap();
-        session.restore("file.txt").unwrap();
+        vault.trash("file.txt").unwrap();
+        vault.restore("file.txt").unwrap();
 
-        assert_eq!(get_bytes(&session, "file.txt"), b"data");
-        assert!(session.list_trash().is_empty());
+        assert_eq!(get_bytes(&vault, "file.txt"), b"data");
+        assert!(vault.list_trash().is_empty());
     }
 
     #[test]
     fn purge() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "1.txt", b"keep this");
-        put_bytes(&mut session, "2.txt", b"delete this");
+        put_bytes(&mut vault, "1.txt", b"keep this");
+        put_bytes(&mut vault, "2.txt", b"delete this");
 
-        session.trash("2.txt").unwrap();
+        vault.trash("2.txt").unwrap();
 
-        let blobs_before_purge = session.storage.list_blobs().unwrap().len();
+        let blobs_before_purge = vault.storage.list_blobs().unwrap().len();
 
-        session.purge("2.txt").unwrap();
+        vault.purge("2.txt").unwrap();
 
-        assert!(session.list_trash().is_empty());
-        assert!(session.storage.list_blobs().unwrap().len() < blobs_before_purge);
-        assert_eq!(get_bytes(&session, "1.txt"), b"keep this");
+        assert!(vault.list_trash().is_empty());
+        assert!(vault.storage.list_blobs().unwrap().len() < blobs_before_purge);
+        assert_eq!(get_bytes(&vault, "1.txt"), b"keep this");
     }
 
     #[test]
     fn purge_all_version_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file1", b"keep this");
-        put_bytes(&mut session, "file2", b"delete v1");
-        put_bytes(&mut session, "file2", b"delete v2");
+        put_bytes(&mut vault, "file1", b"keep this");
+        put_bytes(&mut vault, "file2", b"delete v1");
+        put_bytes(&mut vault, "file2", b"delete v2");
 
-        session.trash("file2").unwrap();
+        vault.trash("file2").unwrap();
 
-        let blobs_before = session.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list_blobs().unwrap().len();
 
-        session.purge("file2").unwrap();
+        vault.purge("file2").unwrap();
 
-        let blobs_after = session.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list_blobs().unwrap().len();
 
         // Both v1 and v2 chunks of file2 should be purged
         assert_eq!(blobs_before, blobs_after + 2);
-        assert_eq!(get_bytes(&session, "file1"), b"keep this");
+        assert_eq!(get_bytes(&vault, "file1"), b"keep this");
     }
 
     #[test]
     fn cleanup() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "1.txt", b"data 1");
-        put_bytes(&mut session, "2.txt", b"data 2");
+        put_bytes(&mut vault, "1.txt", b"data 1");
+        put_bytes(&mut vault, "2.txt", b"data 2");
 
-        session.trash("1.txt").unwrap();
-        session.trash("2.txt").unwrap();
+        vault.trash("1.txt").unwrap();
+        vault.trash("2.txt").unwrap();
 
-        let removed = session.cleanup().unwrap();
+        let removed = vault.cleanup().unwrap();
 
         assert_eq!(removed, 2); // 1 chunk each
-        assert!(session.list_trash().is_empty());
-        assert!(session.list().is_empty());
+        assert!(vault.list_trash().is_empty());
+        assert!(vault.list().is_empty());
     }
 
     #[test]
     fn cleanup_purges_all_version_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
-        put_bytes(&mut session, "file", b"v3");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v3");
 
-        session.trash("file").unwrap();
+        vault.trash("file").unwrap();
 
-        session.cleanup().unwrap();
+        vault.cleanup().unwrap();
 
-        assert_eq!(session.storage.list_blobs().unwrap().len(), 0);
-        assert!(session.list().is_empty());
+        assert_eq!(vault.storage.list_blobs().unwrap().len(), 0);
+        assert!(vault.list().is_empty());
     }
 
     #[test]
     fn delete() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file.txt", b"data");
+        put_bytes(&mut vault, "file.txt", b"data");
 
-        session.delete("file.txt").unwrap();
+        vault.delete("file.txt").unwrap();
 
-        assert!(session.list_trash().is_empty());
+        assert!(vault.list_trash().is_empty());
 
         // file is permanently removed and cannot be restored
-        assert!(session.restore("file.txt").is_err());
+        assert!(vault.restore("file.txt").is_err());
     }
 
     #[test]
     fn only_uploads_changed_chunks() {
-        let mut session = session();
+        let mut vault = vault();
 
         let chunk_a = vec![0xAAu8; CHUNK_SIZE];
         let chunk_b = vec![0xBBu8; CHUNK_SIZE];
         let original: Vec<u8> = [chunk_a.clone(), chunk_b].concat();
 
-        put_bytes(&mut session, "file", &original);
+        put_bytes(&mut vault, "file", &original);
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
         // Since `chunk_a` is identical, it should not be re-uploaded
         let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
         let updated: Vec<u8> = [chunk_a, chunk_b2].concat();
 
-        put_bytes(&mut session, "file", &updated);
+        put_bytes(&mut vault, "file", &updated);
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
         assert_eq!(blobs_after_second, blobs_after_first + 1);
@@ -1231,59 +1231,59 @@ mod tests {
 
     #[test]
     fn not_found() {
-        let session = session();
+        let vault = vault();
         let mut buf = Vec::new();
 
-        let got = session.get("nonexistent.txt", &mut buf);
+        let got = vault.get("nonexistent.txt", &mut buf);
 
         assert!(matches!(got, Err(Error::NotFound)));
     }
 
     #[test]
     fn delete_not_found() {
-        let mut session = session();
-        let deleted = session.delete("nonexistent.txt");
+        let mut vault = vault();
+        let deleted = vault.delete("nonexistent.txt");
 
         assert!(matches!(deleted, Err(Error::NotFound)));
     }
 
     #[test]
-    fn persistent_data_across_sessions() {
+    fn persistent_data_across_vault_opens() {
         let path = temp_storage_path("persistent");
         let words = make_words();
 
         {
             let identity = make_identity(&words);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "persistant.txt", b"persistent data");
+            put_bytes(&mut vault, "persistant.txt", b"persistent data");
         }
 
         {
             let identity = make_identity(&words);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "persistant.txt"), b"persistent data");
+            assert_eq!(get_bytes(&vault, "persistant.txt"), b"persistent data");
         }
     }
 
     #[test]
     fn verify_all() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file1", b"clean data");
-        put_bytes(&mut session, "file2", b"more clean data");
+        put_bytes(&mut vault, "file1", b"clean data");
+        put_bytes(&mut vault, "file2", b"more clean data");
 
-        assert!(session.verify_all().is_empty());
+        assert!(vault.verify_all().is_empty());
     }
 
     #[test]
     fn verify_all_empty_vault() {
-        let session = session();
+        let vault = vault();
 
-        assert!(session.verify_all().is_empty());
+        assert!(vault.verify_all().is_empty());
     }
 
     #[test]
@@ -1293,19 +1293,19 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
 
-        put_bytes(&mut session, "file", b"important data");
+        put_bytes(&mut vault, "file", b"important data");
 
-        let entry = session.manifest.entries.get("file").unwrap();
+        let entry = vault.manifest.entries.get("file").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
         overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
-        let tampared = session.verify_all();
+        let tampared = vault.verify_all();
 
         assert!(tampared.contains(&"file".into()));
     }
@@ -1317,20 +1317,20 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
 
-        put_bytes(&mut session, "secret.txt", b"secret");
+        put_bytes(&mut vault, "secret.txt", b"secret");
 
-        let entry = session.manifest.entries.get("secret.txt").unwrap();
+        let entry = vault.manifest.entries.get("secret.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
         overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
         let mut buf = Vec::new();
-        let result = session.get("secret.txt", &mut buf);
+        let result = vault.get("secret.txt", &mut buf);
 
         assert!(matches!(result, Err(Error::Tampered(_))));
     }
@@ -1342,22 +1342,22 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
 
-        put_bytes(&mut session, "trashed.txt", b"will be trashed");
+        put_bytes(&mut vault, "trashed.txt", b"will be trashed");
 
-        session.trash("trashed.txt").unwrap();
+        vault.trash("trashed.txt").unwrap();
 
         // Corrupt the trashed chunk
-        let entry = session.manifest.entries.get("trashed.txt").unwrap();
+        let entry = vault.manifest.entries.get("trashed.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
         overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
-        let tampared = session.verify_all();
+        let tampared = vault.verify_all();
 
         assert!(tampared.contains(&"trashed.txt".into()));
     }
@@ -1369,24 +1369,24 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
         let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
 
-        put_bytes(&mut session, "large", &data);
+        put_bytes(&mut vault, "large", &data);
 
         // Corrupt both chunks
-        let entry = session.manifest.entries.get("large").unwrap();
+        let entry = vault.manifest.entries.get("large").unwrap();
         let chunks = &entry.chunks;
 
         for chunk in chunks {
-            let mut blob = session.storage.get_blob(&chunk.address).unwrap();
+            let mut blob = vault.storage.get_blob(&chunk.address).unwrap();
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
             overwrite_bytes(&path, &public_signing_key, &chunk.address, &blob);
         }
 
-        let tampared = session.verify_all();
+        let tampared = vault.verify_all();
 
         // Path should appear exactly once despite two tampared chunks
         assert_eq!(tampared.iter().filter(|p| p.as_str() == "large").count(), 1);
@@ -1399,20 +1399,20 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
 
-        put_bytes(&mut session, "file1", b"shared content");
-        put_bytes(&mut session, "file2", b"shared content");
+        put_bytes(&mut vault, "file1", b"shared content");
+        put_bytes(&mut vault, "file2", b"shared content");
 
-        let entry = session.manifest.entries.get("file1").unwrap();
+        let entry = vault.manifest.entries.get("file1").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = session.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
         overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
-        let tampared = session.verify_all();
+        let tampared = vault.verify_all();
 
         assert!(tampared.contains(&"file1".into()));
         assert!(tampared.contains(&"file2".into()));
@@ -1425,22 +1425,22 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut session = Session::new(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage).unwrap();
 
-        put_bytes(&mut session, "file", b"v0");
-        put_bytes(&mut session, "file", b"v1");
-        put_bytes(&mut session, "file", b"v2");
+        put_bytes(&mut vault, "file", b"v0");
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
 
         // Corrupt the v1 (previous version) chunk
-        let entry = session.manifest.entries.get("file").unwrap();
+        let entry = vault.manifest.entries.get("file").unwrap();
         let address = entry.versions[0].chunks[0].address; // Version 1
-        let mut blob = session.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get_blob(&address).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
         overwrite_bytes(&path, &public_signing_key, &address, &blob);
 
-        let tampered = session.verify_all();
+        let tampered = vault.verify_all();
 
         assert_eq!(tampered, vec!["file@v1".to_string()]);
         assert!(tampered.contains(&"file@v1".into()));
@@ -1455,74 +1455,74 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "user1.txt", b"this data belongs to user 1");
+            put_bytes(&mut vault, "user1.txt", b"this data belongs to user 1");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
             let mut buf = Vec::new();
 
             // User2 cannot access user1's data
-            assert!(session.get("user1.txt", &mut buf).is_err());
+            assert!(vault.get("user1.txt", &mut buf).is_err());
         }
     }
 
     #[test]
     fn same_file_same_path_same_user() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"same content");
+        put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
         // Basically a no-op
-        put_bytes(&mut session, "file", b"same content");
+        put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
-        assert_eq!(get_bytes(&session, "file"), b"same content");
+        assert_eq!(get_bytes(&vault, "file"), b"same content");
     }
 
     #[test]
     fn same_file_different_paths_same_user() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file1", b"same content");
+        put_bytes(&mut vault, "file1", b"same content");
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
-        put_bytes(&mut session, "file2", b"same content");
+        put_bytes(&mut vault, "file2", b"same content");
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
-        assert_eq!(get_bytes(&session, "file1"), get_bytes(&session, "file2"));
+        assert_eq!(get_bytes(&vault, "file1"), get_bytes(&vault, "file2"));
     }
 
     #[test]
     fn different_files_same_path_same_user() {
-        let mut session = session();
+        let mut vault = vault();
 
-        put_bytes(&mut session, "file", b"content");
+        put_bytes(&mut vault, "file", b"content");
 
-        let blobs_after_first = session.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
 
-        put_bytes(&mut session, "file", b"different content");
+        put_bytes(&mut vault, "file", b"different content");
 
-        let blobs_after_second = session.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
 
         // No unreferenced chunks, the old chunks are in a separate version
         assert!(blobs_after_second > blobs_after_first);
-        assert_eq!(get_bytes(&session, "file"), b"different content");
+        assert_eq!(get_bytes(&vault, "file"), b"different content");
 
-        session.drop_version("file", 0).unwrap();
+        vault.drop_version("file", 0).unwrap();
 
-        let blobs_after_version_drop = session.storage.list_blobs().unwrap().len();
+        let blobs_after_version_drop = vault.storage.list_blobs().unwrap().len();
 
         assert_eq!(blobs_after_version_drop, blobs_after_first);
     }
@@ -1536,33 +1536,33 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file", b"same content");
+            put_bytes(&mut vault, "file", b"same content");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file", b"same content");
+            put_bytes(&mut vault, "file", b"same content");
         }
 
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file"), b"same content");
+            assert_eq!(get_bytes(&vault, "file"), b"same content");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file"), b"same content");
+            assert_eq!(get_bytes(&vault, "file"), b"same content");
         }
     }
 
@@ -1575,33 +1575,33 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file1", b"same content");
+            put_bytes(&mut vault, "file1", b"same content");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file2", b"same content");
+            put_bytes(&mut vault, "file2", b"same content");
         }
 
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file1"), b"same content");
+            assert_eq!(get_bytes(&vault, "file1"), b"same content");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file2"), b"same content");
+            assert_eq!(get_bytes(&vault, "file2"), b"same content");
         }
     }
 
@@ -1614,33 +1614,33 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file", b"different content 1");
+            put_bytes(&mut vault, "file", b"different content 1");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut session = Session::new(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage).unwrap();
 
-            put_bytes(&mut session, "file", b"different content 2");
+            put_bytes(&mut vault, "file", b"different content 2");
         }
 
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file"), b"different content 1");
+            assert_eq!(get_bytes(&vault, "file"), b"different content 1");
         }
 
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let session = Session::new(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage).unwrap();
 
-            assert_eq!(get_bytes(&session, "file"), b"different content 2");
+            assert_eq!(get_bytes(&vault, "file"), b"different content 2");
         }
     }
 }
