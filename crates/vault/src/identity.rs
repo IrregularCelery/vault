@@ -81,8 +81,8 @@ impl Identity {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidMnemonic`]: if an invalid word was found.
-    /// - [`Error::UnsafeMnemonic`]: if the phrase is a known BIP-39 test vector, guarding against
+    /// - [`Error::InvalidMnemonic`]: If an invalid word is found.
+    /// - [`Error::UnsafeMnemonic`]: If the phrase is a known BIP-39 test vector, guarding against
     ///   accidental use of example mnemonics.
     pub fn from_mnemonic(words: &[impl AsRef<str>]) -> Result<Self, Error> {
         if words.is_empty() {

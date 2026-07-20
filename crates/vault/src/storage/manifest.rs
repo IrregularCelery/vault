@@ -231,7 +231,7 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`]: if `old_path` is absent.
+    /// - [`Error::NotFound`]: If `old_path` is absent.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
         let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
 
@@ -244,8 +244,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`]: if `path` is absent.
-    /// - [`Error::AlreadyTrashed`]: if the entry is already trashed.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::AlreadyTrashed`]: If the entry is already trashed.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -263,8 +263,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`]: if `path` is absent.
-    /// - [`Error::NotTrashed`]: if the entry is not currently trashed.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::NotTrashed`]: If the entry is not currently trashed.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -284,8 +284,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`]: if `path` is absent.
-    /// - [`Error::VersionNotFound`]: if the version index didn't exist.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::VersionNotFound`]: If the version index didn't exist.
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -321,8 +321,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::NotFound`]: if `path` is absent.
-    /// - [`Error::NotTrashed`]: if the entry is not currently trashed.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::NotTrashed`]: If the entry is not currently trashed.
     pub fn purge(&mut self, path: &str) -> Result<Vec<[u8; 32]>, Error> {
         match self.entries.get(path) {
             None => return Err(Error::NotFound),
@@ -388,7 +388,7 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::Codec`]: if serialization process fails.
+    /// - [`Error::Codec`]: If serialization process fails.
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         // Estimated size for each entry, 2 chunks, no versions
         let mut writer = binary::Writer::with_capacity(self.entries.len() * 256);
@@ -435,8 +435,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::Codec`]: if deserialization process fails.
-    /// - [`Error::UnsupportedManifestVersion`]: if the leading version field does not match
+    /// - [`Error::Codec`]: If deserialization process fails.
+    /// - [`Error::UnsupportedManifestVersion`]: If the leading version field does not match
     ///   [`MANIFEST_VERSION`].
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         let mut reader = binary::Reader::new(data);
@@ -525,8 +525,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::Cipher`]: if encryption process fails.
-    /// - [`Error::Codec`]: if serialization process fails.
+    /// - [`Error::Cipher`]: If encryption process fails.
+    /// - [`Error::Codec`]: If serialization process fails.
     pub fn lock(
         &self,
         encryption_key: &[u8; 32],
@@ -542,9 +542,9 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::Cipher`]: if decryption process fails.
-    /// - [`Error::Codec`]: if deserialization process fails.
-    /// - [`Error::Tampered`]: if signature verification fails.
+    /// - [`Error::Cipher`]: If decryption process fails.
+    /// - [`Error::Codec`]: If deserialization process fails.
+    /// - [`Error::Tampered`]: If signature verification fails.
     pub fn unlock(
         blob: &[u8],
         encryption_key: &[u8; 32],

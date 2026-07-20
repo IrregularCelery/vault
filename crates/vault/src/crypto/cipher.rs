@@ -45,7 +45,7 @@ impl core::fmt::Display for Error {
 ///
 /// # Errors
 ///
-/// - [`Error::EncryptFailed`]: if the underlying AEAD cipher fails to encrypt or authenticate
+/// - [`Error::EncryptFailed`]: If the underlying AEAD cipher fails to encrypt or authenticate
 ///   the payload.
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
@@ -68,8 +68,8 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
 ///
 /// # Errors
 ///
-/// - [`Error::DecryptFailed`]: if the ciphertext or tag authentication check fails.
-/// - [`Error::InvalidLength`]: if the input `blob` is less than 28 bytes (nonce + tag).
+/// - [`Error::DecryptFailed`]: If the ciphertext or tag authentication check fails.
+/// - [`Error::InvalidLength`]: If the input `blob` is less than 28 bytes (nonce + tag).
 pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
     // 12-byte nonce + 16-byte tag
     if blob.len() < 28 {
@@ -93,7 +93,7 @@ pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
 ///
 /// # Errors
 ///
-/// - [`Error::EncryptFailed`]: if the underlying AEAD cipher fails to encrypt or authenticate
+/// - [`Error::EncryptFailed`]: If the underlying AEAD cipher fails to encrypt or authenticate
 ///   the payload.
 pub fn lock(
     key: &[u8; 32],
@@ -118,9 +118,9 @@ pub fn lock(
 ///
 /// # Errors
 ///
-/// - [`Error::DecryptFailed`]: if the payload authentication check or decryption fails.
-/// - [`Error::InvalidLength`]: if the input `blob` is less than 92 bytes (signature + nonce + tag).
-/// - [`Error::InvalidSignature`]: if the cryptographic signature verification fails.
+/// - [`Error::DecryptFailed`]: If the payload authentication check or decryption fails.
+/// - [`Error::InvalidLength`]: If the input `blob` is less than 92 bytes (signature + nonce + tag).
+/// - [`Error::InvalidSignature`]: If the cryptographic signature verification fails.
 pub fn unlock(
     key: &[u8; 32],
     blob: &[u8],

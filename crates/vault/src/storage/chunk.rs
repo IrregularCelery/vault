@@ -21,9 +21,6 @@ pub enum Error {
     /// An I/O error.
     Io(io::Error),
 
-    /// The source ended before a complete fixed-size read could be satisfied.
-    UnexpectedEof,
-
     /// Specific message error.
     Other(&'static str),
 }
@@ -32,7 +29,6 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "I/O: {}", e),
-            Self::UnexpectedEof => write!(f, "unexpected end of file"),
             Self::Other(e) => write!(f, "{}", e),
         }
     }

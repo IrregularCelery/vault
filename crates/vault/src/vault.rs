@@ -1,3 +1,12 @@
+//! The primary API surface of the vault.
+//!
+//! A [`Vault`] owns an [`Identity`] and a [`storage::Backend`] and exposes high-level file
+//! operation: put, get, version history, rename, trash/restore/purge, and integrity verification.
+//!
+//! On construction the manifest is loaded and decrypted (or an empty manifest is initialized).
+//! Every mutating method updates the in-memory manifest and then flushes it back to the storage
+//! before returning.
+
 use crate::{
     crypto::cipher,
     identity::Identity,
@@ -10,18 +19,40 @@ use crate::{
 
 use gate::sys::{borrow::Cow, io, macros::format, string::String, time, vec::Vec};
 
+/// Errors from vault-level file operations.
 #[derive(Debug)]
 pub enum Error {
+    /// A blob or manifest storage operation failed.
     Storage(storage::Error),
+
+    /// An AEAD encryption or decryption error (wrong key, corrupted data, etc.).
     Cipher(cipher::Error),
+
+    /// An error from the chunker, most likely an I/O error.
     Chunk(chunk::Error),
+
+    /// A manifest-level error.
     Manifest(manifest::Error),
+
+    /// An I/O error most likely while writing decrypted plaintext to the writer.
     Io(io::Error),
+
+    /// The requested file path does not exist in the manifest (or is trashed).
     NotFound,
+
+    /// A [`Vault::restore`] was attempted on an entry that is not currently trashed.
     NotTrashed,
+
+    /// A [`Vault::trash`] was attempted on an entry that has already been trashed.
     AlreadyTrashed,
+
+    /// The requested version index is out of bounds for the entry's history.
     VersionNotFound,
+
+    /// A blob's signature did not match, could be the manifest blob or chunks (including versions).
     Tampered(String),
+
+    /// Specific message error.
     Other(Cow<'static, str>),
 }
 
@@ -79,13 +110,34 @@ impl From<manifest::Error> for Error {
     }
 }
 
+/// An active vault session with a decrypted manifest and a connected storage backend.
+///
+/// The manifest is kept in memory. All writes are reflected into storage by [`flush_manifest`]
+/// before each method returns, keeping the on-disk state in sync.
 pub struct Vault<S: storage::Backend> {
+    /// The cryptographic identity used to encrypt, decrypt, sign, and verify all blobs and
+    /// the manifest.
     identity: Identity,
+
+    /// The storage backend.
     storage: S,
+
+    /// The decrypted in-memory manifest. All mutations are applied here first, then flushed
+    /// to [`Vault::storage`] via [`Vault::flush_manifest`] before each method returns.
     manifest: Manifest,
 }
 
 impl<S: storage::Backend> Vault<S> {
+    /// Opens a vault by loading and decrypting the manifest from `storage`.
+    ///
+    /// Creates an empty manifest if none exists yet.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading the manifest from storage fails for reasons
+    ///   other than [`Error::NotFound`].
+    /// - [`Error::Manifest`]: If the underlying manifest decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If the manifest signature is invalid.
     pub fn open(identity: Identity, storage: S) -> Result<Self, Error> {
         let manifest = match storage.load_manifest() {
             Ok(manifest) => Manifest::unlock(
@@ -108,6 +160,19 @@ impl<S: storage::Backend> Vault<S> {
         })
     }
 
+    /// Encrypts and stores a file, returning the number of new chunks uploaded.
+    ///
+    /// The file is split into [`chunk::CHUNK_SIZE`]-byte chunks. Each chunk is addressed by
+    /// a keyed BLAKE3 hash of its plaintext, enabling per-user-per-chunk deduplication.
+    /// If `path` already exists with different content, the previous version is saved to history
+    /// via [`manifest::Entry::push_version`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If writing a chunk to storage or flushing the manifest fails.
+    /// - [`Error::Cipher`]: If chunk or manifest encryption fails.
+    /// - [`Error::Chunk`]: If reading from `reader` fails.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     pub fn put(&mut self, path: &str, reader: impl io::Read, size: u64) -> Result<usize, Error> {
         let mut chunks = Chunks::new(reader);
         let mut entry_chunks = Vec::new();
@@ -115,8 +180,7 @@ impl<S: storage::Backend> Vault<S> {
         while let Some(chunk) = chunks.next_chunk()? {
             let address = chunk.address(&self.identity.encryption_key());
             let key = chunk.key(&self.identity.encryption_key());
-            let encrypted_chunk_key =
-                cipher::encrypt(&self.identity.encryption_key(), &key).map_err(Error::Cipher)?;
+            let encrypted_chunk_key = cipher::encrypt(&self.identity.encryption_key(), &key)?;
             let mut encrypted_key = [0u8; 60];
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
@@ -141,6 +205,7 @@ impl<S: storage::Backend> Vault<S> {
             let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
 
             if existing_addresses == new_addresses {
+                // TODO: If the file exists and is trashed, we should untrash it.
                 return Ok(0);
             }
         }
@@ -171,12 +236,26 @@ impl<S: storage::Backend> Vault<S> {
         Ok(chunk_count)
     }
 
+    /// Decrypts and streams the current version of `path` into `writer` then returns the total
+    /// number of plaintext bytes written.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
+    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Io`]: If writing to `writer` fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::Tampered`]: If signature verification fails.
+    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
         let entry = self.manifest.get(path).ok_or(Error::NotFound)?;
 
         self.decrypt_chunks(path, &entry.chunks, writer)
     }
 
+    /// Returns version metadata for all historical revisions of `path`, oldest first.
+    ///
+    /// Includes versions of trashed entries. Returns `None` if the path is absent.
     pub fn versions(&self, path: &str) -> Option<Vec<VersionProperties>> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get(path)?;
@@ -196,6 +275,17 @@ impl<S: storage::Backend> Vault<S> {
         )
     }
 
+    /// Decrypts and streams a specific historical version of `path` into `writer`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
+    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Io`]: If writing to `writer` fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
+    /// - [`Error::Tampered`]: If signature verification fails.
+    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn get_version(
         &self,
         path: &str,
@@ -209,6 +299,18 @@ impl<S: storage::Backend> Vault<S> {
         self.decrypt_chunks(path, &version.chunks, writer)
     }
 
+    /// Rolls `path` back to historical version at `version_index`, pushing the current state into
+    /// history.
+    ///
+    /// The target version is removed from the version list and becomes the active revision.
+    /// The previously-active state is appended to the end of the version list.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
     pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
@@ -234,6 +336,16 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Permanently drops a historical version and deletes its now-unreferenced blobs.
+    ///
+    /// Addresses still referenced by the active version or other files are preserved.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<(), Error> {
         let dropped = self.manifest.drop_version(path, index)?;
 
@@ -246,6 +358,16 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Replaces the active version with the most recent historical version.
+    ///
+    /// Active chunks that are no longer referenced are deleted from storage.
+    /// If no historical versions exist, the file is deleted entirely.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
     pub fn drop_version_current(&mut self, path: &str) -> Result<(), Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
@@ -276,6 +398,17 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Moves a historical version out of `path`'s history into a new independent file at `new_path`.
+    ///
+    /// No blobs are copied, only manifest references are updated. Both paths become independently
+    /// readable and writable after the call.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
     pub fn detach_version(
         &mut self,
         path: &str,
@@ -306,6 +439,16 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Moves the active version of `path` to `new_path` and makees the most recent historical
+    /// version the new active revision.
+    ///
+    /// Equivalent to [`Vault::rename`] when no historical versions exist.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
     pub fn detach_version_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
@@ -334,6 +477,14 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Renames `old_path` to `new_path` in the manifest. Manifest manipulation only, no blobs are
+    /// touched.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
         self.manifest.rename(old_path, new_path)?;
         self.flush_manifest()?;
@@ -341,6 +492,15 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Soft-deletes `path`, moving it to the trash. Blobs are retained and the entry can be
+    /// recovered with [`Vault::restore`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::AlreadyTrashed`]: If the `path` is already trashed.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         self.manifest.trash(path)?;
         self.flush_manifest()?;
@@ -348,6 +508,14 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Recovers a trashed entry, making it live again.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::NotTrashed`]: If the `path` is not currently trashed.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
         self.manifest.restore(path)?;
         self.flush_manifest()?;
@@ -355,6 +523,15 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Permanently removes a trashed entry and deletes its blobs if no longer referenced by any
+    /// live file.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::NotTrashed`]: If the `path` is not currently trashed.
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
         let addresses = self.manifest.purge(path)?;
 
@@ -367,6 +544,12 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Purges all trashed entries at once. Returns the total number of blobs deleted.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     pub fn cleanup(&mut self) -> Result<usize, Error> {
         let addresses = self.manifest.purge_all();
         let removed = addresses.len();
@@ -380,13 +563,23 @@ impl<S: storage::Backend> Vault<S> {
         Ok(removed)
     }
 
+    /// Hard-deletes `path`, trashes it and immediately purges it. Non-recoverable.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
+        // TODO: If trash returns [`Error::AlreadyTrashed`], it should gracefully purge it instead
+        // of propagating the error in this method.
         self.manifest.trash(path)?;
         self.purge(path)?;
 
         Ok(())
     }
 
+    /// Returns a sorted list of paths for all live (non-trashed) entries.
     pub fn list(&self) -> Vec<&str> {
         let mut paths: Vec<&str> = self
             .manifest
@@ -401,6 +594,7 @@ impl<S: storage::Backend> Vault<S> {
         paths
     }
 
+    /// Returns a sorted list of paths for all trashed entries.
     pub fn list_trash(&self) -> Vec<&str> {
         let mut paths: Vec<&str> = self
             .manifest
@@ -415,6 +609,9 @@ impl<S: storage::Backend> Vault<S> {
         paths
     }
 
+    /// Returns [`Properties`] metadata for `path`.
+    ///
+    /// Also returns metadata for trashed entries.
     pub fn properties(&self, path: &str) -> Option<Properties> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         self.manifest.entries.get(path).map(|e| Properties {
@@ -426,6 +623,15 @@ impl<S: storage::Backend> Vault<S> {
         })
     }
 
+    /// Verifies the signatures on all chunks of `path`, including every version.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
+    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::Tampered`]: If signature verification fails.
+    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn verify(&self, path: &str) -> Result<(), Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
@@ -442,6 +648,10 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Verifies every chunk in the manifest, live, trashed, and all versions as well as
+    /// the manifest blob itself.
+    ///
+    /// Returns a sorted, deduplicated list of paths with at least one tampered chunk.
     pub fn verify_all(&self) -> Vec<String> {
         let mut tampered = Vec::new();
 
@@ -480,6 +690,15 @@ impl<S: storage::Backend> Vault<S> {
         tampered
     }
 
+    /// Decrypts the chunk list for `path` and writes plaintext to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
+    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Io`]: If writing to `writer` fails.
+    /// - [`Error::Tampered`]: If signature verification fails.
+    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     fn decrypt_chunks(
         &self,
         path: &str,
@@ -489,12 +708,11 @@ impl<S: storage::Backend> Vault<S> {
         let mut size = 0u64;
 
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
-                .map_err(Error::Cipher)?;
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)?;
             let key = chunk_key
                 .as_slice()
                 .try_into()
-                .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
+                .map_err(|_| Error::Other("wrong size chunk encryption key was found".into()))?;
             let blob = self.storage.get_blob(&chunk.address)?;
             let plaintext = cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
@@ -512,18 +730,26 @@ impl<S: storage::Backend> Vault<S> {
         Ok(size)
     }
 
+    /// Verifies signatures on a chunk list.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
+    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Tampered`]: If signature verification fails.
+    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     fn verify_entry_chunks(
         &self,
         path: &str,
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
+        // TODO: Should this only verify the signature and ignore the decryption?
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)
-                .map_err(Error::Cipher)?;
+            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)?;
             let key = chunk_key
                 .as_slice()
                 .try_into()
-                .map_err(|_| Error::Chunk(chunk::Error::UnexpectedEof))?;
+                .map_err(|_| Error::Other("wrong size chunk encryption key was found".into()))?;
             let blob = self.storage.get_blob(&chunk.address)?;
 
             cipher::unlock(&key, &blob, |message, signature_bytes| {
@@ -538,6 +764,12 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
+    /// Serialises, encrypts, signs, and persists the current manifest to the storage backend.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If writing the manifest blob to storage fails.
+    /// - [`Error::Manifest`]: If the underlying manifest decryption or deserialization fails.
     fn flush_manifest(&self) -> Result<(), Error> {
         let data = self
             .manifest
