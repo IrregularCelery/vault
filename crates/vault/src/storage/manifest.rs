@@ -285,7 +285,7 @@ impl Manifest {
     /// # Errors
     ///
     /// - [`Error::NotFound`]: If `path` is absent.
-    /// - [`Error::VersionNotFound`]: If the version index didn't exist.
+    /// - [`Error::VersionNotFound`]: If the version index doesn't exist.
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 

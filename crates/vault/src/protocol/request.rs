@@ -1,27 +1,74 @@
+//! Client-to-server requests.
+
 use super::Error;
 
 use gate::{codec::binary, sys::vec::Vec};
 
+/// A storage operation request from the client to the server.
 #[derive(Debug, PartialEq)]
 pub enum Request<'a> {
-    SaveManifest { data: &'a [u8] },
+    /// Overwrite the manifest blob with `data`.
+    SaveManifest {
+        /// The serialized, encrypted manifest bytes to persist.
+        data: &'a [u8],
+    },
+
+    /// Retrieve the manifest blob.
     LoadManifest,
-    PutBlob { address: [u8; 32], data: &'a [u8] },
-    GetBlob { address: [u8; 32] },
-    ExistsBlob { address: [u8; 32] },
-    DeleteBlob { address: [u8; 32] },
+
+    /// Store `data` at the content-addressed `address`. No-op if already exists.
+    PutBlob {
+        /// The 32-byte content address of the blob.
+        address: [u8; 32],
+
+        /// The encrypted blob bytes to store.
+        data: &'a [u8],
+    },
+
+    /// Retrieve the encrypted blob at `address`.
+    GetBlob {
+        /// The 32-byte content address of the blob.
+        address: [u8; 32],
+    },
+
+    /// Check whether a blob exists at `address` without reading its contents.
+    ExistsBlob {
+        /// The 32-byte content address of the blob.
+        address: [u8; 32],
+    },
+
+    /// Delete the blob at `address`. Idempotent, no error if absent.
+    DeleteBlob {
+        /// The 32-byte content address of the blob.
+        address: [u8; 32],
+    },
+
+    /// List all blob addresses.
     ListBlobs,
 }
 
 impl<'a> Request<'a> {
+    /// Discriminant tag for [`Request::SaveManifest`].
     const TAG_SAVE_MANIFEST: u8 = 0;
+    /// Discriminant tag for [`Request::LoadManifest`].
     const TAG_LOAD_MANIFEST: u8 = 1;
+    /// Discriminant tag for [`Request::PutBlob`].
     const TAG_PUT_BLOB: u8 = 2;
+    /// Discriminant tag for [`Request::GetBlob`].
     const TAG_GET_BLOB: u8 = 3;
+    /// Discriminant tag for [`Request::ExistsBlob`].
     const TAG_EXISTS_BLOB: u8 = 4;
+    /// Discriminant tag for [`Request::DeleteBlob`].
     const TAG_DELETE_BLOB: u8 = 5;
+    /// Discriminant tag for [`Request::ListBlobs`].
     const TAG_LIST_BLOB: u8 = 6;
 
+    /// Serializes the request into a binary format.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Codec`]: If the underlying binary serialization fails (e.g., blob length exceeds
+    ///   u32::MAX).
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         let mut writer;
 
@@ -78,6 +125,12 @@ impl<'a> Request<'a> {
         Ok(writer.finish())
     }
 
+    /// Deserializes a request from a raw bytes format.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Codec`]: If the underlying binary deserialization fails (e.g., `data` is empty).
+    /// - [`Error::UnknownTag`]: If the leading tag does not match a valid request variant.
     pub fn deserialize(data: &'a [u8]) -> Result<Self, Error> {
         if data.is_empty() {
             return Err(Error::Codec(binary::Error::Other("empty message")));
