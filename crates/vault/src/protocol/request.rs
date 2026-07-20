@@ -8,15 +8,31 @@ use gate::{codec::binary, sys::vec::Vec};
 #[derive(Debug, PartialEq)]
 pub enum Request<'a> {
     /// Overwrite the manifest blob with `data`.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Ok`]
+    /// - [`super::response::Response::Error`]
     SaveManifest {
         /// The serialized, encrypted manifest bytes to persist.
         data: &'a [u8],
     },
 
     /// Retrieve the manifest blob.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Manifest`]
+    /// - [`super::response::Response::NotFound`]
+    /// - [`super::response::Response::Error`]
     LoadManifest,
 
     /// Store `data` at the content-addressed `address`. No-op if already exists.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Ok`]
+    /// - [`super::response::Response::Error`]
     PutBlob {
         /// The 32-byte content address of the blob.
         address: [u8; 32],
@@ -26,24 +42,45 @@ pub enum Request<'a> {
     },
 
     /// Retrieve the encrypted blob at `address`.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Blob`]
+    /// - [`super::response::Response::NotFound`]
+    /// - [`super::response::Response::Error`]
     GetBlob {
         /// The 32-byte content address of the blob.
         address: [u8; 32],
     },
 
     /// Check whether a blob exists at `address` without reading its contents.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Exists`]
+    /// - [`super::response::Response::Error`]
     ExistsBlob {
         /// The 32-byte content address of the blob.
         address: [u8; 32],
     },
 
     /// Delete the blob at `address`. Idempotent, no error if absent.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Ok`]
+    /// - [`super::response::Response::Error`]
     DeleteBlob {
         /// The 32-byte content address of the blob.
         address: [u8; 32],
     },
 
     /// List all blob addresses.
+    ///
+    /// # Responses
+    ///
+    /// - [`super::response::Response::Addresses`]
+    /// - [`super::response::Response::Error`]
     ListBlobs,
 }
 

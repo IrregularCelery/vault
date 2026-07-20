@@ -1,3 +1,5 @@
+//! Server-to-client responses.
+
 use crate::protocol::Error;
 
 use gate::{
@@ -8,26 +10,84 @@ use gate::{
     },
 };
 
+/// A storage operation response from the server to a client.
 #[derive(Debug, PartialEq)]
 pub enum Response {
+    /// The request succeeded with no data to return.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::SaveManifest`]
+    /// - [`super::request::Request::PutBlob`]
+    /// - [`super::request::Request::DeleteBlob`]
     Ok,
+
+    /// The requested manifest blob. Contains the raw encrypted bytes.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::LoadManifest`]
     Manifest(Vec<u8>),
+
+    /// The list of all blob addresses.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::ListBlobs`]
     Addresses(Vec<[u8; 32]>),
+
+    /// The requested blob's raw encrypted bytes.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::GetBlob`]
     Blob(Vec<u8>),
+
+    /// Whether the queried blob exists.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::ExistsBlob`]
     Exists(bool),
+
+    /// The requested path was not found.
+    ///
+    /// # Requests
+    ///
+    /// - [`super::request::Request::LoadManifest`]
+    /// - [`super::request::Request::GetBlob`]
     NotFound,
+
+    /// A server-side error occurred.
+    ///
+    /// # Requests
+    ///
+    /// - All [`super::request::Request`] variants can return error.
     Error(String),
 }
 
 impl Response {
+    /// Discriminant tag for [`Response::Ok`].
     const TAG_OK: u8 = 0;
+    /// Discriminant tag for [`Response::Manifest`].
     const TAG_MANIFEST: u8 = 1;
+    /// Discriminant tag for [`Response::Addresses`].
     const TAG_ADDRESSES: u8 = 2;
+    /// Discriminant tag for [`Response::Blob`].
     const TAG_BLOB: u8 = 3;
+    /// Discriminant tag for [`Response::Exists`].
     const TAG_EXISTS: u8 = 4;
+    /// Discriminant tag for [`Response::NotFound`].
     const TAG_NOT_FOUND: u8 = 5;
+    /// Discriminant tag for [`Response::Error`].
     const TAG_ERROR: u8 = 6;
 
+    /// Serializes the response into a binary format.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Codec`]: If the underlying binary serialization fails (e.g., blob length exceeds
+    ///   u32::MAX).
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         let mut writer;
 
@@ -87,6 +147,12 @@ impl Response {
         Ok(writer.finish())
     }
 
+    /// Deserializes a response from a raw bytes format.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Codec`]: If the underlying binary deserialization fails (e.g., `data` is empty).
+    /// - [`Error::UnknownTag`]: If the leading tag does not match a valid response variant.
     pub fn deserialize(data: &[u8]) -> Result<Self, Error> {
         if data.is_empty() {
             return Err(Error::Codec(binary::Error::Other("empty message")));
