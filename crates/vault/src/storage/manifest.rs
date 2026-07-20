@@ -31,7 +31,7 @@ use gate::{
     sys::{collections::btree_map::BTreeMap, string::String, time, vec::Vec},
 };
 
-/// Binary format version tag written at the start of every serialised manifest.
+/// Binary format version tag written at the start of every serialized manifest.
 const MANIFEST_VERSION: u16 = 1;
 /// BLAKE3 domain tag used to derive the storage address of a user's manifest blob
 /// from their public signing key.
@@ -165,7 +165,7 @@ impl Entry {
 /// The file index, mapping virtual paths to their versioned chunk lists.
 ///
 /// Tracks current chunks, historical versions, timestamps, size, and a soft-delete (trash)
-/// timestamp per entry. Serialised, encrypted, and signed before being persisted to
+/// timestamp per entry. Serialized, encrypted, and signed before being persisted to
 /// the storage backend.
 #[derive(Debug, PartialEq)]
 pub struct Manifest {
@@ -538,7 +538,7 @@ impl Manifest {
         Ok(locked)
     }
 
-    /// Verifies the signature and decrypts the manifest blob, then deserialises it.
+    /// Verifies the signature and decrypts the manifest blob, then deserializes it.
     ///
     /// # Errors
     ///

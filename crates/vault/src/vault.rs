@@ -764,7 +764,7 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
-    /// Serialises, encrypts, signs, and persists the current manifest to the storage backend.
+    /// Serializes, encrypts, signs, and persists the current manifest to the storage backend.
     ///
     /// # Errors
     ///
