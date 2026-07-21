@@ -43,7 +43,7 @@ pub enum Error {
     /// An encryption or decryption error.
     Cipher(cipher::Error),
 
-    /// A binary serialisation or deserialisation error.
+    /// A binary serialization or deserialization error.
     Codec(binary::Error),
 
     /// The leading version field does not match [`MANIFEST_VERSION`]. The value is the version

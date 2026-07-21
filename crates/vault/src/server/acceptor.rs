@@ -1,17 +1,25 @@
+//! Handles a single authenticated client connection from handshake to request loop.
+
 use crate::{
     identity::Identity,
-    protocol::{ClientInit, request::Request, response::Response},
+    protocol::{self, ClientInit, request::Request, response::Response},
     storage::{self, Backend, local},
     transport,
 };
 
-use gate::sys::{borrow::Cow, macros::format, path::PathBuf, string::ToString};
+use gate::sys::{macros::format, path::PathBuf, string::ToString};
 
+/// Errors that can occur while accepting or serving a client connection.
 #[derive(Debug)]
 pub enum Error {
+    /// A transport-level failure.
     Transport(transport::Error),
+
+    /// A blob or manifest storage operation failed.
     Storage(storage::Error),
-    Other(Cow<'static, str>),
+
+    /// A binary serialization or deserialization error.
+    Codec(protocol::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -19,7 +27,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::Transport(e) => write!(f, "transport: {}", e),
             Self::Storage(e) => write!(f, "storage: {}", e),
-            Self::Other(e) => write!(f, "{}", e),
+            Self::Codec(e) => write!(f, "codec: {}", e),
         }
     }
 }
@@ -36,12 +44,21 @@ impl From<storage::Error> for Error {
     }
 }
 
+/// A vault server that authenticates clients and dispatches storage operations.
+///
+/// Each call to [`Server::accept`] handles exactly one client connection for its lifetime.
+/// The server holds its own [`Identity`] and a root directory under which per-user storage
+/// is scoped.
 pub struct Server {
+    /// The server's own cryptographic identity.
     identity: Identity,
+
+    /// Root directory under which per-user storage directories are created.
     storage_root: PathBuf,
 }
 
 impl Server {
+    /// Creates a new server with `identity` and `storage_root`.
     pub fn new(identity: Identity, storage_root: impl Into<PathBuf>) -> Self {
         Self {
             identity,
@@ -49,10 +66,25 @@ impl Server {
         }
     }
 
+    /// Accepts a successfully established transport and serves the client for its lifetime.
+    ///
+    /// Protocol flow:
+    /// 1. Receive and deserialize [`ClientInit`].
+    /// 2. Verify the client's claimed identity using a signature over a version of [`ClientInit`].
+    /// 3. Open a [`local::Storage`] scoped to the client's public signing key.
+    /// 4. Enter a request/response loop, dispatching each [`Request`] variant to the
+    ///    matching [`storage::Backend`] method and serialising the [`Response`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Transport`]: If the client application-level verification, or the transport
+    ///   message transfer fails.
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Codec`]: If serialization or deserialization fails.
     pub fn accept<T: transport::Backend>(&self, mut transport: T) -> Result<(), Error> {
         // Retrieve `ClientInit` message
         let raw = transport.recv()?;
-        let init = ClientInit::deserialize(&raw).map_err(|e| Error::Other(e.to_string().into()))?;
+        let init = ClientInit::deserialize(&raw).map_err(Error::Codec)?;
         let handshake_hash = transport.handshake_hash();
         let message = init.build_signing_message(&handshake_hash);
 
@@ -67,6 +99,7 @@ impl Server {
         loop {
             let raw = match transport.recv() {
                 Ok(r) => r,
+                // A clean disconnect from the client is fine, not an error.
                 Err(transport::Error::Closed) => return Ok(()),
                 Err(e) => return Err(Error::Transport(e)),
             };
@@ -106,14 +139,11 @@ impl Server {
                 Err(e) => Response::Error(format!("error while deserializing request: {}", e)),
             };
 
-            transport.send(
-                &response
-                    .serialize()
-                    .map_err(|e| Error::Other(e.to_string().into()))?,
-            )?;
+            transport.send(&response.serialize().map_err(Error::Codec)?)?;
         }
     }
 
+    /// Returns a reference to the server's [`Identity`].
     pub fn identity(&self) -> &Identity {
         &self.identity
     }

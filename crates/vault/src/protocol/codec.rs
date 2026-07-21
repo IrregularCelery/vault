@@ -10,7 +10,7 @@ pub const DOMAIN_PROTOCOL: &[u8] = b"vault::protocol";
 /// Errors that can occur while processing protocol messages.
 #[derive(Debug)]
 pub enum Error {
-    /// A binary parsing error.
+    /// A binary serialization or deserialization error.
     Codec(binary::Error),
 
     /// The protocol version field does not match [`PROTOCOL_VERSION`]. The value is the version
