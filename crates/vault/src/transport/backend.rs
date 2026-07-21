@@ -5,7 +5,7 @@ use gate::sys::{io, macros::vec::Vec};
 /// Errors from transport-level operations.
 #[derive(Debug)]
 pub enum Error {
-    /// The Noise handshake failed or the post-handshake application protocol was violated.
+    /// The transport handshake failed or the post-handshake application protocol was violated.
     Handshake(&'static str),
 
     /// An underlying I/O error on the byte stream.
