@@ -1,11 +1,23 @@
+//! The [`Backend`] trait for abstract encrypted transports.
+
 use gate::sys::{io, macros::vec::Vec};
 
+/// Errors from transport-level operations.
 #[derive(Debug)]
 pub enum Error {
+    /// The Noise handshake failed or the post-handshake application protocol was violated.
     Handshake(&'static str),
+
+    /// An underlying I/O error on the byte stream.
     Io(io::Error),
+
+    /// The message to be sent exceeds the maximum allowed size.
     MessageTooLarge,
+
+    /// The remote peer closed the connection.
     Closed,
+
+    /// Specific message error.
     Other(&'static str),
 }
 
@@ -27,12 +39,15 @@ impl From<io::Error> for Error {
     }
 }
 
+/// An abstract bidirectional, message-oriented, encrypted channel.
 pub trait Backend {
+    /// Sends a message to the remote peer.
     fn send(&mut self, data: &[u8]) -> Result<(), Error>;
+
+    /// Receives and returns a message from the remote peer.
     fn recv(&mut self) -> Result<Vec<u8>, Error>;
 
-    /// The remote peer's verified static public key / identifier.
-    /// Noise: remote X25519 static public key.
+    /// The remote peer's verified long-term static public key / identifier.
     fn peer_static_key(&self) -> [u8; 32];
 
     /// Handshake transcript hash, identical on both peers after a successful handshake.
