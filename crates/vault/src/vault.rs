@@ -182,6 +182,7 @@ impl<S: storage::Backend> Vault<S> {
             let key = chunk.key(&self.identity.encryption_key());
             let encrypted_chunk_key = cipher::encrypt(&self.identity.encryption_key(), &key)?;
             let mut encrypted_key = [0u8; 60];
+
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
             // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
@@ -199,13 +200,20 @@ impl<S: storage::Backend> Vault<S> {
             });
         }
 
-        if let Some(existing) = self.manifest.entries.get(path) {
+        if let Some(existing) = self.manifest.entries.get_mut(path) {
             let existing_addresses: Vec<[u8; 32]> =
                 existing.chunks.iter().map(|c| c.address).collect();
             let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
 
+            // Same `path`, same existing content, not a new version.
+            // If the `path` is trashed, restore it
             if existing_addresses == new_addresses {
-                // TODO: If the file exists and is trashed, we should untrash it.
+                if existing.trashed != 0 {
+                    existing.trashed = 0;
+
+                    self.flush_manifest()?;
+                }
+
                 return Ok(0);
             }
         }
@@ -214,7 +222,11 @@ impl<S: storage::Backend> Vault<S> {
         let modified = time::current_secs().unwrap_or(0);
 
         if let Some(existing) = self.manifest.entries.get_mut(path) {
+            // Same `path`, different content, a new version.
             existing.push_version(entry_chunks, size, modified);
+            // NOTE: It's debatable whether this should gracefully restore the `path`, or return
+            // an error instead.
+            existing.trashed = 0;
 
             self.flush_manifest()?;
 
@@ -349,11 +361,14 @@ impl<S: storage::Backend> Vault<S> {
     pub fn drop_version(&mut self, path: &str, index: usize) -> Result<(), Error> {
         let dropped = self.manifest.drop_version(path, index)?;
 
+        // Persist the manifest before deleting the blobs. If a delete fails partway, or
+        // the process dies right here, the worst case is an unreferenced blob, never a live entry
+        // pointing at a chunk that no longer exists.
+        self.flush_manifest()?;
+
         for address in dropped {
             self.storage.delete_blob(&address)?;
         }
-
-        self.flush_manifest()?;
 
         Ok(())
     }
@@ -389,11 +404,11 @@ impl<S: storage::Backend> Vault<S> {
             .filter(|a| !referenced.contains(a))
             .collect();
 
+        self.flush_manifest()?;
+
         for address in &addresses {
             self.storage.delete_blob(address)?;
         }
-
-        self.flush_manifest()?;
 
         Ok(())
     }
@@ -454,7 +469,16 @@ impl<S: storage::Backend> Vault<S> {
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
-            return self.rename(path, new_path);
+            self.manifest.rename(path, new_path)?;
+
+            if let Some(detached) = self.manifest.entries.get_mut(new_path) {
+                // `detach` should always produce live entry at `new_path`
+                detached.trashed = 0;
+            }
+
+            self.flush_manifest()?;
+
+            return Ok(());
         }
 
         let latest_version = entry.versions.remove(entry.versions.len() - 1);
@@ -535,11 +559,11 @@ impl<S: storage::Backend> Vault<S> {
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
         let addresses = self.manifest.purge(path)?;
 
+        self.flush_manifest()?;
+
         for address in &addresses {
             self.storage.delete_blob(address)?;
         }
-
-        self.flush_manifest()?;
 
         Ok(())
     }
@@ -554,11 +578,11 @@ impl<S: storage::Backend> Vault<S> {
         let addresses = self.manifest.purge_all();
         let removed = addresses.len();
 
+        self.flush_manifest()?;
+
         for address in &addresses {
             self.storage.delete_blob(address)?;
         }
-
-        self.flush_manifest()?;
 
         Ok(removed)
     }
@@ -944,6 +968,33 @@ mod tests {
         put_bytes(&mut vault, "notes/empty.txt", b"");
 
         assert_eq!(get_bytes(&vault, "notes/empty.txt"), b"");
+    }
+
+    #[test]
+    fn put_same_content_on_trashed_path_restores_it() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"same content");
+
+        vault.trash("file").unwrap();
+
+        put_bytes(&mut vault, "file", b"same content");
+
+        assert_eq!(vault.list(), vec!["file"]);
+    }
+
+    #[test]
+    fn put_different_content_on_trashed_path_restores_it() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"original");
+
+        vault.trash("file").unwrap();
+
+        put_bytes(&mut vault, "file", b"new content");
+
+        assert_eq!(vault.list(), vec!["file"]);
+        assert_eq!(get_bytes(&vault, "file"), b"new content");
     }
 
     #[test]
@@ -1339,6 +1390,19 @@ mod tests {
             vault.get("file", &mut Vec::new()),
             Err(Error::NotFound)
         ));
+    }
+
+    #[test]
+    fn detach_current_no_versions_restores_trashed_at_new_path() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"data");
+
+        vault.trash("file").unwrap();
+        vault.detach_version_current("file", "renamed").unwrap();
+
+        assert_eq!(vault.list(), &["renamed"]);
+        assert_eq!(get_bytes(&vault, "renamed"), b"data");
     }
 
     #[test]
