@@ -53,14 +53,17 @@ pub enum Error {
     /// The requested path does not exist in the manifest.
     NotFound,
 
+    /// The requested version index doesn not exist for an entry.
+    VersionNotFound,
+
+    /// A [`Manifest::rename`] was attempted onto a new path that already has an entry.
+    AlreadyExists,
+
     /// A [`Manifest::restore`] was attempted on an entry that is not currently trashed.
     NotTrashed,
 
     /// A [`Manifest::trash`] was attempted on an entry that has already been trashed.
     AlreadyTrashed,
-
-    /// The requested version index doesn not exist for an entry.
-    VersionNotFound,
 
     /// The manifest's signature did not match the ciphertext, the blob was tampered with.
     Tampered,
@@ -73,9 +76,10 @@ impl core::fmt::Display for Error {
             Self::Codec(e) => write!(f, "codec: {}", e),
             Self::UnsupportedManifestVersion(v) => write!(f, "unsupported manifest version: {}", v),
             Self::NotFound => write!(f, "file not found"),
+            Self::VersionNotFound => write!(f, "version not found"),
+            Self::AlreadyExists => write!(f, "a file already exists at the new path"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
-            Self::VersionNotFound => write!(f, "version not found"),
             Self::Tampered => write!(f, "tampered manifest"),
         }
     }
@@ -245,7 +249,12 @@ impl Manifest {
     /// # Errors
     ///
     /// - [`Error::NotFound`]: If `old_path` is absent.
+    /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        if self.entries.contains_key(new_path) {
+            return Err(Error::AlreadyExists);
+        }
+
         let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
 
         self.entries.insert(new_path.into(), entry);
@@ -874,6 +883,18 @@ mod tests {
         let renamed = manifest.rename("nonexistent.txt", "nonexistent_renamed.txt");
 
         assert!(matches!(renamed, Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn rename_rejects_existing_new_path() {
+        let mut manifest = manifest();
+
+        let renamed = manifest.rename("music/song.mp3", "photos/image.png");
+
+        assert!(matches!(renamed, Err(Error::AlreadyExists)));
+        // Nothing was touched
+        assert!(manifest.get("music/song.mp3").is_some());
+        assert!(manifest.get("photos/image.png").is_some());
     }
 
     #[test]

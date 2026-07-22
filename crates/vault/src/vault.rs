@@ -40,14 +40,18 @@ pub enum Error {
     /// The requested file path does not exist in the manifest (or is trashed).
     NotFound,
 
+    /// The requested version index is out of bounds for the entry's history.
+    VersionNotFound,
+
+    /// A [`Vault::rename`], [`Vault::detach_version`], or [`Vault::detach_version_current`]
+    /// was attempted onto a new path that already has an entry.
+    AlreadyExists,
+
     /// A [`Vault::restore`] was attempted on an entry that is not currently trashed.
     NotTrashed,
 
     /// A [`Vault::trash`] was attempted on an entry that has already been trashed.
     AlreadyTrashed,
-
-    /// The requested version index is out of bounds for the entry's history.
-    VersionNotFound,
 
     /// A blob's signature did not match, could be the manifest blob or chunks (including versions).
     Tampered(String),
@@ -65,9 +69,10 @@ impl core::fmt::Display for Error {
             Self::Manifest(e) => write!(f, "manifest: {}", e),
             Self::Io(e) => write!(f, "I/O: {}", e),
             Self::NotFound => write!(f, "file not found"),
+            Self::VersionNotFound => write!(f, "version not found"),
+            Self::AlreadyExists => write!(f, "a file already exists at the new path"),
             Self::NotTrashed => write!(f, "file is not in the trash"),
             Self::AlreadyTrashed => write!(f, "file is already in the trash"),
-            Self::VersionNotFound => write!(f, "version not found"),
             Self::Tampered(e) => write!(f, "tampered blob: {}", e),
             Self::Other(e) => write!(f, "{}", e),
         }
@@ -102,9 +107,10 @@ impl From<manifest::Error> for Error {
     fn from(value: manifest::Error) -> Self {
         match value {
             manifest::Error::NotFound => Self::NotFound,
+            manifest::Error::VersionNotFound => Self::VersionNotFound,
+            manifest::Error::AlreadyExists => Self::AlreadyExists,
             manifest::Error::NotTrashed => Self::NotTrashed,
             manifest::Error::AlreadyTrashed => Self::AlreadyTrashed,
-            manifest::Error::VersionNotFound => Self::VersionNotFound,
             other => Self::Manifest(other),
         }
     }
@@ -424,12 +430,17 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `index` is absent.
+    /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     pub fn detach_version(
         &mut self,
         path: &str,
         index: usize,
         new_path: &str,
     ) -> Result<(), Error> {
+        if self.manifest.entries.contains_key(new_path) {
+            return Err(Error::AlreadyExists);
+        }
+
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -464,7 +475,12 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Storage`]: If an underlying storage error happens.
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     pub fn detach_version_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
+        if self.manifest.entries.contains_key(new_path) {
+            return Err(Error::AlreadyExists);
+        }
+
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
 
@@ -509,6 +525,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Storage`]: If an underlying storage error happens.
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
         self.manifest.rename(old_path, new_path)?;
         self.flush_manifest()?;
@@ -1314,6 +1331,21 @@ mod tests {
     }
 
     #[test]
+    fn detach_version_rejects_existing_new_path() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+        put_bytes(&mut vault, "other", b"already here");
+
+        assert!(matches!(
+            vault.detach_version("file", 0, "other"),
+            Err(Error::AlreadyExists)
+        ));
+        assert_eq!(vault.versions("file").unwrap().len(), 1);
+    }
+
+    #[test]
     fn detach_version_removes_from_source_history() {
         let mut vault = vault();
 
@@ -1406,6 +1438,21 @@ mod tests {
     }
 
     #[test]
+    fn detach_current_rejects_existing_new_path() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+        put_bytes(&mut vault, "other", b"already here");
+
+        assert!(matches!(
+            vault.detach_version_current("file", "other"),
+            Err(Error::AlreadyExists)
+        ));
+        assert_eq!(get_bytes(&vault, "file"), b"v2");
+    }
+
+    #[test]
     fn rename() {
         let mut vault = vault();
 
@@ -1414,6 +1461,18 @@ mod tests {
         vault.rename("old/file", "new/file").unwrap();
 
         assert_eq!(get_bytes(&vault, "new/file"), b"data");
+    }
+
+    #[test]
+    fn rename_rejects_existing_new_path() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"a data");
+        put_bytes(&mut vault, "b", b"b data");
+
+        assert!(matches!(vault.rename("a", "b"), Err(Error::AlreadyExists)));
+        assert_eq!(get_bytes(&vault, "a"), b"a data");
+        assert_eq!(get_bytes(&vault, "b"), b"b data");
     }
 
     #[test]
