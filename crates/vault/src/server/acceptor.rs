@@ -103,6 +103,8 @@ impl Server {
                 Err(transport::Error::Closed) => return Ok(()),
                 Err(e) => return Err(Error::Transport(e)),
             };
+            // FIXME: Server shouldn't return every error to clients. (e.g., I/O errors)
+            // Perhaps even log them to console and stuff.
             let response = match Request::deserialize(&raw) {
                 Ok(request) => match request {
                     Request::SaveManifest { data } => match storage.save_manifest(data) {

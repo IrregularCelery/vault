@@ -612,9 +612,10 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        // TODO: If trash returns [`Error::AlreadyTrashed`], it should gracefully purge it instead
-        // of propagating the error in this method.
-        self.manifest.trash(path)?;
+        self.manifest.trash(path).or_else(|e| match e {
+            manifest::Error::AlreadyTrashed => Ok(()),
+            other => Err(other),
+        })?;
         self.purge(path)?;
 
         Ok(())
@@ -1595,6 +1596,22 @@ mod tests {
 
         put_bytes(&mut vault, "file.txt", b"data");
 
+        vault.delete("file.txt").unwrap();
+
+        assert!(vault.list_trash().is_empty());
+
+        // file is permanently removed and cannot be restored
+        assert!(vault.restore("file.txt").is_err());
+    }
+
+    #[test]
+    fn delete_a_trashed_entry_is_ok() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file.txt", b"data");
+
+        vault.trash("file.txt").unwrap();
+        // This shouldn't return `Error::AlreadyTrashed`
         vault.delete("file.txt").unwrap();
 
         assert!(vault.list_trash().is_empty());
