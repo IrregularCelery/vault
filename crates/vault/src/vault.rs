@@ -185,7 +185,7 @@ impl<S: storage::Backend> Vault<S> {
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
             // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
-            // though not entirely useless since we can avoid calling cipher::encrypt()
+            // though not entirely useless since we can avoid calling an unnecessary `cipher::lock()`
             if !self.storage.exists_blob(&address)? {
                 let encrypted =
                     cipher::lock(&key, chunk.data, |message| self.identity.sign(message))?;
@@ -382,11 +382,11 @@ impl<S: storage::Backend> Vault<S> {
         entry.size = latest_version.size;
         entry.modified = latest_version.modified;
 
-        let still_referenced: Vec<[u8; 32]> = self.manifest.addresses();
+        let referenced: Vec<[u8; 32]> = self.manifest.addresses();
         let addresses: Vec<[u8; 32]> = dropped_chunks
             .into_iter()
             .map(|c| c.address)
-            .filter(|a| !still_referenced.contains(a))
+            .filter(|a| !referenced.contains(a))
             .collect();
 
         for address in &addresses {
@@ -1176,6 +1176,33 @@ mod tests {
     }
 
     #[test]
+    fn drop_version_current_skips_chunks_shared_with_its_own_new_active_version_when_trashed() {
+        let mut vault = vault();
+
+        let chunk_a = vec![0xAAu8; CHUNK_SIZE];
+        let chunk_b = vec![0xBBu8; CHUNK_SIZE];
+        let chunk_c = vec![0xCCu8; CHUNK_SIZE];
+
+        // v1 = [A, B]
+        put_bytes(
+            &mut vault,
+            "file",
+            &[chunk_a.clone(), chunk_b.clone()].concat(),
+        );
+        // v2 = [A, C] (active), v1 = [A, B] (history) — chunk A is shared between the two
+        put_bytes(&mut vault, "file", &[chunk_a.clone(), chunk_c].concat());
+
+        vault.trash("file").unwrap();
+
+        // Drops active v2 = [A, C], falling back to v1 = [A, B]. Chunk "A" must survive since it's
+        // shared with the version becoming active.
+        vault.drop_version_current("file").unwrap();
+        vault.restore("file").unwrap();
+
+        assert_eq!(get_bytes(&vault, "file"), [chunk_a, chunk_b].concat());
+    }
+
+    #[test]
     fn drop_version_not_found() {
         let mut vault = vault();
 
@@ -1367,6 +1394,22 @@ mod tests {
         assert!(vault.list_trash().is_empty());
         assert!(vault.storage.list_blobs().unwrap().len() < blobs_before_purge);
         assert_eq!(get_bytes(&vault, "1.txt"), b"keep this");
+    }
+
+    #[test]
+    fn purge_skips_chunks_still_used_by_a_trashed_entry() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"shared content");
+        put_bytes(&mut vault, "b", b"shared content"); // Share the same chunk as "a"
+
+        vault.trash("a").unwrap();
+        vault.trash("b").unwrap();
+
+        vault.purge("a").unwrap();
+        vault.restore("b").unwrap();
+
+        assert_eq!(get_bytes(&vault, "b"), b"shared content");
     }
 
     #[test]

@@ -194,11 +194,24 @@ impl Manifest {
         self.entries.get(path).filter(|e| e.trashed == 0)
     }
 
+    /// Collects all blob addresses referenced by every entry, live or trashed, including their
+    /// version history.
+    pub fn addresses(&self) -> Vec<[u8; 32]> {
+        self.entries
+            .values()
+            .flat_map(|e| {
+                e.chunks.iter().map(|c| c.address).chain(
+                    e.versions
+                        .iter()
+                        .flat_map(|v| v.chunks.iter().map(|c| c.address)),
+                )
+            })
+            .collect()
+    }
+
     /// Collects all blob addresses referenced by live (non-trashed) entries, including their
     /// version history.
-    ///
-    /// Any address absent from this set is safe to delete during garbage collection and cleanups.
-    pub fn addresses(&self) -> Vec<[u8; 32]> {
+    pub fn addresses_live(&self) -> Vec<[u8; 32]> {
         self.entries
             .values()
             .filter(|e| e.trashed == 0)
@@ -294,24 +307,13 @@ impl Manifest {
         }
 
         let dropped = entry.versions.remove(index);
-        let still_referenced: Vec<[u8; 32]> = entry
-            .chunks
-            .iter()
-            .map(|c| c.address)
-            .chain(
-                entry
-                    .versions
-                    .iter()
-                    .flat_map(|v| v.chunks.iter().map(|c| c.address)),
-            )
-            .collect();
-        let live = self.addresses();
+        let referenced = self.addresses();
 
         Ok(dropped
             .chunks
             .into_iter()
             .map(|c| c.address)
-            .filter(|a| !still_referenced.contains(a) && !live.contains(a))
+            .filter(|a| !referenced.contains(a))
             .collect())
     }
 
@@ -331,7 +333,7 @@ impl Manifest {
         }
 
         if let Some(entry) = self.entries.remove(path) {
-            let live = self.addresses();
+            let referenced = self.addresses(); // Entry was already removed, so this excludes it
             let all_addresses = entry.chunks.iter().map(|c| c.address).chain(
                 entry
                     .versions
@@ -339,7 +341,7 @@ impl Manifest {
                     .flat_map(|v| v.chunks.iter().map(|c| c.address)),
             );
 
-            return Ok(all_addresses.filter(|a| !live.contains(a)).collect());
+            return Ok(all_addresses.filter(|a| !referenced.contains(a)).collect());
         }
 
         Err(Error::NotFound)
@@ -347,7 +349,7 @@ impl Manifest {
 
     /// Permanently removes all trashed entries and returns all now-unreferenced addresses.
     pub fn purge_all(&mut self) -> Vec<[u8; 32]> {
-        let live = self.addresses();
+        let live = self.addresses_live();
         let paths: Vec<String> = self
             .entries
             .iter()
@@ -926,7 +928,7 @@ mod tests {
             },
         );
 
-        let addrs = manifest.addresses();
+        let addrs = manifest.addresses_live();
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.contains(&[0xAAu8; 32]));
@@ -940,7 +942,7 @@ mod tests {
         manifest.trash("photos/image.png").unwrap();
 
         // Only the 2 chunks from `music/song.mp3`, ignored the one chunk of `photos/image.png`
-        assert_eq!(manifest.addresses().len(), 2);
+        assert_eq!(manifest.addresses_live().len(), 2);
         assert_eq!(manifest.addresses_trashed().len(), 1);
     }
 
@@ -993,6 +995,45 @@ mod tests {
     }
 
     #[test]
+    fn purge_skips_address_still_used_by_a_trashed_entry() {
+        let mut manifest = Manifest::new();
+        let shared = EntryChunk {
+            address: [0xAAu8; 32],
+            encrypted_key: [0xFF; 60],
+        };
+
+        manifest.insert(
+            "a",
+            Entry {
+                chunks: vec![shared.clone()],
+                versions: Vec::new(),
+                size: 1,
+                modified: 0,
+                trashed: 0,
+            },
+        );
+        manifest.insert(
+            "b",
+            Entry {
+                chunks: vec![shared],
+                versions: Vec::new(),
+                size: 1,
+                modified: 0,
+                trashed: 0,
+            },
+        );
+
+        manifest.trash("a").unwrap();
+        manifest.trash("b").unwrap();
+
+        let deleted = manifest.purge("a").unwrap();
+
+        // "b" is trashed but not yet purged, and still references the shared chunk, therefore
+        // no chunks should be deleted
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
     fn purge_rejects_live_entry() {
         let mut manifest = manifest();
 
@@ -1016,7 +1057,7 @@ mod tests {
     #[test]
     fn all_chunk_addresses() {
         let manifest = manifest();
-        let addresses = manifest.addresses();
+        let addresses = manifest.addresses_live();
 
         // Sample has 2 + 1 = 3 chunk addresses
         assert_eq!(addresses.len(), 3);
@@ -1079,6 +1120,51 @@ mod tests {
         let dropped = manifest.drop_version("file", 0).unwrap();
 
         // Must not delete the address since active still uses it
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn drop_version_skips_address_still_used_by_a_trashed_entry() {
+        let mut manifest = Manifest::new();
+        let shared = EntryChunk {
+            address: [0xAAu8; 32],
+            encrypted_key: [0xFF; 60],
+        };
+
+        manifest.insert(
+            "a",
+            Entry {
+                chunks: vec![EntryChunk {
+                    address: [0xBBu8; 32],
+                    encrypted_key: [0xFF; 60],
+                }],
+                versions: vec![Version {
+                    chunks: vec![shared.clone()],
+                    size: 1,
+                    modified: 0,
+                }],
+                size: 1,
+                modified: 0,
+                trashed: 0,
+            },
+        );
+        manifest.insert(
+            "b",
+            Entry {
+                chunks: vec![shared],
+                versions: Vec::new(),
+                size: 1,
+                modified: 0,
+                trashed: 0,
+            },
+        );
+
+        manifest.trash("b").unwrap();
+
+        let dropped = manifest.drop_version("a", 0).unwrap();
+
+        // "b" (trashed, unpurged) still references the chunk, which must not be reported
+        // as droppable
         assert!(dropped.is_empty());
     }
 }
