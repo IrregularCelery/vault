@@ -1,7 +1,7 @@
 //! This module provides AEAD encryption (ChaCha20-Poly1305) and signature-bound blob locking
 //! to detect tampering.
 //!
-//! Encrypted blobs are as follows:
+//! Encrypted blobs are as follows (locked):
 //!   `[ 64-byte signature ] + [ 12-byte nonce ] + [ ciphertext ] + [ 16-byte tag ]`
 
 use gate::{
@@ -85,8 +85,58 @@ pub fn decrypt(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::DecryptFailed)
 }
 
+/// Signs `blob` using the provided `sign` function, prepending the resulting 64-byte signature.
+/// `sign` function is called with the exact bytes of `blob`; must return a 64-byte signature over
+/// those bytes.
+///
+/// Output format:
+/// `[ 64-byte signature ] + [ blob ]`
+pub fn attach_signature(blob: &[u8], sign: impl Fn(&[u8]) -> [u8; 64]) -> Vec<u8> {
+    let signature = sign(blob);
+    let mut out = Vec::with_capacity(64 + blob.len()); // 64-byte signature
+
+    out.extend_from_slice(&signature);
+    out.extend_from_slice(blob);
+
+    out
+}
+
+/// Verifies the signature of a `blob` using the provided `verify` function.
+/// `verify` function is called with the message bytes (everything after the signature) and the
+/// 64-byte signature; returns `true` if the signature is valid for that message.
+///
+/// Expected input format:
+/// `[ 64-byte signature ] + [ data ]`
+///
+/// # Errors
+///
+/// - [`Error::InvalidLength`]: If the input `blob` is less than 64 bytes (signature).
+/// - [`Error::InvalidSignature`]: If the cryptographic signature verification fails.
+pub fn verify_signature(
+    blob: &[u8],
+    verify: impl Fn(&[u8], &[u8; 64]) -> bool,
+) -> Result<(), Error> {
+    // 64-byte signature
+    if blob.len() < 64 {
+        return Err(Error::InvalidLength);
+    }
+
+    let (signature_bytes, data) = blob.split_at(64);
+    let signature = signature_bytes
+        .try_into()
+        .map_err(|_| Error::InvalidLength)?;
+
+    if !verify(data, signature) {
+        return Err(Error::InvalidSignature);
+    }
+
+    Ok(())
+}
+
 /// Encrypts `plaintext` with ChaCha20-Poly1305 under `key`, then signs the resulting payload
 /// using the provided `sign` function, prepending the 64-byte signature.
+/// `sign` function is called with the exact bytes of `blob`; must return a 64-byte signature over
+/// those bytes.
 ///
 /// Output format:
 /// `[ 64-byte signature ] + [ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
@@ -101,17 +151,14 @@ pub fn lock(
     sign: impl Fn(&[u8]) -> [u8; 64],
 ) -> Result<Vec<u8>, Error> {
     let encrypted = encrypt(key, plaintext)?;
-    let signature = sign(&encrypted);
-    let mut out = Vec::with_capacity(64 + encrypted.len()); // 64-byte signature
 
-    out.extend_from_slice(&signature);
-    out.extend_from_slice(&encrypted);
-
-    Ok(out)
+    Ok(attach_signature(&encrypted, sign))
 }
 
 /// Verifies the signature of a `blob` using the provided `verify` function, then decrypts
 /// the payload using ChaCha20-Poly1305 under `key`.
+/// `verify` function is called with the message bytes (everything after the signature) and the
+/// 64-byte signature; returns `true` if the signature is valid for that message.
 ///
 /// Expected input format:
 /// `[ 64-byte signature ] + [ 12-byte nonce ] + [ encrypted plaintext ] + [ 16-byte tag ]`
@@ -131,16 +178,9 @@ pub fn unlock(
         return Err(Error::InvalidLength);
     }
 
-    let (signature_bytes, encrypted) = blob.split_at(64);
-    let signature = signature_bytes
-        .try_into()
-        .map_err(|_| Error::InvalidLength)?;
+    verify_signature(blob, verify)?;
 
-    if !verify(encrypted, signature) {
-        return Err(Error::InvalidSignature);
-    }
-
-    decrypt(key, encrypted)
+    decrypt(key, &blob[64..])
 }
 
 #[cfg(test)]
@@ -165,16 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn lock_unlock_roundtrip() {
-        let key = [0u8; 32];
-        let plaintext = b"Something";
-        let blob = lock(&key, plaintext, sign).unwrap();
-        let decrypted = unlock(&key, &blob, verify).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
     fn encrypt_decrypt_roundtrip() {
         let key = [0u8; 32];
         let plaintext = b"Something";
@@ -185,6 +215,25 @@ mod tests {
         let decrypted_data = decrypt(&key, &encrypted_blob).unwrap();
 
         assert_eq!(decrypted_data, plaintext);
+    }
+
+    #[test]
+    fn attach_verify_signature_roundtrip() {
+        let plaintext = b"Something";
+        let signed = attach_signature(plaintext, sign);
+        let verified = verify_signature(&signed, verify);
+
+        assert!(verified.is_ok());
+    }
+
+    #[test]
+    fn lock_unlock_roundtrip() {
+        let key = [0u8; 32];
+        let plaintext = b"Something";
+        let blob = lock(&key, plaintext, sign).unwrap();
+        let decrypted = unlock(&key, &blob, verify).unwrap();
+
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]
