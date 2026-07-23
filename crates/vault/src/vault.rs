@@ -785,16 +785,10 @@ impl<S: storage::Backend> Vault<S> {
         path: &str,
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
-        // TODO: Should this only verify the signature and ignore the decryption?
         for chunk in chunks {
-            let chunk_key = cipher::decrypt(&self.identity.encryption_key(), &chunk.encrypted_key)?;
-            let key = chunk_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| Error::Other("wrong size chunk encryption key was found".into()))?;
             let blob = self.storage.get_blob(&chunk.address)?;
 
-            cipher::unlock(&key, &blob, |message, signature_bytes| {
+            cipher::verify_signature(&blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
             .map_err(|e| match e {

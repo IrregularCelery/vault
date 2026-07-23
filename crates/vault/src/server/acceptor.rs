@@ -105,6 +105,8 @@ impl Server {
             };
             // FIXME: Server shouldn't return every error to clients. (e.g., I/O errors)
             // Perhaps even log them to console and stuff.
+            // NOTE: We could even have a server-side blob integrity check. Which means we probably
+            // store user's public signing key as a field in the server.
             let response = match Request::deserialize(&raw) {
                 Ok(request) => match request {
                     Request::SaveManifest { data } => match storage.save_manifest(data) {

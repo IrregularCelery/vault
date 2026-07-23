@@ -200,6 +200,7 @@ impl<S: io::Read + io::Write> Backend for Transport<S> {
 
         // `len` is stored as u32 (4 bytes)
         let total_len = u32::from_be_bytes(message[..4].try_into().unwrap()) as usize;
+        // TODO: `total_len` should probably be checked.
         let mut data = Vec::with_capacity(total_len);
 
         data.extend_from_slice(&message[4..len]);
