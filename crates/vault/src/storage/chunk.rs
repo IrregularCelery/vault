@@ -42,9 +42,6 @@ pub struct Chunk<'a> {
 }
 
 impl<'a> Chunk<'a> {
-    // TODO: Why not derive the `address` and the `key` hashes right as the instance is created,
-    // avoiding two data reads.
-
     /// Crates a new [`Chunk`] and wraps `data`.
     pub fn new(data: &'a [u8]) -> Self {
         Self { data }
