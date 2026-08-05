@@ -128,7 +128,7 @@ impl Response {
                 // Add `1` for bool value
                 writer = binary::Writer::with_capacity(1 + 1);
                 writer.write_u8(Self::TAG_EXISTS);
-                writer.write_u8(*payload as u8);
+                writer.write_bool(*payload);
             }
             Response::NotFound => {
                 // `1` for tag
