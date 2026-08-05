@@ -299,7 +299,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Removes the version at `index` from `path`'s history.
+    /// Removes the version at `version_index` from `path`'s history.
     ///
     /// Returns the blob addresses that are now unreferenced and safe to delete.
     /// Addresses still referenced by the active version or other files are excluded.
@@ -308,14 +308,18 @@ impl Manifest {
     ///
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If the version index doesn't exist.
-    pub fn drop_version(&mut self, path: &str, index: usize) -> Result<Vec<[u8; 32]>, Error> {
+    pub fn drop_version(
+        &mut self,
+        path: &str,
+        version_index: usize,
+    ) -> Result<Vec<[u8; 32]>, Error> {
         let entry = self.entries.get_mut(path).ok_or(Error::NotFound)?;
 
-        if index >= entry.versions.len() {
+        if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
         }
 
-        let dropped = entry.versions.remove(index);
+        let dropped = entry.versions.remove(version_index);
         let referenced = self.addresses();
 
         Ok(dropped
@@ -399,7 +403,8 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// - [`Error::Codec`]: If serialization process fails.
+    /// - [`Error::Codec`]: If serialization process fails. (e.g., when the path string size is
+    ///   larger than u16).
     pub fn serialize(&self) -> Result<Vec<u8>, Error> {
         // Estimated size for each entry, 2 chunks, no versions
         let mut writer = binary::Writer::with_capacity(self.entries.len() * 256);

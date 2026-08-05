@@ -301,18 +301,21 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::NotFound`]: If `path` is absent.
-    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
     /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn get_version(
         &self,
         path: &str,
-        index: usize,
+        version_index: usize,
         writer: &mut impl io::Write,
     ) -> Result<u64, Error> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
-        let version = entry.versions.get(index).ok_or(Error::VersionNotFound)?;
+        let version = entry
+            .versions
+            .get(version_index)
+            .ok_or(Error::VersionNotFound)?;
 
         self.decrypt_chunks(path, &version.chunks, writer)
     }
@@ -363,9 +366,9 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Storage`]: If an underlying storage error happens.
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
-    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
-    pub fn drop_version(&mut self, path: &str, index: usize) -> Result<(), Error> {
-        let dropped = self.manifest.drop_version(path, index)?;
+    /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
+    pub fn drop_version(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
+        let dropped = self.manifest.drop_version(path, version_index)?;
 
         // Persist the manifest before deleting the blobs. If a delete fails partway, or
         // the process dies right here, the worst case is an unreferenced blob, never a live entry
@@ -429,12 +432,12 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Storage`]: If an underlying storage error happens.
     /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
-    /// - [`Error::VersionNotFound`]: If version at `index` is absent.
+    /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     pub fn detach_version(
         &mut self,
         path: &str,
-        index: usize,
+        version_index: usize,
         new_path: &str,
     ) -> Result<(), Error> {
         if self.manifest.entries.contains_key(new_path) {
@@ -444,11 +447,11 @@ impl<S: storage::Backend> Vault<S> {
         // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
         let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
 
-        if index >= entry.versions.len() {
+        if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
         }
 
-        let detached = entry.versions.remove(index);
+        let detached = entry.versions.remove(version_index);
 
         self.manifest.insert(
             new_path,
@@ -1127,7 +1130,7 @@ mod tests {
         put_bytes(&mut vault, "file", b"original");
         put_bytes(&mut vault, "file", b"overwritten");
 
-        // Revert to index 0 ("original")
+        // Revert to version index 0 ("original")
         vault.revert("file", 0).unwrap();
 
         assert_eq!(get_bytes(&vault, "file"), b"original");
