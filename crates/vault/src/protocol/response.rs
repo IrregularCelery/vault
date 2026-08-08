@@ -1,6 +1,6 @@
 //! Server-to-client responses.
 
-use crate::protocol::Error;
+use crate::{protocol::Error, storage::Key};
 
 use gate::{
     codec::binary,
@@ -17,45 +17,36 @@ pub enum Response {
     ///
     /// # Requests
     ///
-    /// - [`super::request::Request::SaveManifest`]
-    /// - [`super::request::Request::PutBlob`]
-    /// - [`super::request::Request::DeleteBlob`]
+    /// - [`super::request::Request::Put`]
+    /// - [`super::request::Request::Delete`]
     Ok,
 
-    /// The requested manifest blob. Contains the raw encrypted bytes.
+    /// The list of all keys matching the requested [`super::request::Request::List`] kind.
     ///
     /// # Requests
     ///
-    /// - [`super::request::Request::LoadManifest`]
-    Manifest(Vec<u8>),
+    /// - [`super::request::Request::List`]
+    Keys(Vec<Key>),
 
-    /// The list of all blob addresses.
+    /// The requested item's raw bytes.
     ///
     /// # Requests
     ///
-    /// - [`super::request::Request::ListBlobs`]
-    Addresses(Vec<[u8; 32]>),
+    /// - [`super::request::Request::Get`]
+    Data(Vec<u8>),
 
-    /// The requested blob's raw encrypted bytes.
+    /// Whether the queried key exists.
     ///
     /// # Requests
     ///
-    /// - [`super::request::Request::GetBlob`]
-    Blob(Vec<u8>),
-
-    /// Whether the queried blob exists.
-    ///
-    /// # Requests
-    ///
-    /// - [`super::request::Request::ExistsBlob`]
+    /// - [`super::request::Request::Exists`]
     Exists(bool),
 
-    /// The requested path was not found.
+    /// The requested key was not found.
     ///
     /// # Requests
     ///
-    /// - [`super::request::Request::LoadManifest`]
-    /// - [`super::request::Request::GetBlob`]
+    /// - [`super::request::Request::Get`]
     NotFound,
 
     /// A server-side error occurred.
@@ -69,18 +60,16 @@ pub enum Response {
 impl Response {
     /// Discriminant tag for [`Response::Ok`].
     const TAG_OK: u8 = 0;
-    /// Discriminant tag for [`Response::Manifest`].
-    const TAG_MANIFEST: u8 = 1;
-    /// Discriminant tag for [`Response::Addresses`].
-    const TAG_ADDRESSES: u8 = 2;
-    /// Discriminant tag for [`Response::Blob`].
-    const TAG_BLOB: u8 = 3;
+    /// Discriminant tag for [`Response::Keys`].
+    const TAG_KEYS: u8 = 1;
+    /// Discriminant tag for [`Response::Data`].
+    const TAG_DATA: u8 = 2;
     /// Discriminant tag for [`Response::Exists`].
-    const TAG_EXISTS: u8 = 4;
+    const TAG_EXISTS: u8 = 3;
     /// Discriminant tag for [`Response::NotFound`].
-    const TAG_NOT_FOUND: u8 = 5;
+    const TAG_NOT_FOUND: u8 = 4;
     /// Discriminant tag for [`Response::Error`].
-    const TAG_ERROR: u8 = 6;
+    const TAG_ERROR: u8 = 5;
 
     /// Serializes the response into a binary format.
     ///
@@ -97,30 +86,24 @@ impl Response {
                 writer = binary::Writer::with_capacity(1);
                 writer.write_u8(Self::TAG_OK);
             }
-            Response::Manifest(payload) => {
+            Response::Keys(payload) => {
                 // Add `1` for tag
                 // Add `4` for data length prefix (u32)
-                writer = binary::Writer::with_capacity(1 + 4 + payload.len());
-                writer.write_u8(Self::TAG_MANIFEST);
-                writer.write_blob(payload)?;
-            }
-            Response::Addresses(payload) => {
-                // Add `1` for tag
-                // Add `4` for data length prefix (u32)
-                // Multiply `32` since addresses are 32 bytes each
-                writer = binary::Writer::with_capacity(1 + 4 + payload.len() * 32);
-                writer.write_u8(Self::TAG_ADDRESSES);
+                // Multiply by `33` as an estimate since keys are at most 32 bytes each + 1
+                // for their discriminant
+                writer = binary::Writer::with_capacity(1 + 4 + payload.len() * 33);
+                writer.write_u8(Self::TAG_KEYS);
                 writer.write_u32(payload.len() as u32);
 
-                for address in payload.iter() {
-                    writer.write_bytes(address);
+                for key in payload.iter() {
+                    key.write_to(&mut writer);
                 }
             }
-            Response::Blob(payload) => {
+            Response::Data(payload) => {
                 // Add `1` for tag
                 // Add `4` for data length prefix (u32)
                 writer = binary::Writer::with_capacity(1 + 4 + payload.len());
-                writer.write_u8(Self::TAG_BLOB);
+                writer.write_u8(Self::TAG_DATA);
                 writer.write_blob(payload)?;
             }
             Response::Exists(payload) => {
@@ -163,27 +146,22 @@ impl Response {
 
         Ok(match tag {
             Self::TAG_OK => Self::Ok,
-            Self::TAG_MANIFEST => {
-                let manifest = reader.read_blob()?;
-
-                Self::Manifest(manifest.to_vec())
-            }
-            Self::TAG_ADDRESSES => {
+            Self::TAG_KEYS => {
                 let count = reader.read_u32()? as usize;
-                let mut addresses = Vec::with_capacity(count);
+                let mut keys = Vec::with_capacity(count);
 
                 for _ in 0..count {
-                    let address: [u8; 32] = *reader.read_bytes()?;
+                    let key = Key::read_from(&mut reader)?;
 
-                    addresses.push(address);
+                    keys.push(key);
                 }
 
-                Self::Addresses(addresses)
+                Self::Keys(keys)
             }
-            Self::TAG_BLOB => {
+            Self::TAG_DATA => {
                 let blob = reader.read_blob()?;
 
-                Self::Blob(blob.to_vec())
+                Self::Data(blob.to_vec())
             }
             Self::TAG_EXISTS => {
                 let exists = reader.read_bool()?;
@@ -211,9 +189,9 @@ mod tests {
     fn response_variants_roundtrip() {
         let responses = vec![
             Response::Ok,
-            Response::Manifest(vec![1, 2]),
-            Response::Addresses(vec![[1u8; 32], [2u8; 32]]),
-            Response::Blob(vec![3, 4]),
+            Response::Keys(vec![Key::Blob([1u8; 32]), Key::Blob([2u8; 32])]),
+            Response::Keys(vec![Key::Manifest]),
+            Response::Data(vec![3, 4]),
             Response::Exists(true),
             Response::Exists(false),
             Response::NotFound,

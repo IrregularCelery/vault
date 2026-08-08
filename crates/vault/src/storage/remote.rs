@@ -6,7 +6,7 @@ use gate::sys::{macros::format, vec::Vec};
 
 use crate::{
     protocol::{request::Request, response::Response},
-    storage::{Backend, Error},
+    storage::{Backend, Error, Key, Kind},
     transport,
 };
 
@@ -43,68 +43,45 @@ impl<T: transport::Backend> Storage<T> {
 }
 
 impl<T: transport::Backend> Backend for Storage<T> {
-    fn save_manifest(&self, data: &[u8]) -> Result<(), Error> {
-        match self.roundtrip(Request::SaveManifest { data })? {
+    fn put(&self, key: Key, data: &[u8]) -> Result<(), Error> {
+        match self.roundtrip(Request::Put { key, data })? {
             Response::Ok => Ok(()),
-            Response::Error(_) => Err(Error::Other("server error for `save_manifest`".into())),
-            _ => Err(Error::Other(
-                "unexpected response to `save_manifest`".into(),
-            )),
+            Response::Error(_) => Err(Error::Other("server error for `put`".into())),
+            _ => Err(Error::Other("unexpected response to `put`".into())),
         }
     }
 
-    fn load_manifest(&self) -> Result<Vec<u8>, Error> {
-        match self.roundtrip(Request::LoadManifest)? {
-            Response::Manifest(data) => Ok(data),
+    fn get(&self, key: Key) -> Result<Vec<u8>, Error> {
+        match self.roundtrip(Request::Get { key })? {
+            Response::Data(data) => Ok(data),
             Response::NotFound => Err(Error::NotFound),
-            Response::Error(_) => Err(Error::Other("server error for `load_manifest`".into())),
-            _ => Err(Error::Other(
-                "unexpected response to `load_manifest`".into(),
-            )),
+            Response::Error(_) => Err(Error::Other("server error for `get`".into())),
+            _ => Err(Error::Other("unexpected response to `get`".into())),
         }
     }
 
-    fn put_blob(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error> {
-        match self.roundtrip(Request::PutBlob {
-            address: *address,
-            data,
-        })? {
-            Response::Ok => Ok(()),
-            Response::Error(_) => Err(Error::Other("server error for `put_blob`".into())),
-            _ => Err(Error::Other("unexpected response to `put_blob`".into())),
-        }
-    }
-
-    fn get_blob(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error> {
-        match self.roundtrip(Request::GetBlob { address: *address })? {
-            Response::Blob(data) => Ok(data),
-            Response::Error(_) => Err(Error::Other("server error for `get_blob`".into())),
-            _ => Err(Error::Other("unexpected response to `get_blob`".into())),
-        }
-    }
-
-    fn exists_blob(&self, address: &[u8; 32]) -> Result<bool, Error> {
-        match self.roundtrip(Request::ExistsBlob { address: *address })? {
+    fn exists(&self, key: Key) -> Result<bool, Error> {
+        match self.roundtrip(Request::Exists { key })? {
             Response::Exists(exists) => Ok(exists),
-            Response::Error(_) => Err(Error::Other("server error for `exists_blob`".into())),
-            _ => Err(Error::Other("unexpected response to `exists_blob`".into())),
+            Response::Error(_) => Err(Error::Other("server error for `exists`".into())),
+            _ => Err(Error::Other("unexpected response to `exists`".into())),
         }
     }
 
-    fn delete_blob(&self, address: &[u8; 32]) -> Result<(), Error> {
-        match self.roundtrip(Request::DeleteBlob { address: *address })? {
+    fn delete(&self, key: Key) -> Result<(), Error> {
+        match self.roundtrip(Request::Delete { key })? {
             // Response::NotFound is actually redundant since the server never returns it
             Response::Ok | Response::NotFound => Ok(()),
-            Response::Error(_) => Err(Error::Other("server error for `delete_blob`".into())),
-            _ => Err(Error::Other("unexpected response to `delete_blob`".into())),
+            Response::Error(_) => Err(Error::Other("server error for `delete`".into())),
+            _ => Err(Error::Other("unexpected response to `delete`".into())),
         }
     }
 
-    fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error> {
-        match self.roundtrip(Request::ListBlobs)? {
-            Response::Addresses(addresses) => Ok(addresses),
-            Response::Error(_) => Err(Error::Other("server error for `list_blobs`".into())),
-            _ => Err(Error::Other("unexpected response to `list_blobs`".into())),
+    fn list(&self, kind: Kind) -> Result<Vec<Key>, Error> {
+        match self.roundtrip(Request::List { kind })? {
+            Response::Keys(keys) => Ok(keys),
+            Response::Error(_) => Err(Error::Other("server error for `list`".into())),
+            _ => Err(Error::Other("unexpected response to `list`".into())),
         }
     }
 }

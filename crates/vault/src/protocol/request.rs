@@ -1,5 +1,7 @@
 //! Client-to-server requests.
 
+use crate::storage::{Key, Kind};
+
 use super::Error;
 
 use gate::{codec::binary, sys::vec::Vec};
@@ -7,98 +9,77 @@ use gate::{codec::binary, sys::vec::Vec};
 /// A storage operation request from the client to the server.
 #[derive(Debug, PartialEq)]
 pub enum Request<'a> {
-    /// Overwrite the manifest blob with `data`.
+    /// Stores `data` at `key`.
     ///
     /// # Responses
     ///
     /// - [`super::response::Response::Ok`]
     /// - [`super::response::Response::Error`]
-    SaveManifest {
-        /// The serialized, encrypted manifest bytes to persist.
+    Put {
+        /// The key identifying the item to store.
+        key: Key,
+
+        /// The bytes to store.
         data: &'a [u8],
     },
 
-    /// Retrieve the manifest blob.
+    /// Retrieves the raw bytes stored at `key`.
     ///
     /// # Responses
     ///
-    /// - [`super::response::Response::Manifest`]
+    /// - [`super::response::Response::Data`]
     /// - [`super::response::Response::NotFound`]
     /// - [`super::response::Response::Error`]
-    LoadManifest,
-
-    /// Store `data` at the content-addressed `address`. No-op if already exists.
-    ///
-    /// # Responses
-    ///
-    /// - [`super::response::Response::Ok`]
-    /// - [`super::response::Response::Error`]
-    PutBlob {
-        /// The 32-byte content address of the blob.
-        address: [u8; 32],
-
-        /// The encrypted blob bytes to store.
-        data: &'a [u8],
+    Get {
+        /// The key identifying the item to retrieve.
+        key: Key,
     },
 
-    /// Retrieve the encrypted blob at `address`.
-    ///
-    /// # Responses
-    ///
-    /// - [`super::response::Response::Blob`]
-    /// - [`super::response::Response::NotFound`]
-    /// - [`super::response::Response::Error`]
-    GetBlob {
-        /// The 32-byte content address of the blob.
-        address: [u8; 32],
-    },
-
-    /// Check whether a blob exists at `address` without reading its contents.
+    /// Checks whether an item exists at `key` without reading its contents.
     ///
     /// # Responses
     ///
     /// - [`super::response::Response::Exists`]
     /// - [`super::response::Response::Error`]
-    ExistsBlob {
-        /// The 32-byte content address of the blob.
-        address: [u8; 32],
+    Exists {
+        /// The key identifying the item to check.
+        key: Key,
     },
 
-    /// Delete the blob at `address`. Idempotent, no error if absent.
+    /// Deletes the item at `key`.
     ///
     /// # Responses
     ///
     /// - [`super::response::Response::Ok`]
     /// - [`super::response::Response::Error`]
-    DeleteBlob {
-        /// The 32-byte content address of the blob.
-        address: [u8; 32],
+    Delete {
+        /// The key identifying the item to delete.
+        key: Key,
     },
 
-    /// List all blob addresses.
+    /// List all keys in a `kind` category.
     ///
     /// # Responses
     ///
-    /// - [`super::response::Response::Addresses`]
+    /// - [`super::response::Response::Keys`]
     /// - [`super::response::Response::Error`]
-    ListBlobs,
+    List {
+        /// The category of keys to list.
+        kind: Kind,
+    },
 }
 
 impl<'a> Request<'a> {
-    /// Discriminant tag for [`Request::SaveManifest`].
-    const TAG_SAVE_MANIFEST: u8 = 0;
-    /// Discriminant tag for [`Request::LoadManifest`].
-    const TAG_LOAD_MANIFEST: u8 = 1;
-    /// Discriminant tag for [`Request::PutBlob`].
-    const TAG_PUT_BLOB: u8 = 2;
-    /// Discriminant tag for [`Request::GetBlob`].
-    const TAG_GET_BLOB: u8 = 3;
-    /// Discriminant tag for [`Request::ExistsBlob`].
-    const TAG_EXISTS_BLOB: u8 = 4;
-    /// Discriminant tag for [`Request::DeleteBlob`].
-    const TAG_DELETE_BLOB: u8 = 5;
-    /// Discriminant tag for [`Request::ListBlobs`].
-    const TAG_LIST_BLOB: u8 = 6;
+    /// Discriminant tag for [`Request::Put`].
+    const TAG_PUT: u8 = 0;
+    /// Discriminant tag for [`Request::Get`].
+    const TAG_GET: u8 = 1;
+    /// Discriminant tag for [`Request::Exists`].
+    const TAG_EXISTS: u8 = 2;
+    /// Discriminant tag for [`Request::Delete`].
+    const TAG_DELETE: u8 = 3;
+    /// Discriminant tag for [`Request::List`].
+    const TAG_LIST: u8 = 4;
 
     /// Serializes the request into a binary format.
     ///
@@ -110,52 +91,38 @@ impl<'a> Request<'a> {
         let mut writer;
 
         match self {
-            Request::SaveManifest { data } => {
+            Request::Put { key, data } => {
                 // Add `1` for tag
                 // Add `4` for data length prefix (u32)
-                writer = binary::Writer::with_capacity(1 + 4 + data.len());
-                writer.write_u8(Self::TAG_SAVE_MANIFEST);
+                writer = binary::Writer::with_capacity(1 + key.size() + 4 + data.len());
+                writer.write_u8(Self::TAG_PUT);
+                key.write_to(&mut writer);
                 writer.write_blob(data)?;
             }
-            Request::LoadManifest => {
-                // `1` for tag
-                writer = binary::Writer::with_capacity(1);
-                writer.write_u8(Self::TAG_LOAD_MANIFEST);
-            }
-            Request::PutBlob { address, data } => {
+            Request::Get { key } => {
                 // Add `1` for tag
-                // Add `32` for address
-                // Add `4` for data length prefix (u32)
-                writer = binary::Writer::with_capacity(1 + 32 + 4 + data.len());
-                writer.write_u8(Self::TAG_PUT_BLOB);
-                writer.write_bytes(address);
-                writer.write_blob(data)?;
+                writer = binary::Writer::with_capacity(1 + key.size());
+                writer.write_u8(Self::TAG_GET);
+                key.write_to(&mut writer);
             }
-            Request::GetBlob { address } => {
+            Request::Exists { key } => {
                 // Add `1` for tag
-                // Add `32` for address
-                writer = binary::Writer::with_capacity(1 + 32);
-                writer.write_u8(Self::TAG_GET_BLOB);
-                writer.write_bytes(address);
+                writer = binary::Writer::with_capacity(1 + key.size());
+                writer.write_u8(Self::TAG_EXISTS);
+                key.write_to(&mut writer);
             }
-            Request::ExistsBlob { address } => {
+            Request::Delete { key } => {
                 // Add `1` for tag
-                // Add `32` for address
-                writer = binary::Writer::with_capacity(1 + 32);
-                writer.write_u8(Self::TAG_EXISTS_BLOB);
-                writer.write_bytes(address);
+                writer = binary::Writer::with_capacity(1 + key.size());
+                writer.write_u8(Self::TAG_DELETE);
+                key.write_to(&mut writer);
             }
-            Request::DeleteBlob { address } => {
+            Request::List { kind } => {
                 // Add `1` for tag
-                // Add `32` for address
-                writer = binary::Writer::with_capacity(1 + 32);
-                writer.write_u8(Self::TAG_DELETE_BLOB);
-                writer.write_bytes(address);
-            }
-            Request::ListBlobs => {
-                // `1` for tag
-                writer = binary::Writer::with_capacity(1);
-                writer.write_u8(Self::TAG_LIST_BLOB);
+                // Add `1` for kind
+                writer = binary::Writer::with_capacity(1 + 1);
+                writer.write_u8(Self::TAG_LIST);
+                kind.write_to(&mut writer);
             }
         }
 
@@ -177,24 +144,22 @@ impl<'a> Request<'a> {
         let tag = reader.read_u8()?;
 
         Ok(match tag {
-            Self::TAG_SAVE_MANIFEST => Self::SaveManifest {
+            Self::TAG_PUT => Self::Put {
+                key: Key::read_from(&mut reader)?,
                 data: reader.read_blob()?,
             },
-            Self::TAG_LOAD_MANIFEST => Self::LoadManifest {},
-            Self::TAG_PUT_BLOB => Self::PutBlob {
-                address: *reader.read_bytes()?,
-                data: reader.read_blob()?,
+            Self::TAG_GET => Self::Get {
+                key: Key::read_from(&mut reader)?,
             },
-            Self::TAG_GET_BLOB => Self::GetBlob {
-                address: *reader.read_bytes()?,
+            Self::TAG_EXISTS => Self::Exists {
+                key: Key::read_from(&mut reader)?,
             },
-            Self::TAG_EXISTS_BLOB => Self::ExistsBlob {
-                address: *reader.read_bytes()?,
+            Self::TAG_DELETE => Self::Delete {
+                key: Key::read_from(&mut reader)?,
             },
-            Self::TAG_DELETE_BLOB => Self::DeleteBlob {
-                address: *reader.read_bytes()?,
+            Self::TAG_LIST => Self::List {
+                kind: Kind::read_from(&mut reader)?,
             },
-            Self::TAG_LIST_BLOB => Self::ListBlobs {},
             other => return Err(Error::UnknownTag(other)),
         })
     }
@@ -209,16 +174,27 @@ mod tests {
     #[test]
     fn request_variants_roundtrip() {
         let requests = vec![
-            Request::SaveManifest { data: &[1, 2, 3] },
-            Request::LoadManifest,
-            Request::PutBlob {
-                address: [9u8; 32],
+            Request::Put {
+                key: Key::Blob([9u8; 32]),
                 data: &[4, 5],
             },
-            Request::GetBlob { address: [1u8; 32] },
-            Request::ExistsBlob { address: [2u8; 32] },
-            Request::DeleteBlob { address: [3u8; 32] },
-            Request::ListBlobs,
+            Request::Get {
+                key: Key::Blob([1u8; 32]),
+            },
+            Request::Exists {
+                key: Key::Blob([2u8; 32]),
+            },
+            Request::Delete {
+                key: Key::Blob([3u8; 32]),
+            },
+            Request::List { kind: Kind::Blobs },
+            Request::Put {
+                key: Key::Manifest,
+                data: &[4, 5],
+            },
+            Request::Get { key: Key::Manifest },
+            Request::Exists { key: Key::Manifest },
+            Request::Delete { key: Key::Manifest },
         ];
 
         for request in requests {

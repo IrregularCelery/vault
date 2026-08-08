@@ -109,34 +109,25 @@ impl Server {
             // store user's public signing key as a field in the server.
             let response = match Request::deserialize(&raw) {
                 Ok(request) => match request {
-                    Request::SaveManifest { data } => match storage.save_manifest(data) {
+                    Request::Put { key, data } => match storage.put(key, data) {
                         Ok(()) => Response::Ok,
                         Err(e) => Response::Error(e.to_string()),
                     },
-                    Request::LoadManifest => match storage.load_manifest() {
-                        Ok(data) => Response::Manifest(data),
+                    Request::Get { key } => match storage.get(key) {
+                        Ok(data) => Response::Data(data),
                         Err(storage::Error::NotFound) => Response::NotFound,
                         Err(e) => Response::Error(e.to_string()),
                     },
-                    Request::PutBlob { address, data } => match storage.put_blob(&address, data) {
-                        Ok(()) => Response::Ok,
-                        Err(e) => Response::Error(e.to_string()),
-                    },
-                    Request::GetBlob { address } => match storage.get_blob(&address) {
-                        Ok(data) => Response::Blob(data),
-                        Err(storage::Error::NotFound) => Response::NotFound,
-                        Err(e) => Response::Error(e.to_string()),
-                    },
-                    Request::ExistsBlob { address } => match storage.exists_blob(&address) {
+                    Request::Exists { key } => match storage.exists(key) {
                         Ok(exists) => Response::Exists(exists),
                         Err(e) => Response::Error(e.to_string()),
                     },
-                    Request::DeleteBlob { address } => match storage.delete_blob(&address) {
+                    Request::Delete { key } => match storage.delete(key) {
                         Ok(()) => Response::Ok,
                         Err(e) => Response::Error(e.to_string()),
                     },
-                    Request::ListBlobs => match storage.list_blobs() {
-                        Ok(addresses) => Response::Addresses(addresses),
+                    Request::List { kind } => match storage.list(kind) {
+                        Ok(keys) => Response::Keys(keys),
                         Err(e) => Response::Error(e.to_string()),
                     },
                 },

@@ -11,7 +11,7 @@ use crate::{
     crypto::cipher,
     identity::Identity,
     storage::{
-        self,
+        self, Key,
         chunk::{self, Chunks},
         manifest::{self, Manifest, Properties, VersionProperties},
     },
@@ -145,7 +145,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Manifest`]: If the underlying manifest decryption or deserialization fails.
     /// - [`Error::Tampered`]: If the manifest signature is invalid.
     pub fn open(identity: Identity, storage: S) -> Result<Self, Error> {
-        let manifest = match storage.load_manifest() {
+        let manifest = match storage.get(Key::Manifest) {
             Ok(manifest) => Manifest::unlock(
                 &manifest,
                 &identity.encryption_key(),
@@ -193,11 +193,11 @@ impl<S: storage::Backend> Vault<S> {
 
             // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
             // though not entirely useless since we can avoid calling an unnecessary `cipher::lock()`
-            if !self.storage.exists_blob(&address)? {
+            if !self.storage.exists(Key::Blob(address))? {
                 let encrypted =
                     cipher::lock(&key, chunk.data, |message| self.identity.sign(message))?;
 
-                self.storage.put_blob(&address, &encrypted)?;
+                self.storage.put(Key::Blob(address), &encrypted)?;
             }
 
             entry_chunks.push(manifest::EntryChunk {
@@ -376,7 +376,7 @@ impl<S: storage::Backend> Vault<S> {
         self.flush_manifest()?;
 
         for address in dropped {
-            self.storage.delete_blob(&address)?;
+            self.storage.delete(Key::Blob(address))?;
         }
 
         Ok(())
@@ -415,8 +415,8 @@ impl<S: storage::Backend> Vault<S> {
 
         self.flush_manifest()?;
 
-        for address in &addresses {
-            self.storage.delete_blob(address)?;
+        for address in addresses {
+            self.storage.delete(Key::Blob(address))?;
         }
 
         Ok(())
@@ -581,8 +581,8 @@ impl<S: storage::Backend> Vault<S> {
 
         self.flush_manifest()?;
 
-        for address in &addresses {
-            self.storage.delete_blob(address)?;
+        for address in addresses {
+            self.storage.delete(Key::Blob(address))?;
         }
 
         Ok(())
@@ -600,8 +600,8 @@ impl<S: storage::Backend> Vault<S> {
 
         self.flush_manifest()?;
 
-        for address in &addresses {
-            self.storage.delete_blob(address)?;
+        for address in addresses {
+            self.storage.delete(Key::Blob(address))?;
         }
 
         Ok(removed)
@@ -701,7 +701,7 @@ impl<S: storage::Backend> Vault<S> {
         let mut tampered = Vec::new();
 
         // Check the manifest blob itself
-        if let Ok(blob) = self.storage.load_manifest()
+        if let Ok(blob) = self.storage.get(Key::Manifest)
             && Manifest::unlock(
                 &blob,
                 &self.identity.encryption_key(),
@@ -758,7 +758,7 @@ impl<S: storage::Backend> Vault<S> {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Other("wrong size chunk encryption key was found".into()))?;
-            let blob = self.storage.get_blob(&chunk.address)?;
+            let blob = self.storage.get(Key::Blob(chunk.address))?;
             let plaintext = cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
@@ -789,7 +789,7 @@ impl<S: storage::Backend> Vault<S> {
         chunks: &[manifest::EntryChunk],
     ) -> Result<(), Error> {
         for chunk in chunks {
-            let blob = self.storage.get_blob(&chunk.address)?;
+            let blob = self.storage.get(Key::Blob(chunk.address))?;
 
             cipher::verify_signature(&blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
@@ -816,7 +816,7 @@ impl<S: storage::Backend> Vault<S> {
                 self.identity.sign(message)
             })?;
 
-        self.storage.save_manifest(&data)?;
+        self.storage.put(Key::Manifest, &data)?;
 
         Ok(())
     }
@@ -826,7 +826,7 @@ impl<S: storage::Backend> Vault<S> {
 mod tests {
     use super::*;
 
-    use crate::storage::{Backend, chunk::CHUNK_SIZE, local};
+    use crate::storage::{Backend, Kind, chunk::CHUNK_SIZE, local};
 
     use gate::{
         crypto::bip39,
@@ -922,7 +922,7 @@ mod tests {
 
         put_bytes(&mut vault, "large", &data);
 
-        let blobs = vault.storage.list_blobs().unwrap().len();
+        let blobs = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs, 3); // 3 data blobs
         assert_eq!(get_bytes(&vault, "large"), data);
@@ -947,11 +947,11 @@ mod tests {
 
         put_bytes(&mut vault, "file1", &data1);
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         put_bytes(&mut vault, "file2", &data2);
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs_after_second, blobs_after_first + 1); // Only one new chunk
         assert_eq!(get_bytes(&vault, "file1"), data1);
@@ -970,7 +970,7 @@ mod tests {
 
         put_bytes(&mut vault, "large", &data);
 
-        let blobs = vault.storage.list_blobs().unwrap().len();
+        let blobs = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs, 2); // The file has 3 blobs but 2 are identical
         assert_eq!(get_bytes(&vault, "large"), data);
@@ -1081,11 +1081,11 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"version one");
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         put_bytes(&mut vault, "file", b"version two");
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // A new chunk was added, nothing was removed
         assert!(blobs_after_second > blobs_after_first);
@@ -1098,11 +1098,11 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Identical content, no new chunk written
         assert_eq!(blobs_after_first, blobs_after_second);
@@ -1179,11 +1179,11 @@ mod tests {
         put_bytes(&mut vault, "file", b"old content");
         put_bytes(&mut vault, "file", b"new content");
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.drop_version("file", 0).unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // One chunk purged (the "old content" chunk)
         assert!(blobs_after < blobs_before);
@@ -1204,11 +1204,11 @@ mod tests {
         // Overwrite to create version
         put_bytes(&mut vault, "file", &vec![0xBBu8; CHUNK_SIZE]);
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.drop_version("file", 0).unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // A Chunk is shared with the active version, must not be deleted
         // Only one chunk is purged (the unshared one)
@@ -1230,11 +1230,11 @@ mod tests {
         // Overwrite file1 to create version
         put_bytes(&mut vault, "file1", &vec![0xCCu8; CHUNK_SIZE]);
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.drop_version("file1", 0).unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Chunk is shared with the active version, must not be deleted
         assert_eq!(blobs_before, blobs_after);
@@ -1287,11 +1287,11 @@ mod tests {
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.drop_version_current("file").unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // v2 chunk was purged
         assert!(blobs_after < blobs_before);
@@ -1370,12 +1370,12 @@ mod tests {
         put_bytes(&mut vault, "file", b"shared data");
         put_bytes(&mut vault, "file", b"other data");
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Detach just references existing chunks, no new blobs written
         vault.detach_version("file", 0, "detached").unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs_before, blobs_after);
     }
@@ -1482,7 +1482,7 @@ mod tests {
         vault.trash("file.txt").unwrap();
 
         assert!(vault.list().is_empty());
-        assert!(!vault.storage.list_blobs().unwrap().is_empty());
+        assert!(!vault.storage.list(Kind::Blobs).unwrap().is_empty());
         assert_eq!(vault.list_trash(), vec!["file.txt"]);
     }
 
@@ -1508,12 +1508,12 @@ mod tests {
 
         vault.trash("2.txt").unwrap();
 
-        let blobs_before_purge = vault.storage.list_blobs().unwrap().len();
+        let blobs_before_purge = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.purge("2.txt").unwrap();
 
         assert!(vault.list_trash().is_empty());
-        assert!(vault.storage.list_blobs().unwrap().len() < blobs_before_purge);
+        assert!(vault.storage.list(Kind::Blobs).unwrap().len() < blobs_before_purge);
         assert_eq!(get_bytes(&vault, "1.txt"), b"keep this");
     }
 
@@ -1543,11 +1543,11 @@ mod tests {
 
         vault.trash("file2").unwrap();
 
-        let blobs_before = vault.storage.list_blobs().unwrap().len();
+        let blobs_before = vault.storage.list(Kind::Blobs).unwrap().len();
 
         vault.purge("file2").unwrap();
 
-        let blobs_after = vault.storage.list_blobs().unwrap().len();
+        let blobs_after = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Both v1 and v2 chunks of file2 should be purged
         assert_eq!(blobs_before, blobs_after + 2);
@@ -1583,7 +1583,7 @@ mod tests {
 
         vault.cleanup().unwrap();
 
-        assert_eq!(vault.storage.list_blobs().unwrap().len(), 0);
+        assert_eq!(vault.storage.list(Kind::Blobs).unwrap().len(), 0);
         assert!(vault.list().is_empty());
     }
 
@@ -1627,7 +1627,7 @@ mod tests {
 
         put_bytes(&mut vault, "file", &original);
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Since `chunk_a` is identical, it should not be re-uploaded
         let chunk_b2 = vec![0xCCu8; CHUNK_SIZE];
@@ -1635,7 +1635,7 @@ mod tests {
 
         put_bytes(&mut vault, "file", &updated);
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // `chunk_a` already exists, therefore it's skipped and we'd only have 1 new blob
         assert_eq!(blobs_after_second, blobs_after_first + 1);
@@ -1711,7 +1711,7 @@ mod tests {
 
         let entry = vault.manifest.entries.get("file").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = vault.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1735,7 +1735,7 @@ mod tests {
 
         let entry = vault.manifest.entries.get("secret.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = vault.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1763,7 +1763,7 @@ mod tests {
         // Corrupt the trashed chunk
         let entry = vault.manifest.entries.get("trashed.txt").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = vault.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1791,7 +1791,7 @@ mod tests {
         let chunks = &entry.chunks;
 
         for chunk in chunks {
-            let mut blob = vault.storage.get_blob(&chunk.address).unwrap();
+            let mut blob = vault.storage.get(Key::Blob(chunk.address)).unwrap();
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1818,7 +1818,7 @@ mod tests {
 
         let entry = vault.manifest.entries.get("file1").unwrap();
         let address = entry.chunks[0].address;
-        let mut blob = vault.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1846,7 +1846,7 @@ mod tests {
         // Corrupt the v1 (previous version) chunk
         let entry = vault.manifest.entries.get("file").unwrap();
         let address = entry.versions[0].chunks[0].address; // Version 1
-        let mut blob = vault.storage.get_blob(&address).unwrap();
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
@@ -1889,12 +1889,12 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // Basically a no-op
         put_bytes(&mut vault, "file", b"same content");
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&vault, "file"), b"same content");
@@ -1906,11 +1906,11 @@ mod tests {
 
         put_bytes(&mut vault, "file1", b"same content");
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         put_bytes(&mut vault, "file2", b"same content");
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs_after_first, blobs_after_second);
         assert_eq!(get_bytes(&vault, "file1"), get_bytes(&vault, "file2"));
@@ -1922,11 +1922,11 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"content");
 
-        let blobs_after_first = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_first = vault.storage.list(Kind::Blobs).unwrap().len();
 
         put_bytes(&mut vault, "file", b"different content");
 
-        let blobs_after_second = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_second = vault.storage.list(Kind::Blobs).unwrap().len();
 
         // No unreferenced chunks, the old chunks are in a separate version
         assert!(blobs_after_second > blobs_after_first);
@@ -1934,7 +1934,7 @@ mod tests {
 
         vault.drop_version("file", 0).unwrap();
 
-        let blobs_after_version_drop = vault.storage.list_blobs().unwrap().len();
+        let blobs_after_version_drop = vault.storage.list(Kind::Blobs).unwrap().len();
 
         assert_eq!(blobs_after_version_drop, blobs_after_first);
     }

@@ -2,8 +2,8 @@
 //!
 //! Storage layout is as follows:
 //!
-//!   [root]/<u0:2>/<u2:4>/<u4:64>/manifest
-//!          |-------------------|    ^- encrypted manifest file
+//!   [root]/<u0:2>/<u2:4>/<u4:64>/manifests/file
+//!          |-------------------|            ^- encrypted manifest file
 //!                   ^- user address
 //!
 //!   [root]/<u0:2>/<u2:4>/<u4:64>/blobs/<b0:2>/<b2:4>/<b4:64>
@@ -16,12 +16,12 @@
 //!
 //! Blob writes are atomic
 
-use crate::storage::{Backend, Error, hashpath::HashPath, manifest::Manifest};
+use crate::storage::{Backend, Error, Key, Kind, hashpath::HashPath, manifest::Manifest};
 
 use gate::sys::{fs, io, path::PathBuf, vec::Vec};
 
 /// Filename used for the encrypted manifest blob within a user's storage directory.
-const MANIFEST_FILENAME: &str = "manifest";
+const MANIFEST_DIRNAME: &str = "manifest";
 /// Name of the subdirectory inside each user's directory that contains content-addressed blobs.
 const BLOBS_DIRNAME: &str = "blobs";
 
@@ -44,88 +44,27 @@ impl Storage {
             .into()
             .join(PathBuf::from(HashPath::new(&user_address)));
 
-        fs::create_dir_all(&root)?;
-        fs::create_dir_all(root.join(BLOBS_DIRNAME))?;
-
         Ok(Self { root })
     }
 
-    /// Returns the absolute path to this user's manifest file.
-    fn manifest_path(&self) -> PathBuf {
-        self.root.join(MANIFEST_FILENAME)
-    }
-
-    /// Returns the absolute path for a blob file at its 32-byte content address.
-    fn blob_path(&self, address: &[u8; 32]) -> PathBuf {
-        self.root
-            .join(BLOBS_DIRNAME)
-            .join(PathBuf::from(HashPath::new(address)))
-    }
-}
-
-impl Backend for Storage {
-    fn save_manifest(&self, data: &[u8]) -> Result<(), Error> {
-        let path = self.manifest_path();
-        let temp = path.with_extension("tmp");
-
-        // Atomic write
-        fs::write(&temp, data)?;
-        fs::rename(&temp, &path)?;
-
-        Ok(())
-    }
-
-    fn load_manifest(&self) -> Result<Vec<u8>, Error> {
-        let path = self.manifest_path();
-
-        Ok(fs::read(&path)?)
-    }
-
-    fn put_blob(&self, address: &[u8; 32], data: &[u8]) -> Result<(), Error> {
-        let path = self.blob_path(address);
-
-        if path.exists() {
-            return Ok(()); // No-op in content-addressed, file already exists
-        }
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp = path.with_extension("tmp");
-
-        // Atomic write
-        fs::write(&temp, data)?;
-        fs::rename(&temp, path)?;
-
-        Ok(())
-    }
-
-    fn get_blob(&self, address: &[u8; 32]) -> Result<Vec<u8>, Error> {
-        let path = self.blob_path(address);
-
-        Ok(fs::read(&path)?)
-    }
-
-    fn exists_blob(&self, address: &[u8; 32]) -> Result<bool, Error> {
-        Ok(self.blob_path(address).exists())
-    }
-
-    fn delete_blob(&self, address: &[u8; 32]) -> Result<(), Error> {
-        let path = self.blob_path(address);
-
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io(e)),
+    /// Resolves a key and returns the path at which the key will be stored.
+    fn resolve(&self, key: Key) -> PathBuf {
+        match key {
+            Key::Manifest => self.root.join(MANIFEST_DIRNAME).join("file"),
+            Key::Blob(address) => self
+                .root
+                .join(BLOBS_DIRNAME)
+                .join(PathBuf::from(HashPath::new(&address))),
         }
     }
 
-    fn list_blobs(&self) -> Result<Vec<[u8; 32]>, Error> {
+    /// Walks a three-level `xx/xx/xxxxxx...` hex directory tree at `path` (`self.root/path`)
+    /// and reconstructs the 32-byte addresses.
+    fn list_hashpath_dir(&self, path: impl Into<PathBuf>) -> Result<Vec<Key>, Error> {
         let mut addresses = Vec::new();
 
         // Must be 3 levels: ./xx/xx/xxxxxx...
-        let entries = match fs::read_dir(self.root.join(BLOBS_DIRNAME)) {
+        let entries = match fs::read_dir(self.root.join(path.into())) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(addresses),
             Err(e) => return Err(Error::Io(e)),
@@ -188,13 +127,65 @@ impl Backend for Storage {
                         file.file_name().to_str(),
                     ) && let Some(address) = path_to_address(dir, subdir, file)
                     {
-                        addresses.push(address);
+                        addresses.push(Key::Blob(address));
                     }
                 }
             }
         }
 
         Ok(addresses)
+    }
+}
+
+impl Backend for Storage {
+    fn put(&self, key: Key, data: &[u8]) -> Result<(), Error> {
+        let path = self.resolve(key);
+
+        if matches!(key, Key::Blob(_)) && path.exists() {
+            return Ok(()); // No-op in content-addressed, file already exists
+        }
+
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp = path.with_extension("tmp");
+
+        // Atomic write
+        fs::write(&temp, data)?;
+        fs::rename(&temp, path)?;
+
+        Ok(())
+    }
+
+    fn get(&self, key: Key) -> Result<Vec<u8>, Error> {
+        let path = self.resolve(key);
+
+        Ok(fs::read(&path)?)
+    }
+
+    fn exists(&self, key: Key) -> Result<bool, Error> {
+        let path = self.resolve(key);
+
+        Ok(path.exists())
+    }
+
+    fn delete(&self, key: Key) -> Result<(), Error> {
+        let path = self.resolve(key);
+
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    fn list(&self, kind: Kind) -> Result<Vec<Key>, Error> {
+        match kind {
+            Kind::Blobs => self.list_hashpath_dir(BLOBS_DIRNAME),
+        }
     }
 }
 
@@ -217,44 +208,44 @@ mod tests {
     }
 
     #[test]
-    fn manifest_save_load_roundtrip() {
+    fn manifest_put_get_roundtrip() {
         let storage = temp_storage("manifest_roundtrip");
         let data = b"data";
 
-        storage.save_manifest(data).unwrap();
+        storage.put(Key::Manifest, data).unwrap();
 
-        assert_eq!(storage.load_manifest().unwrap(), data);
+        assert_eq!(storage.get(Key::Manifest).unwrap(), data);
     }
 
     #[test]
     fn put_get_roundtrip() {
         let storage = temp_storage("roundtrip");
-        let address = [0; 32];
+        let key = Key::Blob([0; 32]);
         let data = b"data";
 
-        storage.put_blob(&address, data).unwrap();
+        storage.put(key, data).unwrap();
 
-        assert_eq!(storage.get_blob(&address).unwrap(), data);
+        assert_eq!(storage.get(key).unwrap(), data);
     }
 
     #[test]
     fn exists() {
         let storage = temp_storage("exists");
-        let address = [1; 32];
+        let key = Key::Blob([1; 32]);
         let data = b"data";
 
-        assert!(!storage.exists_blob(&address).unwrap());
+        assert!(!storage.exists(key).unwrap());
 
-        storage.put_blob(&address, data).unwrap();
+        storage.put(key, data).unwrap();
 
-        assert!(storage.exists_blob(&address).unwrap());
+        assert!(storage.exists(key).unwrap());
     }
 
     #[test]
     fn not_found() {
         let storage = temp_storage("not_found");
-        let address = [2; 32];
-        let got = storage.get_blob(&address);
+        let key = Key::Blob([2; 32]);
+        let got = storage.get(key);
 
         assert!(matches!(got, Err(Error::NotFound)));
     }
@@ -262,47 +253,47 @@ mod tests {
     #[test]
     fn no_op_put() {
         let storage = temp_storage("no_op_put");
-        let address = [3; 32];
+        let key = Key::Blob([3; 32]);
 
-        storage.put_blob(&address, b"first write").unwrap();
+        storage.put(key, b"first write").unwrap();
         storage
-            .put_blob(&address, b"second write - should be ignored")
+            .put(key, b"second write - should be ignored")
             .unwrap();
 
         // Same address so the second put is a no-op, original data preserved
-        assert_eq!(storage.get_blob(&address).unwrap(), b"first write");
+        assert_eq!(storage.get(key).unwrap(), b"first write");
     }
 
     #[test]
     fn delete() {
         let storage = temp_storage("delete");
-        let address = [4; 32];
+        let key = Key::Blob([4; 32]);
 
-        storage.put_blob(&address, b"gonna get deleted").unwrap();
-        storage.delete_blob(&address).unwrap();
+        storage.put(key, b"gonna get deleted").unwrap();
+        storage.delete(key).unwrap();
 
-        assert!(!storage.exists_blob(&address).unwrap());
+        assert!(!storage.exists(key).unwrap());
     }
 
     #[test]
     fn delete_non_existent() {
         let storage = temp_storage("delete_non_existent");
-        let address = [5; 32];
+        let key = Key::Blob([5; 32]);
 
-        assert!(storage.delete_blob(&address).is_ok());
+        assert!(storage.delete(key).is_ok());
     }
 
     #[test]
     fn list() {
         let storage = temp_storage("list");
-        let address1 = [6; 32];
-        let address2 = [7; 32];
+        let key1 = Key::Blob([6; 32]);
+        let key2 = Key::Blob([7; 32]);
 
-        storage.put_blob(&address1, b"a").unwrap();
-        storage.put_blob(&address2, b"b").unwrap();
+        storage.put(key1, b"a").unwrap();
+        storage.put(key2, b"b").unwrap();
 
-        let mut list = storage.list_blobs().unwrap();
-        let expected = vec![address1, address2];
+        let mut list = storage.list(Kind::Blobs).unwrap();
+        let expected = vec![key1, key2];
 
         list.sort();
 
@@ -315,9 +306,9 @@ mod tests {
         use gate::sys::{fs::Permissions, os::unix::fs::PermissionsExt};
 
         let storage = temp_storage("list_inaccessible");
-        let address = [8; 32];
+        let key = Key::Blob([8; 32]);
 
-        storage.put_blob(&address, b"accessible payload").unwrap();
+        storage.put(key, b"accessible payload").unwrap();
 
         let broken_dir = storage.root.join(BLOBS_DIRNAME).join("ff");
 
@@ -326,7 +317,7 @@ mod tests {
         // Revoke all permissions so read_dir fails
         fs::set_permissions(&broken_dir, Permissions::from_mode(0o000)).unwrap();
 
-        let result = storage.list_blobs();
+        let result = storage.list(Kind::Blobs);
 
         // Restore permissions so we can delete the temporary directory after the test
         let _ = fs::set_permissions(&broken_dir, Permissions::from_mode(0o755));
@@ -338,7 +329,7 @@ mod tests {
             "Should have skipped the broken directory instead of failing"
         );
         assert_eq!(
-            list[0], address,
+            list[0], key,
             "The valid chunk must still be collected safely"
         );
     }
