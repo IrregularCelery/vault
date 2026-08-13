@@ -190,7 +190,7 @@ mod tests {
         let responses = vec![
             Response::Ok,
             Response::Keys(vec![Key::Blob([1u8; 32]), Key::Blob([2u8; 32])]),
-            Response::Keys(vec![Key::Manifest]),
+            Response::Keys(vec![Key::Index(69)]),
             Response::Data(vec![3, 4]),
             Response::Exists(true),
             Response::Exists(false),

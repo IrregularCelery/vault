@@ -189,12 +189,12 @@ mod tests {
             },
             Request::List { kind: Kind::Blobs },
             Request::Put {
-                key: Key::Manifest,
+                key: Key::Index(1),
                 data: &[4, 5],
             },
-            Request::Get { key: Key::Manifest },
-            Request::Exists { key: Key::Manifest },
-            Request::Delete { key: Key::Manifest },
+            Request::Get { key: Key::Index(2) },
+            Request::Exists { key: Key::Index(3) },
+            Request::Delete { key: Key::Index(4) },
         ];
 
         for request in requests {

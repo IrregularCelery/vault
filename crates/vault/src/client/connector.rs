@@ -148,7 +148,7 @@ impl Client {
 
         let server_static_key = transport.peer_static_key();
         let storage = remote::Storage::new(transport);
-        let vault = Vault::open(self.identity, storage)?;
+        let vault = Vault::open(self.identity, storage);
 
         Ok(ConnectedClient {
             vault,

@@ -2,44 +2,44 @@
 //!
 //! Storage layout is as follows:
 //!
-//!   [root]/<u0:2>/<u2:4>/<u4:64>/manifests/file
-//!          |-------------------|            ^- encrypted manifest file
-//!                   ^- user address
+//!   [root]/<u0:2>/<u2:4>/<u4:64>/index/<shard>
+//!          |-------------------|       |-----|
+//!                   ^- user address       ^- encrypted shards of the index (4 hex chars)
 //!
 //!   [root]/<u0:2>/<u2:4>/<u4:64>/blobs/<b0:2>/<b2:4>/<b4:64>
 //!          |-------------------|       |-------------------|
-//!                   ^- user address           ^- encrypted blob file (Content-Addressed Storage)
+//!                   ^- user address           ^- encrypted blobs (Content-Addressed Storage)
 //!
 //! Each [`Storage`] instance is scoped to a single user. The shared prefix is
-//! `Manifest::address(public_key)`.
+//! `Index::address(public_key)`.
 //! The same 2+2+60 hex split used for blob addresses [`HashPath`] is reused.
 //!
-//! Blob writes are atomic
+//! Write operations are atomic.
 
-use crate::storage::{Backend, Error, Key, Kind, hashpath::HashPath, manifest::Manifest};
+use crate::storage::{Backend, Error, Key, Kind, SHARD_COUNT, hashpath::HashPath, index::Index};
 
-use gate::sys::{fs, io, path::PathBuf, vec::Vec};
+use gate::sys::{fs, io, macros::format, path::PathBuf, vec::Vec};
 
-/// Filename used for the encrypted manifest blob within a user's storage directory.
-const MANIFEST_DIRNAME: &str = "manifest";
+/// Name of the subdirectory inside each user's directory that contains index shards.
+const INDEX_DIRNAME: &str = "index";
 /// Name of the subdirectory inside each user's directory that contains content-addressed blobs.
 const BLOBS_DIRNAME: &str = "blobs";
 
-/// A filesystem-backed, user-scoped blob and manifest store.
+/// A filesystem-backed, user-scoped blob and index store.
 ///
 /// All data lives under a nested hex directory tree derived from the user's public signing key,
-/// ensuring storage isolation between users sharing the same root directory. All blobs and
-/// manifests writes are atomic; Data is staged to a `.tmp` file and renamed into place.
+/// ensuring storage isolation between users sharing the same root directory. All index shard and
+/// blob writes are atomic; data is staged to a `.tmp` file and renamed into place.
 pub struct Storage {
     /// Absolute path to this user's scoped storage root (i.e. `[base_root]/xx/xx/xxxxxx...`).
-    /// All manifest and blob paths are derived relative to this directory.
+    /// All index shard and blob paths are derived relative to this directory.
     root: PathBuf,
 }
 
 impl Storage {
     /// Creates a new [`Storage`] instance rooted at `root`, scoped to `public_key`.
     pub fn new(root: impl Into<PathBuf>, public_key: &[u8; 32]) -> Result<Self, Error> {
-        let user_address = Manifest::address(public_key);
+        let user_address = Index::address(public_key);
         let root = root
             .into()
             .join(PathBuf::from(HashPath::new(&user_address)));
@@ -50,7 +50,10 @@ impl Storage {
     /// Resolves a key and returns the path at which the key will be stored.
     fn resolve(&self, key: Key) -> PathBuf {
         match key {
-            Key::Manifest => self.root.join(MANIFEST_DIRNAME).join("file"),
+            Key::Index(number) => self
+                .root
+                .join(INDEX_DIRNAME)
+                .join(format!("{:04x}", number)),
             Key::Blob(address) => self
                 .root
                 .join(BLOBS_DIRNAME)
@@ -58,15 +61,41 @@ impl Storage {
         }
     }
 
-    /// Walks a three-level `xx/xx/xxxxxx...` hex directory tree at `path` (`self.root/path`)
-    /// and reconstructs the 32-byte addresses.
-    fn list_hashpath_dir(&self, path: impl Into<PathBuf>) -> Result<Vec<Key>, Error> {
-        let mut addresses = Vec::new();
+    /// Lists every index's key present in the [`INDEX_DIRNAME`] directory.
+    fn list_index_dir(&self) -> Result<Vec<Key>, Error> {
+        let mut keys = Vec::new();
+
+        let entries = match fs::read_dir(self.root.join(INDEX_DIRNAME)) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(keys),
+            Err(e) => return Err(Error::Io(e)),
+        };
+
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+
+            if let Some(name) = entry.file_name().to_str()
+                && name.len() == 4
+                && let Ok(number) = u16::from_str_radix(name, 16)
+                && number < SHARD_COUNT
+            {
+                keys.push(Key::Index(number));
+            }
+        }
+
+        Ok(keys)
+    }
+
+    /// Lists every blob's key present in the [`BLOBS_DIRNAME`] directory.
+    fn list_blobs_dir(&self) -> Result<Vec<Key>, Error> {
+        let mut keys = Vec::new();
 
         // Must be 3 levels: ./xx/xx/xxxxxx...
-        let entries = match fs::read_dir(self.root.join(path.into())) {
+        let entries = match fs::read_dir(self.root.join(BLOBS_DIRNAME)) {
             Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(addresses),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(keys),
             Err(e) => return Err(Error::Io(e)),
         };
 
@@ -127,13 +156,13 @@ impl Storage {
                         file.file_name().to_str(),
                     ) && let Some(address) = path_to_address(dir, subdir, file)
                     {
-                        addresses.push(Key::Blob(address));
+                        keys.push(Key::Blob(address));
                     }
                 }
             }
         }
 
-        Ok(addresses)
+        Ok(keys)
     }
 }
 
@@ -184,7 +213,8 @@ impl Backend for Storage {
 
     fn list(&self, kind: Kind) -> Result<Vec<Key>, Error> {
         match kind {
-            Kind::Blobs => self.list_hashpath_dir(BLOBS_DIRNAME),
+            Kind::Index => self.list_index_dir(),
+            Kind::Blobs => self.list_blobs_dir(),
         }
     }
 }
@@ -208,17 +238,18 @@ mod tests {
     }
 
     #[test]
-    fn manifest_put_get_roundtrip() {
-        let storage = temp_storage("manifest_roundtrip");
+    fn index_shard_put_get_roundtrip() {
+        let storage = temp_storage("index_shard_roundtrip");
+        let key = Key::Index(0);
         let data = b"data";
 
-        storage.put(Key::Manifest, data).unwrap();
+        storage.put(key, data).unwrap();
 
-        assert_eq!(storage.get(Key::Manifest).unwrap(), data);
+        assert_eq!(storage.get(key).unwrap(), data);
     }
 
     #[test]
-    fn put_get_roundtrip() {
+    fn blob_put_get_roundtrip() {
         let storage = temp_storage("roundtrip");
         let key = Key::Blob([0; 32]);
         let data = b"data";
@@ -265,6 +296,18 @@ mod tests {
     }
 
     #[test]
+    fn index_shard_put_always_overwrites() {
+        let storage = temp_storage("index_overwrite");
+        let key = Key::Index(3);
+
+        storage.put(key, b"first write").unwrap();
+        storage.put(key, b"second write").unwrap();
+
+        // Unlike blobs, an index shard is mutable and always overwritten
+        assert_eq!(storage.get(key).unwrap(), b"second write");
+    }
+
+    #[test]
     fn delete() {
         let storage = temp_storage("delete");
         let key = Key::Blob([4; 32]);
@@ -298,6 +341,41 @@ mod tests {
         list.sort();
 
         assert_eq!(list, expected);
+    }
+
+    #[test]
+    fn list_index_shards() {
+        let storage = temp_storage("list_index");
+        let key1 = Key::Index(1);
+        let key2 = Key::Index(200);
+
+        storage.put(key1, b"shard one").unwrap();
+        storage.put(key2, b"shard two").unwrap();
+
+        let mut list = storage.list(Kind::Index).unwrap();
+        let expected = vec![key1, key2];
+
+        list.sort();
+
+        assert_eq!(list, expected);
+    }
+
+    #[test]
+    fn list_index_empty_when_nothing_written() {
+        let storage = temp_storage("list_index_empty");
+
+        assert!(storage.list(Kind::Index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blobs_and_index_are_isolated() {
+        let storage = temp_storage("isolation");
+
+        storage.put(Key::Blob([9; 32]), b"blob data").unwrap();
+        storage.put(Key::Index(69), b"shard data").unwrap();
+
+        assert_eq!(storage.list(Kind::Blobs).unwrap(), vec![Key::Blob([9; 32])]);
+        assert_eq!(storage.list(Kind::Index).unwrap(), vec![Key::Index(69)]);
     }
 
     #[test]

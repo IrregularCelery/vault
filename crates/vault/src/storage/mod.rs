@@ -1,6 +1,6 @@
-//! Storage layer for encrypted blobs and manifest persistence.
+//! Storage layer for encrypted blobs and index persistence.
 //!
-//! Defines the [`Backend`] trait as well as some implemenetations:
+//! Defines the [`Backend`] trait as well as some implementations:
 //!
 //! - [`local::Storage`]: Filesystem-backed, scoped per user via a content-addressed
 //!   hex directory tree derived from the user's public signing key.
@@ -11,8 +11,8 @@ mod backend;
 
 pub mod chunk;
 pub mod hashpath;
+pub mod index;
 pub mod local;
-pub mod manifest;
 pub mod remote;
 
 pub use backend::*;

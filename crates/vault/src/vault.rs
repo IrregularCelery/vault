@@ -1,19 +1,22 @@
 //! The primary API surface of the vault.
 //!
 //! A [`Vault`] owns an [`Identity`] and a [`storage::Backend`] and exposes high-level file
-//! operation: put, get, version history, rename, trash/restore/purge, and integrity verification.
+//! operations: put, get, version history, rename, trash/restore/purge, and integrity verification.
 //!
-//! On construction the manifest is loaded and decrypted (or an empty manifest is initialized).
-//! Every mutating method updates the in-memory manifest and then flushes it back to the storage
-//! before returning.
+//! Index shards are loaded lazily: [`Vault::open`] does no storage I/O at all. Each index shard is
+//! only retrieved and decrypted from storage the first time a path that falls into it is actually
+//! touched, then kept cached in memory. (see [`Vault::ensure_shard`]).
+//!
+//! Every mutating method updates the in-memory index and then flushes only the shards that are
+//! marked dirty back to the storage before returning.
 
 use crate::{
     crypto::cipher,
     identity::Identity,
     storage::{
-        self, Key,
+        self, Key, Kind,
         chunk::{self, Chunks},
-        manifest::{self, Manifest, Properties, VersionProperties},
+        index::{self, Index, Properties, VersionProperties},
     },
 };
 
@@ -22,7 +25,7 @@ use gate::sys::{borrow::Cow, io, macros::format, string::String, time, vec::Vec}
 /// Errors from vault-level file operations.
 #[derive(Debug)]
 pub enum Error {
-    /// A blob or manifest storage operation failed.
+    /// A blob or index shard storage operation failed.
     Storage(storage::Error),
 
     /// An AEAD encryption or decryption error (wrong key, corrupted data, etc.).
@@ -31,13 +34,13 @@ pub enum Error {
     /// An error from the chunker, most likely an I/O error.
     Chunk(chunk::Error),
 
-    /// A manifest-level error.
-    Manifest(manifest::Error),
+    /// An index-level error.
+    Index(index::Error),
 
     /// An I/O error most likely while writing decrypted plaintext to the writer.
     Io(io::Error),
 
-    /// The requested file path does not exist in the manifest (or is trashed).
+    /// The requested file path does not exist in the index (or is trashed).
     NotFound,
 
     /// The requested version index is out of bounds for the entry's history.
@@ -53,7 +56,7 @@ pub enum Error {
     /// A [`Vault::trash`] was attempted on an entry that has already been trashed.
     AlreadyTrashed,
 
-    /// A blob's signature did not match, could be the manifest blob or chunks (including versions).
+    /// A blob's signature did not match, could be an index shard or chunks (including versions).
     Tampered(String),
 
     /// Specific message error.
@@ -66,7 +69,7 @@ impl core::fmt::Display for Error {
             Self::Storage(e) => write!(f, "storage: {}", e),
             Self::Cipher(e) => write!(f, "cipher: {}", e),
             Self::Chunk(e) => write!(f, "chunk: {}", e),
-            Self::Manifest(e) => write!(f, "manifest: {}", e),
+            Self::Index(e) => write!(f, "index: {}", e),
             Self::Io(e) => write!(f, "I/O: {}", e),
             Self::NotFound => write!(f, "file not found"),
             Self::VersionNotFound => write!(f, "version not found"),
@@ -103,67 +106,42 @@ impl From<chunk::Error> for Error {
     }
 }
 
-impl From<manifest::Error> for Error {
-    fn from(value: manifest::Error) -> Self {
+impl From<index::Error> for Error {
+    fn from(value: index::Error) -> Self {
         match value {
-            manifest::Error::NotFound => Self::NotFound,
-            manifest::Error::VersionNotFound => Self::VersionNotFound,
-            manifest::Error::AlreadyExists => Self::AlreadyExists,
-            manifest::Error::NotTrashed => Self::NotTrashed,
-            manifest::Error::AlreadyTrashed => Self::AlreadyTrashed,
-            other => Self::Manifest(other),
+            index::Error::NotFound => Self::NotFound,
+            index::Error::VersionNotFound => Self::VersionNotFound,
+            index::Error::AlreadyExists => Self::AlreadyExists,
+            index::Error::NotTrashed => Self::NotTrashed,
+            index::Error::AlreadyTrashed => Self::AlreadyTrashed,
+            other => Self::Index(other),
         }
     }
 }
 
-/// An active vault session with a decrypted manifest and a connected storage backend.
-///
-/// The manifest is kept in memory. All writes are reflected into storage by [`flush_manifest`]
-/// before each method returns, keeping the on-disk state in sync.
+/// An active vault session with a connected storage backend and a lazily-populated index cache.
 pub struct Vault<S: storage::Backend> {
-    /// The cryptographic identity used to encrypt, decrypt, sign, and verify all blobs and
-    /// the manifest.
+    /// The cryptographic identity used to encrypt, decrypt, sign, and verify all blobs and index
+    /// shards.
     identity: Identity,
 
     /// The storage backend.
     storage: S,
 
-    /// The decrypted in-memory manifest. All mutations are applied here first, then flushed
-    /// to [`Vault::storage`] via [`Vault::flush_manifest`] before each method returns.
-    manifest: Manifest,
+    /// The lazily-populated index cache. See the module and [`Index`] docs for more details.
+    index: core::cell::RefCell<Index>,
 }
 
 impl<S: storage::Backend> Vault<S> {
-    /// Opens a vault by loading and decrypting the manifest from `storage`.
+    /// Opens a new vault with an empty index.
     ///
-    /// Creates an empty manifest if none exists yet.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Storage`]: If reading the manifest from storage fails for reasons
-    ///   other than [`Error::NotFound`].
-    /// - [`Error::Manifest`]: If the underlying manifest decryption or deserialization fails.
-    /// - [`Error::Tampered`]: If the manifest signature is invalid.
-    pub fn open(identity: Identity, storage: S) -> Result<Self, Error> {
-        let manifest = match storage.get(Key::Manifest) {
-            Ok(manifest) => Manifest::unlock(
-                &manifest,
-                &identity.encryption_key(),
-                |message, signature_bytes| identity.verify(message, signature_bytes),
-            )
-            .map_err(|e| match e {
-                manifest::Error::Tampered => Error::Tampered("manifest".into()),
-                other => Error::Manifest(other),
-            })?,
-            Err(storage::Error::NotFound) => Manifest::new(),
-            Err(e) => return Err(Error::Storage(e)),
-        };
-
-        Ok(Self {
+    /// Shards are lazily loaded into the index when they are actually touched.
+    pub fn open(identity: Identity, storage: S) -> Self {
+        Self {
             identity,
             storage,
-            manifest,
-        })
+            index: core::cell::RefCell::new(Index::new()),
+        }
     }
 
     /// Encrypts and stores a file, returning the number of new chunks uploaded.
@@ -171,15 +149,21 @@ impl<S: storage::Backend> Vault<S> {
     /// The file is split into [`chunk::CHUNK_SIZE`]-byte chunks. Each chunk is addressed by
     /// a keyed BLAKE3 hash of its plaintext, enabling per-user-per-chunk deduplication.
     /// If `path` already exists with different content, the previous version is saved to history
-    /// via [`manifest::Entry::push_version`].
+    /// via [`index::Entry::push_version`].
+    ///
+    /// Returns the number of new chunks written.
     ///
     /// # Errors
     ///
-    /// - [`Error::Storage`]: If writing a chunk to storage or flushing the manifest fails.
-    /// - [`Error::Cipher`]: If chunk or manifest encryption fails.
+    /// - [`Error::Storage`]: If reading a shard, writing a chunk or flushing the dirty index
+    ///   shards fails.
+    /// - [`Error::Cipher`]: If chunk or index encryption fails.
     /// - [`Error::Chunk`]: If reading from `reader` fails.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting the dirty index shard fails.
+    /// - [`Error::Tampered`]: If the dirty index shard's signature is invalid.
     pub fn put(&mut self, path: &str, reader: impl io::Read, size: u64) -> Result<usize, Error> {
+        self.ensure_shard(Index::shard_of(path))?;
+
         let mut chunks = Chunks::new(reader);
         let mut entry_chunks = Vec::new();
 
@@ -200,13 +184,13 @@ impl<S: storage::Backend> Vault<S> {
                 self.storage.put(Key::Blob(address), &encrypted)?;
             }
 
-            entry_chunks.push(manifest::EntryChunk {
+            entry_chunks.push(index::EntryChunk {
                 address,
                 encrypted_key,
             });
         }
 
-        if let Some(existing) = self.manifest.entries.get_mut(path) {
+        if let Some(existing) = self.index.get_mut().entries.get_mut(path) {
             let existing_addresses: Vec<[u8; 32]> =
                 existing.chunks.iter().map(|c| c.address).collect();
             let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
@@ -217,7 +201,8 @@ impl<S: storage::Backend> Vault<S> {
                 if existing.trashed != 0 {
                     existing.trashed = 0;
 
-                    self.flush_manifest()?;
+                    self.index.get_mut().mark_dirty(path);
+                    self.flush_index()?;
                 }
 
                 return Ok(0);
@@ -227,21 +212,22 @@ impl<S: storage::Backend> Vault<S> {
         let chunk_count = entry_chunks.len();
         let modified = time::current_secs().unwrap_or(0);
 
-        if let Some(existing) = self.manifest.entries.get_mut(path) {
+        if let Some(existing) = self.index.get_mut().entries.get_mut(path) {
             // Same `path`, different content, a new version.
             existing.push_version(entry_chunks, size, modified);
             // NOTE: It's debatable whether this should gracefully restore the `path`, or return
             // an error instead.
             existing.trashed = 0;
 
-            self.flush_manifest()?;
+            self.index.get_mut().mark_dirty(path);
+            self.flush_index()?;
 
             return Ok(chunk_count);
         }
 
-        self.manifest.insert(
+        self.index.get_mut().insert(
             path,
-            manifest::Entry {
+            index::Entry {
                 chunks: entry_chunks,
                 versions: Vec::new(),
                 size,
@@ -249,7 +235,7 @@ impl<S: storage::Backend> Vault<S> {
                 trashed: 0,
             },
         );
-        self.flush_manifest()?;
+        self.flush_index()?;
 
         Ok(chunk_count)
     }
@@ -259,28 +245,39 @@ impl<S: storage::Backend> Vault<S> {
     ///
     /// # Errors
     ///
-    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
-    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
+    /// - [`Error::Cipher`]: If chunk or index decryption fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
     /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
-        let entry = self.manifest.get(path).ok_or(Error::NotFound)?;
+        self.ensure_shard(Index::shard_of(path))?;
+
+        let index = self.index.borrow();
+        let entry = index.get(path).ok_or(Error::NotFound)?;
 
         self.decrypt_chunks(path, &entry.chunks, writer)
     }
 
-    /// Returns version metadata for all historical revisions of `path`, oldest first.
+    /// Returns version metadata for all historical revisions of `path`, oldest first, or `None`
+    /// if `path` is absent.
     ///
-    /// Includes versions of trashed entries. Returns `None` if the path is absent.
-    pub fn versions(&self, path: &str) -> Option<Vec<VersionProperties>> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get(path)?;
+    /// Includes versions of trashed entries.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading the touched index shard fails.
+    /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
+    pub fn versions(&self, path: &str) -> Result<Option<Vec<VersionProperties>>, Error> {
+        self.ensure_shard(Index::shard_of(path))?;
 
-        Some(
-            entry
-                .versions
+        let index = self.index.borrow();
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        Ok(index.entries.get(path).map(|e| {
+            e.versions
                 .iter()
                 .enumerate()
                 .map(|(i, v)| VersionProperties {
@@ -289,16 +286,16 @@ impl<S: storage::Backend> Vault<S> {
                     size: v.size,
                     modified: v.modified,
                 })
-                .collect(),
-        )
+                .collect()
+        }))
     }
 
     /// Decrypts and streams a specific historical version of `path` into `writer`.
     ///
     /// # Errors
     ///
-    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
-    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
+    /// - [`Error::Cipher`]: If chunk or index decryption fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
@@ -310,8 +307,12 @@ impl<S: storage::Backend> Vault<S> {
         version_index: usize,
         writer: &mut impl io::Write,
     ) -> Result<u64, Error> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
+        self.ensure_shard(Index::shard_of(path))?;
+
+        let index = self.index.borrow();
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = index.entries.get(path).ok_or(Error::NotFound)?;
         let version = entry
             .versions
             .get(version_index)
@@ -329,18 +330,26 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting the touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
+    /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+        self.ensure_shard(Index::shard_of(path))?;
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = self
+            .index
+            .get_mut()
+            .entries
+            .get_mut(path)
+            .ok_or(Error::NotFound)?;
 
         if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
         }
 
-        let current = manifest::Version {
+        let current = index::Version {
             chunks: core::mem::take(&mut entry.chunks),
             size: entry.size,
             modified: entry.modified,
@@ -352,28 +361,34 @@ impl<S: storage::Backend> Vault<S> {
         entry.modified = target.modified;
         entry.versions.push(current);
 
-        self.flush_manifest()?;
+        self.index.get_mut().mark_dirty(path);
+        self.flush_index()?;
 
         Ok(())
     }
 
     /// Permanently drops a historical version and deletes its now-unreferenced blobs.
     ///
-    /// Addresses still referenced by the active version or other files are preserved.
+    /// Addresses still referenced by the active version or other files are preserved. Since that
+    /// check needs to go through every file, this method loads every index shard rather than just
+    /// the one with `path` in it.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting any index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
     pub fn drop_version(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
-        let dropped = self.manifest.drop_version(path, version_index)?;
+        self.ensure_all_shards()?;
 
-        // Persist the manifest before deleting the blobs. If a delete fails partway, or
+        let dropped = self.index.get_mut().drop_version(path, version_index)?;
+
+        // Persist the index before deleting the blobs. If a delete fails partway, or
         // the process dies right here, the worst case is an unreferenced blob, never a live entry
         // pointing at a chunk that no longer exists.
-        self.flush_manifest()?;
+        self.flush_index()?;
 
         for address in dropped {
             self.storage.delete(Key::Blob(address))?;
@@ -385,16 +400,23 @@ impl<S: storage::Backend> Vault<S> {
     /// Replaces the active version with the most recent historical version.
     ///
     /// Active chunks that are no longer referenced are deleted from storage.
-    /// If no historical versions exist, the file is deleted entirely.
+    /// If no historical versions exist, the file is deleted entirely. This needs to go through
+    /// every file in the vault to know what's still referenced, so it needs to load every index
+    /// shard rather than just the one with `path` in it.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting any index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
     pub fn drop_version_current(&mut self, path: &str) -> Result<(), Error> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+        self.ensure_all_shards()?;
+
+        let index = self.index.get_mut();
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
             return self.delete(path);
@@ -406,14 +428,16 @@ impl<S: storage::Backend> Vault<S> {
         entry.size = latest_version.size;
         entry.modified = latest_version.modified;
 
-        let referenced: Vec<[u8; 32]> = self.manifest.addresses();
+        index.mark_dirty(path);
+
+        let referenced: Vec<[u8; 32]> = index.addresses();
         let addresses: Vec<[u8; 32]> = dropped_chunks
             .into_iter()
             .map(|c| c.address)
             .filter(|a| !referenced.contains(a))
             .collect();
 
-        self.flush_manifest()?;
+        self.flush_index()?;
 
         for address in addresses {
             self.storage.delete(Key::Blob(address))?;
@@ -424,28 +448,34 @@ impl<S: storage::Backend> Vault<S> {
 
     /// Moves a historical version out of `path`'s history into a new independent file at `new_path`.
     ///
-    /// No blobs are copied, only manifest references are updated. Both paths become independently
+    /// No blobs are copied, only index references are updated. Both paths become independently
     /// readable and writable after the call.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting a touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
+    /// - [`Error::Tampered`]: If a touched index shard's signature is invalid.
     pub fn detach_version(
         &mut self,
         path: &str,
         version_index: usize,
         new_path: &str,
     ) -> Result<(), Error> {
-        if self.manifest.entries.contains_key(new_path) {
+        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard(Index::shard_of(new_path))?;
+
+        let index = self.index.get_mut();
+
+        if index.entries.contains_key(new_path) {
             return Err(Error::AlreadyExists);
         }
 
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
 
         if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
@@ -453,9 +483,10 @@ impl<S: storage::Backend> Vault<S> {
 
         let detached = entry.versions.remove(version_index);
 
-        self.manifest.insert(
+        index.mark_dirty(path);
+        index.insert(
             new_path,
-            manifest::Entry {
+            index::Entry {
                 chunks: detached.chunks,
                 versions: Vec::new(),
                 size: detached.size,
@@ -463,7 +494,8 @@ impl<S: storage::Backend> Vault<S> {
                 trashed: 0,
             },
         );
-        self.flush_manifest()?;
+
+        self.flush_index()?;
 
         Ok(())
     }
@@ -471,31 +503,40 @@ impl<S: storage::Backend> Vault<S> {
     /// Moves the active version of `path` to `new_path` and makees the most recent historical
     /// version the new active revision.
     ///
-    /// Equivalent to [`Vault::rename`] when no historical versions exist.
+    /// Equivalent to [`Vault::rename`] when no historical versions exist. (this also makes
+    /// the entry live if trashed)
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting a touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
+    /// - [`Error::Tampered`]: If a touched index shard's signature is invalid.
     pub fn detach_version_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
-        if self.manifest.entries.contains_key(new_path) {
+        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard(Index::shard_of(new_path))?;
+
+        let index = self.index.get_mut();
+
+        if index.entries.contains_key(new_path) {
             return Err(Error::AlreadyExists);
         }
 
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get_mut(path).ok_or(Error::NotFound)?;
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
-            self.manifest.rename(path, new_path)?;
+            index.rename(path, new_path)?;
 
-            if let Some(detached) = self.manifest.entries.get_mut(new_path) {
+            if let Some(detached) = index.entries.get_mut(new_path) {
                 // `detach` should always produce live entry at `new_path`
                 detached.trashed = 0;
+
+                index.mark_dirty(new_path);
             }
 
-            self.flush_manifest()?;
+            self.flush_index()?;
 
             return Ok(());
         }
@@ -505,9 +546,10 @@ impl<S: storage::Backend> Vault<S> {
         let size = core::mem::replace(&mut entry.size, latest_version.size);
         let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
 
-        self.manifest.insert(
+        index.mark_dirty(path);
+        index.insert(
             new_path,
-            manifest::Entry {
+            index::Entry {
                 chunks,
                 versions: Vec::new(),
                 size,
@@ -515,23 +557,27 @@ impl<S: storage::Backend> Vault<S> {
                 trashed: 0,
             },
         );
-        self.flush_manifest()?;
+
+        self.flush_index()?;
 
         Ok(())
     }
 
-    /// Renames `old_path` to `new_path` in the manifest. Manifest manipulation only, no blobs are
+    /// Renames `old_path` to `new_path` in the index. Index manipulation only, no blobs are
     /// touched.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting a touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
+    /// - [`Error::Tampered`]: If a touched index shard's signature is invalid.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
-        self.manifest.rename(old_path, new_path)?;
-        self.flush_manifest()?;
+        self.ensure_shard(Index::shard_of(old_path))?;
+        self.ensure_shard(Index::shard_of(new_path))?;
+        self.index.get_mut().rename(old_path, new_path)?;
+        self.flush_index()?;
 
         Ok(())
     }
@@ -542,12 +588,14 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting the touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::AlreadyTrashed`]: If the `path` is already trashed.
+    /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
-        self.manifest.trash(path)?;
-        self.flush_manifest()?;
+        self.ensure_shard(Index::shard_of(path))?;
+        self.index.get_mut().trash(path)?;
+        self.flush_index()?;
 
         Ok(())
     }
@@ -557,29 +605,35 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting the touched index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::NotTrashed`]: If the `path` is not currently trashed.
+    /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
-        self.manifest.restore(path)?;
-        self.flush_manifest()?;
+        self.ensure_shard(Index::shard_of(path))?;
+        self.index.get_mut().restore(path)?;
+        self.flush_index()?;
 
         Ok(())
     }
 
     /// Permanently removes a trashed entry and deletes its blobs if no longer referenced by any
-    /// live file.
+    /// file. Since that check needs to go through every file, this method loads every index shard
+    /// rather than just the one with `path` in it.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting any index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::NotTrashed`]: If the `path` is not currently trashed.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
-        let addresses = self.manifest.purge(path)?;
+        self.ensure_all_shards()?;
 
-        self.flush_manifest()?;
+        let addresses = self.index.get_mut().purge(path)?;
+
+        self.flush_index()?;
 
         for address in addresses {
             self.storage.delete(Key::Blob(address))?;
@@ -593,12 +647,15 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting any index shard fails.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
     pub fn cleanup(&mut self) -> Result<usize, Error> {
-        let addresses = self.manifest.purge_all();
+        self.ensure_all_shards()?;
+
+        let addresses = self.index.get_mut().purge_all();
         let removed = addresses.len();
 
-        self.flush_manifest()?;
+        self.flush_index()?;
 
         for address in addresses {
             self.storage.delete(Key::Blob(address))?;
@@ -612,11 +669,13 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If an underlying storage error happens.
-    /// - [`Error::Manifest`]: If manifest encryption or serialization fails.
+    /// - [`Error::Index`]: If loading or encrypting an index shard fails.
     /// - [`Error::NotFound`]: If `path` is absent.
+    /// - [`Error::Tampered`]: If an index shard's signature is invalid.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.manifest.trash(path).or_else(|e| match e {
-            manifest::Error::AlreadyTrashed => Ok(()),
+        self.ensure_shard(Index::shard_of(path))?;
+        self.index.get_mut().trash(path).or_else(|e| match e {
+            index::Error::AlreadyTrashed => Ok(()),
             other => Err(other),
         })?;
         self.purge(path)?;
@@ -624,62 +683,93 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
-    /// Returns a sorted list of paths for all live (non-trashed) entries.
-    pub fn list(&self) -> Vec<&str> {
-        let mut paths: Vec<&str> = self
-            .manifest
+    /// Returns a sorted list of paths for all live (non-trashed) entries. Loads every index shard,
+    /// since every path in the vault needs to be considered.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Index`]: If loading any index shard fails.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
+    pub fn list(&self) -> Result<Vec<String>, Error> {
+        self.ensure_all_shards()?;
+
+        let index = self.index.borrow();
+        let mut paths: Vec<String> = index
             .entries
             .iter()
             .filter(|(_, v)| v.trashed == 0)
-            .map(|(k, _)| k.as_str())
+            .map(|(k, _)| k.clone())
             .collect();
 
         paths.sort();
 
-        paths
+        Ok(paths)
     }
 
-    /// Returns a sorted list of paths for all trashed entries.
-    pub fn list_trash(&self) -> Vec<&str> {
-        let mut paths: Vec<&str> = self
-            .manifest
+    /// Returns a sorted list of paths for all trashed entries. Loads every index shard, since
+    /// every path in the vault needs to be considered.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If an underlying storage error happens.
+    /// - [`Error::Index`]: If loading any index shard fails.
+    /// - [`Error::Tampered`]: If any index shard's signature is invalid.
+    pub fn list_trash(&self) -> Result<Vec<String>, Error> {
+        self.ensure_all_shards()?;
+
+        let index = self.index.borrow();
+        let mut paths: Vec<String> = index
             .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
-            .map(|(k, _)| k.as_str())
+            .map(|(k, _)| k.clone())
             .collect();
 
         paths.sort();
 
-        paths
+        Ok(paths)
     }
 
-    /// Returns [`Properties`] metadata for `path`.
+    /// Returns [`Properties`] metadata for `path`, or `None` if `path` is absent.
     ///
     /// Also returns metadata for trashed entries.
-    pub fn properties(&self, path: &str) -> Option<Properties> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        self.manifest.entries.get(path).map(|e| Properties {
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading the touched index shard fails.
+    /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
+    pub fn properties(&self, path: &str) -> Result<Option<Properties>, Error> {
+        self.ensure_shard(Index::shard_of(path))?;
+
+        let index = self.index.borrow();
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        Ok(index.entries.get(path).map(|e| Properties {
             chunk_count: e.chunks.len(),
             size: e.size,
             modified: e.modified,
             trashed: e.trashed,
             version_count: e.versions.len(),
-        })
+        }))
     }
 
     /// Verifies the signatures on all chunks of `path`, including every version.
     ///
     /// # Errors
     ///
-    /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
-    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
+    /// - [`Error::Cipher`]: If chunk or index decryption fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
-    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn verify(&self, path: &str) -> Result<(), Error> {
-        // Direct `entries` get instead of `self.manifest.get()` so the trashed entries are included
-        let entry = self.manifest.entries.get(path).ok_or(Error::NotFound)?;
+        self.ensure_shard(Index::shard_of(path))?;
+
+        let index = self.index.borrow();
+
+        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
+        let entry = index.entries.get(path).ok_or(Error::NotFound)?;
 
         self.verify_entry_chunks(path, &entry.chunks)?;
 
@@ -693,26 +783,42 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
-    /// Verifies every chunk in the manifest, live, trashed, and all versions as well as
-    /// the manifest blob itself.
+    /// Verifies every chunk in the index, live, trashed, and all versions, as well as every
+    /// index shard blob itself.
     ///
-    /// Returns a sorted, deduplicated list of paths with at least one tampered chunk.
+    /// Returns a sorted, deduplicated list of paths with at least one tampered chunk, plus an
+    /// entry per tampered index shard (formatted as `"index shard xxxx"`).
+    /// Unlike other methods, this always re-reads and re-verifies every index shard's raw bytes
+    /// directly from storage, even ones that are already cached.
     pub fn verify_all(&self) -> Vec<String> {
         let mut tampered = Vec::new();
 
-        // Check the manifest blob itself
-        if let Ok(blob) = self.storage.get(Key::Manifest)
-            && Manifest::unlock(
-                &blob,
-                &self.identity.encryption_key(),
-                |message, signature_bytes| self.identity.verify(message, signature_bytes),
-            )
-            .is_err()
-        {
-            tampered.push("manifest".into());
+        // Check the index shards
+        if let Ok(keys) = self.storage.list(Kind::Index) {
+            for key in keys {
+                let Key::Index(shard) = key else { continue };
+
+                if let Ok(blob) = self.storage.get(key)
+                    && cipher::unlock(
+                        &self.identity.encryption_key(),
+                        &blob,
+                        |message, signature_bytes| self.identity.verify(message, signature_bytes),
+                    )
+                    .is_err()
+                {
+                    tampered.push(format!("index shard {:04x}", shard));
+                }
+
+                // Also make sure the shard is loaded into the cache for the chunk-level pass
+                // below. A shard already flagged above may fail here too, which is fine, it's
+                // already accounted for.
+                let _ = self.ensure_shard(shard);
+            }
         }
 
-        for (path, entry) in &self.manifest.entries {
+        let index = self.index.borrow();
+
+        for (path, entry) in &index.entries {
             if self.verify_entry_chunks(path, &entry.chunks).is_err() {
                 tampered.push(path.clone());
             }
@@ -735,19 +841,75 @@ impl<S: storage::Backend> Vault<S> {
         tampered
     }
 
+    /// Ensures `shard` is loaded into the in-memory index cache, getting and decrypting it from
+    /// storage the first time it's needed. A no-op if the shard is already cached.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading the shard from storage fails for a reason other than the
+    ///   shard not existing yet.
+    /// - [`Error::Index`]: If the shard's decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If the shard's signature is invalid.
+    fn ensure_shard(&self, shard: u16) -> Result<(), Error> {
+        if self.index.borrow().is_loaded(shard) {
+            return Ok(());
+        }
+
+        match self.storage.get(Key::Index(shard)) {
+            Ok(blob) => {
+                self.index
+                    .borrow_mut()
+                    .unlock_shard(
+                        &self.identity.encryption_key(),
+                        &blob,
+                        |message, signature_bytes| self.identity.verify(message, signature_bytes),
+                    )
+                    .map_err(|e| match e {
+                        index::Error::Tampered => {
+                            Error::Tampered(format!("index shard {:04x}", shard))
+                        }
+                        other => Error::Index(other),
+                    })?;
+            }
+            Err(storage::Error::NotFound) => {}
+            Err(e) => return Err(Error::Storage(e)),
+        }
+
+        self.index.borrow_mut().mark_loaded(shard);
+
+        Ok(())
+    }
+
+    /// Ensures every shard currently present in storage is loaded into the in-memory index cache.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If listing or reading a shard fails.
+    /// - [`Error::Index`]: If a shard's decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If a shard's signature is invalid.
+    fn ensure_all_shards(&self) -> Result<(), Error> {
+        for key in self.storage.list(Kind::Index)? {
+            let Key::Index(shard) = key else { continue };
+
+            self.ensure_shard(shard)?;
+        }
+
+        Ok(())
+    }
+
     /// Decrypts the chunk list for `path` and writes plaintext to `writer`.
     ///
     /// # Errors
     ///
     /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
-    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Cipher`]: If chunk or index decryption fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::Tampered`]: If signature verification fails.
     /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     fn decrypt_chunks(
         &self,
         path: &str,
-        chunks: &[manifest::EntryChunk],
+        chunks: &[index::EntryChunk],
         writer: &mut impl io::Write,
     ) -> Result<u64, Error> {
         let mut size = 0u64;
@@ -780,14 +942,9 @@ impl<S: storage::Backend> Vault<S> {
     /// # Errors
     ///
     /// - [`Error::Storage`]: If reading a chunk blob from storage fails.
-    /// - [`Error::Cipher`]: If chunk or manifest decryption fails.
+    /// - [`Error::Cipher`]: If chunk or index decryption fails.
     /// - [`Error::Tampered`]: If signature verification fails.
-    /// - [`Error::Other`]: If wrong size chunk encryption key is found.
-    fn verify_entry_chunks(
-        &self,
-        path: &str,
-        chunks: &[manifest::EntryChunk],
-    ) -> Result<(), Error> {
+    fn verify_entry_chunks(&self, path: &str, chunks: &[index::EntryChunk]) -> Result<(), Error> {
         for chunk in chunks {
             let blob = self.storage.get(Key::Blob(chunk.address))?;
 
@@ -803,20 +960,31 @@ impl<S: storage::Backend> Vault<S> {
         Ok(())
     }
 
-    /// Serializes, encrypts, signs, and persists the current manifest to the storage backend.
+    /// Serializes, encrypts, signs, and persists every shard marked dirty since the last flush.
+    /// A shard left with no entries is deleted instead, so a shard file only exists in storage
+    /// while it actually contains data.
     ///
     /// # Errors
     ///
-    /// - [`Error::Storage`]: If writing the manifest blob to storage fails.
-    /// - [`Error::Manifest`]: If the underlying manifest decryption or deserialization fails.
-    fn flush_manifest(&self) -> Result<(), Error> {
-        let data = self
-            .manifest
-            .lock(&self.identity.encryption_key(), |message| {
-                self.identity.sign(message)
-            })?;
+    /// - [`Error::Storage`]: If writing or deleting a shard fails.
+    /// - [`Error::Index`]: If a shard's encryption or serialization fails.
+    fn flush_index(&mut self) -> Result<(), Error> {
+        // FIXME: This isn't atomic!
+        for shard in self.index.get_mut().take_dirty() {
+            if self.index.get_mut().is_shard_empty(shard) {
+                self.storage.delete(Key::Index(shard))?;
 
-        self.storage.put(Key::Manifest, &data)?;
+                continue;
+            }
+
+            let data = self.index.get_mut().lock_shard(
+                shard,
+                &self.identity.encryption_key(),
+                |message| self.identity.sign(message),
+            )?;
+
+            self.storage.put(Key::Index(shard), &data)?;
+        }
 
         Ok(())
     }
@@ -859,7 +1027,7 @@ mod tests {
         let identity = make_identity(&words);
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
 
-        Vault::open(identity, storage).unwrap()
+        Vault::open(identity, storage)
     }
 
     fn put_bytes(vault: &mut Vault<local::Storage>, path: &str, data: &[u8]) {
@@ -875,25 +1043,27 @@ mod tests {
     }
 
     // Only used for tests, blob storage is immutable
-    fn overwrite_bytes(
-        storage_path: &Path,
-        public_signing_key: &[u8; 32],
-        address: &[u8; 32],
-        data: &[u8],
-    ) {
-        let user_hex: String = Manifest::address(public_signing_key)
+    fn overwrite_bytes(storage_path: &Path, public_signing_key: &[u8; 32], key: Key, data: &[u8]) {
+        let user_hex: String = Index::address(public_signing_key)
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        let blob_hex: String = address.iter().map(|b| format!("{:02x}", b)).collect();
-        let path = storage_path
+        let user_dir = storage_path
             .join(&user_hex[0..2])
             .join(&user_hex[2..4])
-            .join(&user_hex[4..])
-            .join("blobs")
-            .join(&blob_hex[0..2])
-            .join(&blob_hex[2..4])
-            .join(&blob_hex[4..]);
+            .join(&user_hex[4..]);
+        let path = match key {
+            Key::Blob(address) => {
+                let blob_hex: String = address.iter().map(|b| format!("{:02x}", b)).collect();
+
+                user_dir
+                    .join("blobs")
+                    .join(&blob_hex[0..2])
+                    .join(&blob_hex[2..4])
+                    .join(&blob_hex[4..])
+            }
+            Key::Index(shard) => user_dir.join("index").join(format!("{:04x}", shard)),
+        };
         let temp = path.with_extension("tmp");
 
         fs::write(&temp, data).unwrap();
@@ -995,7 +1165,7 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"same content");
 
-        assert_eq!(vault.list(), vec!["file"]);
+        assert_eq!(vault.list().unwrap(), vec!["file"]);
     }
 
     #[test]
@@ -1008,7 +1178,7 @@ mod tests {
 
         put_bytes(&mut vault, "file", b"new content");
 
-        assert_eq!(vault.list(), vec!["file"]);
+        assert_eq!(vault.list().unwrap(), vec!["file"]);
         assert_eq!(get_bytes(&vault, "file"), b"new content");
     }
 
@@ -1069,7 +1239,7 @@ mod tests {
         assert_eq!(get_bytes(&vault, "file"), b"version two");
 
         // One previous version was created
-        let versions = vault.versions("file").unwrap();
+        let versions = vault.versions("file").unwrap().unwrap();
 
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].size, b"version one".len() as u64);
@@ -1108,7 +1278,7 @@ mod tests {
         assert_eq!(blobs_after_first, blobs_after_second);
 
         // No-op, no new version recorded
-        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
     }
 
     #[test]
@@ -1120,7 +1290,7 @@ mod tests {
         put_bytes(&mut vault, "file", b"v3");
 
         assert_eq!(get_bytes(&vault, "file"), b"v3");
-        assert_eq!(vault.versions("file").unwrap().len(), 2);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 2);
     }
 
     #[test]
@@ -1149,7 +1319,7 @@ mod tests {
         // After revert: active = "v1", versions = ["v2"]
         assert_eq!(get_bytes(&vault, "file"), b"v1");
 
-        let versions = vault.versions("file").unwrap();
+        let versions = vault.versions("file").unwrap().unwrap();
 
         assert_eq!(versions.len(), 1);
 
@@ -1187,7 +1357,7 @@ mod tests {
 
         // One chunk purged (the "old content" chunk)
         assert!(blobs_after < blobs_before);
-        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
         assert_eq!(get_bytes(&vault, "file"), b"new content");
     }
 
@@ -1255,7 +1425,7 @@ mod tests {
             "file",
             &[chunk_a.clone(), chunk_b.clone()].concat(),
         );
-        // v2 = [A, C] (active), v1 = [A, B] (history) — chunk A is shared between the two
+        // v2 = [A, C] (active), v1 = [A, B] (history), chunk A is shared between the two
         put_bytes(&mut vault, "file", &[chunk_a.clone(), chunk_c].concat());
 
         vault.trash("file").unwrap();
@@ -1298,7 +1468,7 @@ mod tests {
 
         // v1 is now active
         assert_eq!(get_bytes(&vault, "file"), b"v1");
-        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
     }
 
     #[test]
@@ -1340,7 +1510,7 @@ mod tests {
             vault.detach_version("file", 0, "other"),
             Err(Error::AlreadyExists)
         ));
-        assert_eq!(vault.versions("file").unwrap().len(), 1);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 1);
     }
 
     #[test]
@@ -1353,10 +1523,10 @@ mod tests {
         vault.detach_version("file", 0, "file_v1").unwrap();
 
         // Version was removed from source
-        assert_eq!(vault.versions("file").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
 
         // Detached entry has no history of its own
-        assert_eq!(vault.versions("file_v1").unwrap().len(), 0);
+        assert_eq!(vault.versions("file_v1").unwrap().unwrap().len(), 0);
 
         // Both paths are independently readable
         assert_eq!(get_bytes(&vault, "file"), b"v2");
@@ -1403,8 +1573,8 @@ mod tests {
 
         assert_eq!(get_bytes(&vault, "file_v2"), b"v2");
         assert_eq!(get_bytes(&vault, "file"), b"v1");
-        assert_eq!(vault.versions("file").unwrap().len(), 0);
-        assert_eq!(vault.versions("file_v2").unwrap().len(), 0);
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
+        assert_eq!(vault.versions("file_v2").unwrap().unwrap().len(), 0);
     }
 
     #[test]
@@ -1431,7 +1601,7 @@ mod tests {
         vault.trash("file").unwrap();
         vault.detach_version_current("file", "renamed").unwrap();
 
-        assert_eq!(vault.list(), &["renamed"]);
+        assert_eq!(vault.list().unwrap(), &["renamed"]);
         assert_eq!(get_bytes(&vault, "renamed"), b"data");
     }
 
@@ -1481,9 +1651,9 @@ mod tests {
 
         vault.trash("file.txt").unwrap();
 
-        assert!(vault.list().is_empty());
+        assert!(vault.list().unwrap().is_empty());
         assert!(!vault.storage.list(Kind::Blobs).unwrap().is_empty());
-        assert_eq!(vault.list_trash(), vec!["file.txt"]);
+        assert_eq!(vault.list_trash().unwrap(), vec!["file.txt"]);
     }
 
     #[test]
@@ -1496,7 +1666,7 @@ mod tests {
         vault.restore("file.txt").unwrap();
 
         assert_eq!(get_bytes(&vault, "file.txt"), b"data");
-        assert!(vault.list_trash().is_empty());
+        assert!(vault.list_trash().unwrap().is_empty());
     }
 
     #[test]
@@ -1512,7 +1682,7 @@ mod tests {
 
         vault.purge("2.txt").unwrap();
 
-        assert!(vault.list_trash().is_empty());
+        assert!(vault.list_trash().unwrap().is_empty());
         assert!(vault.storage.list(Kind::Blobs).unwrap().len() < blobs_before_purge);
         assert_eq!(get_bytes(&vault, "1.txt"), b"keep this");
     }
@@ -1567,8 +1737,8 @@ mod tests {
         let removed = vault.cleanup().unwrap();
 
         assert_eq!(removed, 2); // 1 chunk each
-        assert!(vault.list_trash().is_empty());
-        assert!(vault.list().is_empty());
+        assert!(vault.list_trash().unwrap().is_empty());
+        assert!(vault.list().unwrap().is_empty());
     }
 
     #[test]
@@ -1584,7 +1754,7 @@ mod tests {
         vault.cleanup().unwrap();
 
         assert_eq!(vault.storage.list(Kind::Blobs).unwrap().len(), 0);
-        assert!(vault.list().is_empty());
+        assert!(vault.list().unwrap().is_empty());
     }
 
     #[test]
@@ -1595,7 +1765,7 @@ mod tests {
 
         vault.delete("file.txt").unwrap();
 
-        assert!(vault.list_trash().is_empty());
+        assert!(vault.list_trash().unwrap().is_empty());
 
         // file is permanently removed and cannot be restored
         assert!(vault.restore("file.txt").is_err());
@@ -1611,7 +1781,7 @@ mod tests {
         // This shouldn't return `Error::AlreadyTrashed`
         vault.delete("file.txt").unwrap();
 
-        assert!(vault.list_trash().is_empty());
+        assert!(vault.list_trash().unwrap().is_empty());
 
         // file is permanently removed and cannot be restored
         assert!(vault.restore("file.txt").is_err());
@@ -1667,7 +1837,7 @@ mod tests {
         {
             let identity = make_identity(&words);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "persistant.txt", b"persistent data");
         }
@@ -1675,10 +1845,105 @@ mod tests {
         {
             let identity = make_identity(&words);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "persistant.txt"), b"persistent data");
         }
+    }
+
+    #[test]
+    fn accessing_one_path_does_not_load_an_unrelated_shard() {
+        let path = temp_storage_path("unrelated_shard");
+        let words = make_words();
+
+        let shard_a = Index::shard_of("a");
+        let mut other_path = String::from("b");
+        let mut i = 0;
+
+        // Find a path guaranteed to land in a different shard than "a"
+        while Index::shard_of(&other_path) == shard_a {
+            other_path = format!("b{}", i);
+            i += 1;
+        }
+
+        {
+            let identity = make_identity(&words);
+            let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+            let mut vault = Vault::open(identity, storage);
+
+            put_bytes(&mut vault, "a", b"a data");
+            put_bytes(&mut vault, &other_path, b"other data");
+        }
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        // Fresh session, nothing loaded yet
+        assert!(!reopened.index.borrow().is_loaded(shard_a));
+        assert!(
+            !reopened
+                .index
+                .borrow()
+                .is_loaded(Index::shard_of(&other_path))
+        );
+
+        assert_eq!(get_bytes(&reopened, "a"), b"a data");
+
+        // Only "a"'s shard got loaded; the other path's shard is untouched
+        assert!(reopened.index.borrow().is_loaded(shard_a));
+        assert!(
+            !reopened
+                .index
+                .borrow()
+                .is_loaded(Index::shard_of(&other_path))
+        );
+    }
+
+    #[test]
+    fn only_dirty_shard_is_rewritten() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"a data");
+
+        let shard_a = Index::shard_of("a");
+        let mut other_path = String::from("b");
+        let mut i = 0;
+
+        // Find a path guaranteed to land in a different shard than "a"
+        while Index::shard_of(&other_path) == shard_a {
+            other_path = format!("b{}", i);
+            i += 1;
+        }
+
+        put_bytes(&mut vault, &other_path, b"other data");
+
+        let blob_a_before = vault.storage.get(Key::Index(shard_a)).unwrap();
+
+        put_bytes(&mut vault, &other_path, b"updated other data"); // Only touches its own shard
+
+        let blob_a_after = vault.storage.get(Key::Index(shard_a)).unwrap();
+
+        // "a"'s shard was never marked dirty on the second put
+        assert_eq!(blob_a_before, blob_a_after);
+        assert_eq!(get_bytes(&vault, &other_path), b"updated other data");
+    }
+
+    #[test]
+    fn empty_shard_is_deleted_from_storage() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "solo", b"only entry");
+
+        let shard = Index::shard_of("solo");
+
+        assert!(vault.storage.exists(Key::Index(shard)).unwrap());
+
+        vault.delete("solo").unwrap();
+
+        // No entries left in that shard, so its blob should be removed entirely rather than kept
+        // around as an empty encrypted shell
+        assert!(!vault.storage.exists(Key::Index(shard)).unwrap());
     }
 
     #[test]
@@ -1705,21 +1970,52 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "file", b"important data");
 
-        let entry = vault.manifest.entries.get("file").unwrap();
-        let address = entry.chunks[0].address;
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entries.get("file").unwrap().chunks[0].address
+        };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_signing_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
         let tampared = vault.verify_all();
 
         assert!(tampared.contains(&"file".into()));
+    }
+
+    #[test]
+    fn verify_all_tampered_index_shard() {
+        let path = temp_storage_path("verify_all_tampered_index_shard");
+        let words = make_words();
+        let identity = make_identity(&words);
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
+        let mut vault = Vault::open(identity, storage);
+
+        put_bytes(&mut vault, "file", b"important data");
+
+        let shard = Index::shard_of("file");
+
+        // The shard is already cached in memory from the `put` above; `verify_all` must still
+        // catch tampering of the on-disk copy rather than trusting the cache.
+        assert!(vault.index.borrow().is_loaded(shard));
+
+        let mut blob = vault.storage.get(Key::Index(shard)).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        overwrite_bytes(&path, &public_signing_key, Key::Index(shard), &blob);
+
+        let tampered = vault.verify_all();
+
+        assert!(tampered.iter().any(|t| t.contains("index shard")));
     }
 
     #[test]
@@ -1729,17 +2025,20 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "secret.txt", b"secret");
 
-        let entry = vault.manifest.entries.get("secret.txt").unwrap();
-        let address = entry.chunks[0].address;
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entries.get("secret.txt").unwrap().chunks[0].address
+        };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_signing_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
         let mut buf = Vec::new();
         let result = vault.get("secret.txt", &mut buf);
@@ -1754,20 +2053,23 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "trashed.txt", b"will be trashed");
 
         vault.trash("trashed.txt").unwrap();
 
         // Corrupt the trashed chunk
-        let entry = vault.manifest.entries.get("trashed.txt").unwrap();
-        let address = entry.chunks[0].address;
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entries.get("trashed.txt").unwrap().chunks[0].address
+        };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_signing_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
         let tampared = vault.verify_all();
 
@@ -1781,21 +2083,31 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
         let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
 
         put_bytes(&mut vault, "large", &data);
 
         // Corrupt both chunks
-        let entry = vault.manifest.entries.get("large").unwrap();
-        let chunks = &entry.chunks;
+        let addresses: Vec<[u8; 32]> = {
+            let index = vault.index.borrow();
 
-        for chunk in chunks {
-            let mut blob = vault.storage.get(Key::Blob(chunk.address)).unwrap();
+            index
+                .entries
+                .get("large")
+                .unwrap()
+                .chunks
+                .iter()
+                .map(|c| c.address)
+                .collect()
+        };
+
+        for address in addresses {
+            let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
             blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-            overwrite_bytes(&path, &public_signing_key, &chunk.address, &blob);
+            overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
         }
 
         let tampared = vault.verify_all();
@@ -1811,18 +2123,21 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "file1", b"shared content");
         put_bytes(&mut vault, "file2", b"shared content");
 
-        let entry = vault.manifest.entries.get("file1").unwrap();
-        let address = entry.chunks[0].address;
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entries.get("file1").unwrap().chunks[0].address
+        };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_signing_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
         let tampared = vault.verify_all();
 
@@ -1837,20 +2152,23 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage).unwrap();
+        let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "file", b"v0");
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
 
         // Corrupt the v1 (previous version) chunk
-        let entry = vault.manifest.entries.get("file").unwrap();
-        let address = entry.versions[0].chunks[0].address; // Version 1
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entries.get("file").unwrap().versions[0].chunks[0].address // Version 1
+        };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
         blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
 
-        overwrite_bytes(&path, &public_signing_key, &address, &blob);
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
         let tampered = vault.verify_all();
 
@@ -1867,7 +2185,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "user1.txt", b"this data belongs to user 1");
         }
@@ -1875,7 +2193,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
             let mut buf = Vec::new();
 
             // User2 cannot access user1's data
@@ -1948,7 +2266,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file", b"same content");
         }
@@ -1956,7 +2274,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file", b"same content");
         }
@@ -1964,7 +2282,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file"), b"same content");
         }
@@ -1972,7 +2290,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file"), b"same content");
         }
@@ -1987,7 +2305,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file1", b"same content");
         }
@@ -1995,7 +2313,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file2", b"same content");
         }
@@ -2003,7 +2321,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file1"), b"same content");
         }
@@ -2011,7 +2329,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file2"), b"same content");
         }
@@ -2026,7 +2344,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file", b"different content 1");
         }
@@ -2034,7 +2352,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let mut vault = Vault::open(identity, storage).unwrap();
+            let mut vault = Vault::open(identity, storage);
 
             put_bytes(&mut vault, "file", b"different content 2");
         }
@@ -2042,7 +2360,7 @@ mod tests {
         {
             let identity = make_identity(&words1);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file"), b"different content 1");
         }
@@ -2050,7 +2368,7 @@ mod tests {
         {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
-            let vault = Vault::open(identity, storage).unwrap();
+            let vault = Vault::open(identity, storage);
 
             assert_eq!(get_bytes(&vault, "file"), b"different content 2");
         }

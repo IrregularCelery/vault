@@ -1,6 +1,6 @@
 //! Vault server.
 //!
-//! Accepts incoming transport connections and serves blob and manifest operations.
+//! Accepts incoming transport connections and serves blob and index operations.
 
 mod acceptor;
 

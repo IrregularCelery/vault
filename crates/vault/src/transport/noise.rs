@@ -1,4 +1,4 @@
-//! The Noise Protocol Framework (https://noiseprotocol.org/noise.html)
+//! The [Noise Protocol Framework](https://noiseprotocol.org/noise.html)
 //!
 //!   XX:
 //!     -> e

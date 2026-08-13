@@ -15,7 +15,7 @@ pub enum Error {
     /// A transport-level failure.
     Transport(transport::Error),
 
-    /// A blob or manifest storage operation failed.
+    /// A blob or index shard storage operation failed.
     Storage(storage::Error),
 
     /// A binary serialization or deserialization error.
