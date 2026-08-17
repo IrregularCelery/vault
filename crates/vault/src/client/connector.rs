@@ -45,6 +45,7 @@ impl From<vault::Error> for Error {
     }
 }
 
+// TODO: Rename to Client and rename Client to something else.
 /// A successfully connected and authenticated client.
 ///
 /// Wraps a [`Vault`] backed by a [`remote::Storage`] over the established transport.

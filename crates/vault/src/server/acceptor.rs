@@ -55,6 +55,9 @@ pub struct Server {
 
     /// Root directory under which per-user storage directories are created.
     storage_root: PathBuf,
+    // TODO: capabilities: Capabilities
+    // Contains things such as an indicator showing whether the blobs and indices are on separate
+    // storages.
 }
 
 impl Server {
