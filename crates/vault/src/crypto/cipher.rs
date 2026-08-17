@@ -1,5 +1,5 @@
-//! This module provides AEAD encryption (ChaCha20-Poly1305) and signature-bound blob locking
-//! to detect tampering.
+//! AEAD encryption (ChaCha20-Poly1305) and signature-bound blob locking primitives for detecting
+//! tampering.
 //!
 //! Encrypted blobs are as follows (locked):
 //!   `[ 64-byte signature ] + [ 12-byte nonce ] + [ ciphertext ] + [ 16-byte tag ]`

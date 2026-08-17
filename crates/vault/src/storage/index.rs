@@ -31,11 +31,13 @@
 //!     [8-byte]             modified (u64)
 //!     [8-byte]             trashed (u64, 0 = live, unix timestapms = trashed)
 
-use crate::{crypto::cipher, storage::SHARD_COUNT};
+use crate::{
+    crypto::{cipher, hash},
+    storage::SHARD_COUNT,
+};
 
 use gate::{
     codec::binary,
-    crypto::blake3,
     sys::{collections::btree_map::BTreeMap, string::String, time, vec::Vec},
 };
 
@@ -209,7 +211,7 @@ impl Index {
         // TODO: This should probably be derived using user's private key too.
         // Or maybe not? Let's say an attacker knows that path `something/file` would be stored
         // in shard `5`; So what? Many other path also belong to the same shard. Is this a leak?
-        let hash = blake3::derive_key(DOMAIN_SHARD, path.as_bytes());
+        let hash = hash::derive_key(DOMAIN_SHARD, path.as_bytes());
         let n = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
 
         (n % SHARD_COUNT as u32) as u16
@@ -475,7 +477,7 @@ impl Index {
     ///
     /// Computed as `BLAKE3(context=DOMAIN_INDEX, public_signing_key)`.
     pub fn address(public_signing_key: &[u8; 32]) -> [u8; 32] {
-        blake3::derive_key(DOMAIN_INDEX, public_signing_key)
+        hash::derive_key(DOMAIN_INDEX, public_signing_key)
     }
 
     /// Serializes the entries belonging to `shard` into the binary format described in

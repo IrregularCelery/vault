@@ -6,10 +6,12 @@
 //!
 //! The mnemonic itself IS the credential.
 
+use crate::crypto::hash;
+
 use gate::{
     crypto::{
         argon2::{Algorithm, Argon2, Params, Version},
-        bip39, blake3,
+        bip39,
         ed25519::{Signature, Signer, SigningKey, Verifier, VerifyingKey},
         x25519::{PublicKey, StaticSecret},
     },
@@ -108,9 +110,9 @@ impl Identity {
     /// derived via BLAKE3 with distinct domain tags, ensuring they remain fully independent.
     pub fn from_seed(seed: &[u8; 64]) -> Self {
         // Three independent keys from one seed, separated by distinct domain tags.
-        let encryption_key = blake3::derive_key(DOMAIN_ENCRYPTION, seed);
-        let signing_seed = blake3::derive_key(DOMAIN_SIGNING, seed);
-        let exchange_seed = blake3::derive_key(DOMAIN_EXCHANGE, seed);
+        let encryption_key = hash::derive_key(DOMAIN_ENCRYPTION, seed);
+        let signing_seed = hash::derive_key(DOMAIN_SIGNING, seed);
+        let exchange_seed = hash::derive_key(DOMAIN_EXCHANGE, seed);
 
         let private_signing_key = SigningKey::from_bytes(&signing_seed);
         let public_signing_key = private_signing_key.verifying_key();

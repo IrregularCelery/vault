@@ -3,10 +3,9 @@
 //! Large files are split into fixed-size chunks of up to [`CHUNK_SIZE`] bytes (4 MiB).
 //! Each chunk gets an independent content-derived address and a unique per-chunk encryption key.
 
-use gate::{
-    crypto::blake3,
-    sys::{io, macros::vec, vec::Vec},
-};
+use crate::crypto::hash;
+
+use gate::sys::{io, macros::vec, vec::Vec};
 
 /// Maximum size of a single chunk in bytes (4 MiB).
 pub const CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -52,7 +51,7 @@ impl<'a> Chunk<'a> {
     /// Computed as `BLAKE3(key=encryption_key, chunk_data)`. Keying with the user's encryption key
     /// prevents cross-user address collisions for identical plaintext content.
     pub fn address(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
-        *blake3::keyed_hash(encryption_key, self.data).as_bytes()
+        hash::keyed_hash(encryption_key, self.data)
     }
 
     /// Derives a unique per-chunk encryption key.
@@ -61,12 +60,12 @@ impl<'a> Chunk<'a> {
     /// The domain tag distinguishes this key from the address hash, ensuring the two are
     /// independent even though they are derived from the same plaintext.
     pub fn key(&self, encryption_key: &[u8; 32]) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_keyed(encryption_key);
+        let mut hasher = hash::Hasher::new_keyed(encryption_key);
 
         hasher.update(DOMAIN_CHUNK_KEY);
         hasher.update(self.data);
 
-        *hasher.finalize().as_bytes()
+        hasher.finalize()
     }
 }
 

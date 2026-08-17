@@ -2,13 +2,13 @@
 //!
 //! Each method serializes a [`Request`], sends it, and deserializes the [`Response`].
 
-use gate::sys::{macros::format, vec::Vec};
-
 use crate::{
     protocol::{request::Request, response::Response},
     storage::{Backend, Error, Key, Kind},
     transport,
 };
+
+use gate::sys::{macros::format, vec::Vec};
 
 /// A storage backend that delegates all operations to a remote server.
 pub struct Storage<T: transport::Backend> {
