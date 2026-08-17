@@ -20,7 +20,14 @@ use crate::{
     },
 };
 
-use gate::sys::{borrow::Cow, io, macros::format, string::String, time, vec::Vec};
+use gate::sys::{
+    borrow::Cow,
+    io,
+    macros::format,
+    string::{String, ToString},
+    time,
+    vec::Vec,
+};
 
 /// Errors from vault-level file operations.
 #[derive(Debug)]
@@ -699,7 +706,7 @@ impl<S: storage::Backend> Vault<S> {
             .entries
             .iter()
             .filter(|(_, v)| v.trashed == 0)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_string())
             .collect();
 
         paths.sort();
@@ -723,7 +730,7 @@ impl<S: storage::Backend> Vault<S> {
             .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_string())
             .collect();
 
         paths.sort();
@@ -820,7 +827,7 @@ impl<S: storage::Backend> Vault<S> {
 
         for (path, entry) in &index.entries {
             if self.verify_entry_chunks(path, &entry.chunks).is_err() {
-                tampered.push(path.clone());
+                tampered.push(path.to_string());
             }
 
             for (i, version) in entry.versions.iter().enumerate() {

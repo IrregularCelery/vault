@@ -29,7 +29,7 @@
 //!       [8-byte]           modified
 //!     [8-byte]             size (u64)
 //!     [8-byte]             modified (u64)
-//!     [8-byte]             trashed (u64, 0 = live, unix timestapms = trashed)
+//!     [8-byte]             trashed (u64, 0 = live, unix timestamps = trashed)
 
 use crate::{
     crypto::{cipher, hash},
@@ -38,7 +38,12 @@ use crate::{
 
 use gate::{
     codec::binary,
-    sys::{collections::btree_map::BTreeMap, string::String, time, vec::Vec},
+    sys::{
+        collections::{btree_map::BTreeMap, btree_set::BTreeSet},
+        rc::Rc,
+        time,
+        vec::Vec,
+    },
 };
 
 /// Binary format version tag written at the start of every serialized shard.
@@ -64,7 +69,7 @@ pub enum Error {
     /// The requested path does not exist in the index.
     NotFound,
 
-    /// The requested version index doesn not exist for an entry.
+    /// The requested version index does not exist for an entry.
     VersionNotFound,
 
     /// A [`Index::rename`] was attempted onto a new path that already has an entry.
@@ -184,7 +189,11 @@ impl Entry {
 pub struct Index {
     /// All tracked file entries currently loaded, keyed by their virtual path (e.g.
     /// `"photos/image.png"`). Includes both live and trashed entries, across every loaded shard.
-    pub entries: BTreeMap<String, Entry>,
+    pub entries: BTreeMap<Rc<str>, Entry>,
+
+    /// Reverse index of paths assigned to shards. Mirrors `entries`'s keys, scoped by shard.
+    /// Only exists as a derived lookup cache, never serialized.
+    shard_paths: BTreeMap<u16, BTreeSet<Rc<str>>>,
 
     /// Shards that have been loaded from storage and are therefore fully represented in
     /// [`Index::entries`].
@@ -200,6 +209,7 @@ impl Index {
     pub fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            shard_paths: BTreeMap::new(),
             // `loaded` and `dirty` are only ever as big as `SHARD_COUNT`
             loaded: Vec::with_capacity(SHARD_COUNT as usize),
             dirty: Vec::with_capacity(SHARD_COUNT as usize),
@@ -219,10 +229,7 @@ impl Index {
 
     /// Returns whether `shard` currently has no entries.
     pub fn is_shard_empty(&self, shard: u16) -> bool {
-        !self
-            .entries
-            .keys()
-            .any(|path| Self::shard_of(path) == shard)
+        !self.shard_paths.contains_key(&shard)
     }
 
     /// Marks `shard` as loaded. This should only be called once `shard`'s entries have been merged
@@ -259,7 +266,10 @@ impl Index {
     /// Overwrites any existing entry without versioning. Must call [`Entry::push_version`] before
     /// inserting to preserve history. Internally marks the touched shard dirty.
     pub fn insert(&mut self, path: &str, entry: Entry) {
-        self.entries.insert(path.into(), entry);
+        let entry_path = Rc::from(path);
+
+        self.track_path(&entry_path);
+        self.entries.insert(entry_path, entry);
         self.mark_dirty(path);
     }
 
@@ -327,7 +337,13 @@ impl Index {
 
         let entry = self.entries.remove(old_path).ok_or(Error::NotFound)?;
 
-        self.entries.insert(new_path.into(), entry);
+        self.untrack_path(old_path);
+
+        let new_entry_path = Rc::from(new_path);
+
+        self.track_path(&new_entry_path);
+        self.entries.insert(new_entry_path, entry);
+
         self.mark_dirty(old_path);
         self.mark_dirty(new_path);
 
@@ -424,6 +440,7 @@ impl Index {
         }
 
         if let Some(entry) = self.entries.remove(path) {
+            self.untrack_path(path);
             self.mark_dirty(path);
 
             let referenced = self.addresses(); // Entry was already removed, so this excludes it
@@ -443,16 +460,17 @@ impl Index {
     /// Permanently removes all trashed entries and returns all now-unreferenced addresses.
     pub fn purge_all(&mut self) -> Vec<[u8; 32]> {
         let live = self.addresses_live();
-        let paths: Vec<String> = self
+        let paths: Vec<Rc<str>> = self
             .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
-            .map(|(k, _)| k.into())
+            .map(|(k, _)| Rc::clone(k))
             .collect();
         let mut purged = Vec::new();
 
         for path in paths {
             if let Some(entry) = self.entries.remove(&path) {
+                self.untrack_path(&path);
                 self.mark_dirty(&path);
 
                 let all = entry.chunks.into_iter().map(|c| c.address).chain(
@@ -487,13 +505,12 @@ impl Index {
     ///
     /// - [`Error::Codec`]: If serialization process fails (e.g., a path string's size exceeds u16).
     pub fn serialize_shard(&self, shard: u16) -> Result<Vec<u8>, Error> {
-        // TODO: This should be done in another way instead of iterating through everything to get
-        // the ones belonging to `shard`. Perhaps the `Index::entries` should store the shard
-        // number too?
-        let entries: Vec<(&String, &Entry)> = self
-            .entries
-            .iter()
-            .filter(|(path, _)| Self::shard_of(path) == shard)
+        let entries: Vec<(&Rc<str>, &Entry)> = self
+            .shard_paths
+            .get(&shard)
+            .into_iter()
+            .flat_map(|paths| paths.iter())
+            .filter_map(|path| self.entries.get_key_value(path))
             .collect();
 
         // Estimated size for each entry, 2 chunks, no versions
@@ -610,8 +627,11 @@ impl Index {
             let modified = reader.read_u64()?;
             let trashed = reader.read_u64()?;
 
+            let entry_path = Rc::from(path);
+
+            self.track_path(&entry_path);
             self.entries.insert(
-                path.into(),
+                entry_path,
                 Entry {
                     chunks,
                     versions,
@@ -662,6 +682,25 @@ impl Index {
         let unlocked = cipher::unlock(encryption_key, blob, verify)?;
 
         self.deserialize_shard(&unlocked)
+    }
+
+    fn track_path(&mut self, path: &Rc<str>) {
+        self.shard_paths
+            .entry(Self::shard_of(path))
+            .or_default()
+            .insert(Rc::clone(path));
+    }
+
+    fn untrack_path(&mut self, path: &str) {
+        let shard = Self::shard_of(path);
+
+        if let Some(paths) = self.shard_paths.get_mut(&shard) {
+            paths.remove(path);
+
+            if paths.is_empty() {
+                self.shard_paths.remove(&shard);
+            }
+        }
     }
 }
 
@@ -717,7 +756,10 @@ pub struct VersionProperties {
 mod tests {
     use super::*;
 
-    use gate::sys::macros::{format, vec};
+    use gate::sys::{
+        macros::{format, vec},
+        string::String,
+    };
 
     fn index() -> Index {
         let mut index = Index::new();
