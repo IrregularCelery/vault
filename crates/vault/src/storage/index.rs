@@ -189,7 +189,7 @@ impl Entry {
 pub struct Index {
     /// All tracked file entries currently loaded, keyed by their virtual path (e.g.
     /// `"photos/image.png"`). Includes both live and trashed entries, across every loaded shard.
-    pub entries: BTreeMap<Rc<str>, Entry>,
+    entries: BTreeMap<Rc<str>, Entry>,
 
     /// Reverse index of paths assigned to shards. Mirrors `entries`'s keys, scoped by shard.
     /// Only exists as a derived lookup cache, never serialized.
@@ -214,6 +214,36 @@ impl Index {
             loaded: Vec::with_capacity(SHARD_COUNT as usize),
             dirty: Vec::with_capacity(SHARD_COUNT as usize),
         }
+    }
+
+    /// Returns a reference to the entry at `path`, live or trashed, or `None` if absent.
+    pub fn entry(&self, path: &str) -> Option<&Entry> {
+        self.entries.get(path)
+    }
+
+    /// Returns a mutable reference to the entry at `path`, live or trashed, or `None` if absent.
+    pub fn entry_mut(&mut self, path: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(path)
+    }
+
+    /// Returns whether an entry (live or trashed) exists at `path`.
+    pub fn contains(&self, path: &str) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    /// Returns an iterator over all of the entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &Entry)> {
+        self.entries.iter()
+    }
+
+    /// Returns the number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether there are no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Deterministically assigns `path` to a shard in `0..SHARD_COUNT`.
@@ -684,6 +714,7 @@ impl Index {
         self.deserialize_shard(&unlocked)
     }
 
+    /// Registers `path` under its shard.
     fn track_path(&mut self, path: &Rc<str>) {
         self.shard_paths
             .entry(Self::shard_of(path))
@@ -691,6 +722,7 @@ impl Index {
             .insert(Rc::clone(path));
     }
 
+    /// Unregisters `path` from its shard.
     fn untrack_path(&mut self, path: &str) {
         let shard = Self::shard_of(path);
 

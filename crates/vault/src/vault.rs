@@ -197,7 +197,7 @@ impl<S: storage::Backend> Vault<S> {
             });
         }
 
-        if let Some(existing) = self.index.get_mut().entries.get_mut(path) {
+        if let Some(existing) = self.index.get_mut().entry_mut(path) {
             let existing_addresses: Vec<[u8; 32]> =
                 existing.chunks.iter().map(|c| c.address).collect();
             let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
@@ -219,7 +219,7 @@ impl<S: storage::Backend> Vault<S> {
         let chunk_count = entry_chunks.len();
         let modified = time::current_secs().unwrap_or(0);
 
-        if let Some(existing) = self.index.get_mut().entries.get_mut(path) {
+        if let Some(existing) = self.index.get_mut().entry_mut(path) {
             // Same `path`, different content, a new version.
             existing.push_version(entry_chunks, size, modified);
             // NOTE: It's debatable whether this should gracefully restore the `path`, or return
@@ -283,7 +283,7 @@ impl<S: storage::Backend> Vault<S> {
         let index = self.index.borrow();
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        Ok(index.entries.get(path).map(|e| {
+        Ok(index.entry(path).map(|e| {
             e.versions
                 .iter()
                 .enumerate()
@@ -319,7 +319,7 @@ impl<S: storage::Backend> Vault<S> {
         let index = self.index.borrow();
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entries.get(path).ok_or(Error::NotFound)?;
+        let entry = index.entry(path).ok_or(Error::NotFound)?;
         let version = entry
             .versions
             .get(version_index)
@@ -348,8 +348,7 @@ impl<S: storage::Backend> Vault<S> {
         let entry = self
             .index
             .get_mut()
-            .entries
-            .get_mut(path)
+            .entry_mut(path)
             .ok_or(Error::NotFound)?;
 
         if version_index >= entry.versions.len() {
@@ -423,7 +422,7 @@ impl<S: storage::Backend> Vault<S> {
         let index = self.index.get_mut();
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
+        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
             return self.delete(path);
@@ -477,12 +476,12 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.get_mut();
 
-        if index.entries.contains_key(new_path) {
+        if index.contains(new_path) {
             return Err(Error::AlreadyExists);
         }
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
+        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
 
         if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
@@ -526,17 +525,17 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.get_mut();
 
-        if index.entries.contains_key(new_path) {
+        if index.contains(new_path) {
             return Err(Error::AlreadyExists);
         }
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entries.get_mut(path).ok_or(Error::NotFound)?;
+        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
             index.rename(path, new_path)?;
 
-            if let Some(detached) = index.entries.get_mut(new_path) {
+            if let Some(detached) = index.entry_mut(new_path) {
                 // `detach` should always produce live entry at `new_path`
                 detached.trashed = 0;
 
@@ -703,7 +702,6 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.borrow();
         let mut paths: Vec<String> = index
-            .entries
             .iter()
             .filter(|(_, v)| v.trashed == 0)
             .map(|(k, _)| k.to_string())
@@ -727,7 +725,6 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.borrow();
         let mut paths: Vec<String> = index
-            .entries
             .iter()
             .filter(|(_, v)| v.trashed != 0)
             .map(|(k, _)| k.to_string())
@@ -753,7 +750,7 @@ impl<S: storage::Backend> Vault<S> {
         let index = self.index.borrow();
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        Ok(index.entries.get(path).map(|e| Properties {
+        Ok(index.entry(path).map(|e| Properties {
             chunk_count: e.chunks.len(),
             size: e.size,
             modified: e.modified,
@@ -776,7 +773,7 @@ impl<S: storage::Backend> Vault<S> {
         let index = self.index.borrow();
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entries.get(path).ok_or(Error::NotFound)?;
+        let entry = index.entry(path).ok_or(Error::NotFound)?;
 
         self.verify_entry_chunks(path, &entry.chunks)?;
 
@@ -825,7 +822,7 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.borrow();
 
-        for (path, entry) in &index.entries {
+        for (path, entry) in index.iter() {
             if self.verify_entry_chunks(path, &entry.chunks).is_err() {
                 tampered.push(path.to_string());
             }
@@ -1984,7 +1981,7 @@ mod tests {
         let address = {
             let index = vault.index.borrow();
 
-            index.entries.get("file").unwrap().chunks[0].address
+            index.entry("file").unwrap().chunks[0].address
         };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
@@ -2039,7 +2036,7 @@ mod tests {
         let address = {
             let index = vault.index.borrow();
 
-            index.entries.get("secret.txt").unwrap().chunks[0].address
+            index.entry("secret.txt").unwrap().chunks[0].address
         };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
@@ -2070,7 +2067,7 @@ mod tests {
         let address = {
             let index = vault.index.borrow();
 
-            index.entries.get("trashed.txt").unwrap().chunks[0].address
+            index.entry("trashed.txt").unwrap().chunks[0].address
         };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
@@ -2100,8 +2097,7 @@ mod tests {
             let index = vault.index.borrow();
 
             index
-                .entries
-                .get("large")
+                .entry("large")
                 .unwrap()
                 .chunks
                 .iter()
@@ -2138,7 +2134,7 @@ mod tests {
         let address = {
             let index = vault.index.borrow();
 
-            index.entries.get("file1").unwrap().chunks[0].address
+            index.entry("file1").unwrap().chunks[0].address
         };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
@@ -2169,7 +2165,7 @@ mod tests {
         let address = {
             let index = vault.index.borrow();
 
-            index.entries.get("file").unwrap().versions[0].chunks[0].address // Version 1
+            index.entry("file").unwrap().versions[0].chunks[0].address // Version 1
         };
         let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
 
