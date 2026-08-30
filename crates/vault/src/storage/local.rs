@@ -214,7 +214,7 @@ impl Backend for Storage {
     fn list(&self, kind: Kind) -> Result<Vec<Key>, Error> {
         match kind {
             Kind::Index => self.list_index_dir(),
-            Kind::Blobs => self.list_blobs_dir(),
+            Kind::Blob => self.list_blobs_dir(),
         }
     }
 }
@@ -335,7 +335,7 @@ mod tests {
         storage.put(key1, b"a").unwrap();
         storage.put(key2, b"b").unwrap();
 
-        let mut list = storage.list(Kind::Blobs).unwrap();
+        let mut list = storage.list(Kind::Blob).unwrap();
         let expected = vec![key1, key2];
 
         list.sort();
@@ -374,7 +374,7 @@ mod tests {
         storage.put(Key::Blob([9; 32]), b"blob data").unwrap();
         storage.put(Key::Index(69), b"shard data").unwrap();
 
-        assert_eq!(storage.list(Kind::Blobs).unwrap(), vec![Key::Blob([9; 32])]);
+        assert_eq!(storage.list(Kind::Blob).unwrap(), vec![Key::Blob([9; 32])]);
         assert_eq!(storage.list(Kind::Index).unwrap(), vec![Key::Index(69)]);
     }
 
@@ -395,7 +395,7 @@ mod tests {
         // Revoke all permissions so read_dir fails
         fs::set_permissions(&broken_dir, Permissions::from_mode(0o000)).unwrap();
 
-        let result = storage.list(Kind::Blobs);
+        let result = storage.list(Kind::Blob);
 
         // Restore permissions so we can delete the temporary directory after the test
         let _ = fs::set_permissions(&broken_dir, Permissions::from_mode(0o755));

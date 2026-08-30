@@ -187,7 +187,7 @@ mod tests {
             Request::Delete {
                 key: Key::Blob([3u8; 32]),
             },
-            Request::List { kind: Kind::Blobs },
+            Request::List { kind: Kind::Blob },
             Request::Put {
                 key: Key::Index(1),
                 data: &[4, 5],

@@ -120,7 +120,7 @@ pub enum Kind {
     Index,
 
     /// The category of all [`Key::Blob`]s.
-    Blobs,
+    Blob,
 }
 
 impl Kind {
@@ -128,7 +128,7 @@ impl Kind {
     pub fn write_to(&self, writer: &mut binary::Writer) {
         match self {
             Kind::Index => writer.write_u8(0),
-            Kind::Blobs => writer.write_u8(1),
+            Kind::Blob => writer.write_u8(1),
         }
     }
 
@@ -140,12 +140,13 @@ impl Kind {
     pub fn read_from(reader: &mut binary::Reader) -> Result<Self, binary::Error> {
         Ok(match reader.read_u8()? {
             0 => Kind::Index,
-            1 => Kind::Blobs,
+            1 => Kind::Blob,
             _ => return Err(binary::Error::Other("unknown `kind` tag discriminant")),
         })
     }
 }
 
+// TODO: Change the order to put/get/delete/list/exists
 /// Abstract interface for storage data persistence.
 ///
 /// [`Key::Index`] is mutable and is always overwritten.
