@@ -110,6 +110,20 @@ impl Key {
             }
         }
     }
+
+    /// Returns the [`Kind`] category this key belongs to.
+    pub fn kind(&self) -> Kind {
+        (*self).into()
+    }
+}
+
+impl From<Key> for Kind {
+    fn from(value: Key) -> Self {
+        match value {
+            Key::Index(_) => Kind::Index,
+            Key::Blob(_) => Kind::Blob,
+        }
+    }
 }
 
 /// Identifies a listable category of keys.
