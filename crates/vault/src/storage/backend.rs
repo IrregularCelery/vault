@@ -160,7 +160,6 @@ impl Kind {
     }
 }
 
-// TODO: Change the order to put/get/delete/list/exists
 /// Abstract interface for storage data persistence.
 ///
 /// [`Key::Index`] is mutable and is always overwritten.
