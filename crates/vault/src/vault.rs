@@ -280,10 +280,8 @@ impl<S: storage::Backend> Vault<S> {
     pub fn versions(&self, path: &str) -> Result<Option<Vec<VersionProperties>>, Error> {
         self.ensure_shard(Index::shard_of(path))?;
 
-        let index = self.index.borrow();
-
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        Ok(index.entry(path).map(|e| {
+        Ok(self.index.borrow().entry(path).map(|e| {
             e.versions
                 .iter()
                 .enumerate()
@@ -419,10 +417,12 @@ impl<S: storage::Backend> Vault<S> {
     pub fn drop_version_current(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_all_shards()?;
 
-        let index = self.index.get_mut();
-
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
+        let entry = self
+            .index
+            .get_mut()
+            .entry_mut(path)
+            .ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
             return self.delete(path);
@@ -434,9 +434,9 @@ impl<S: storage::Backend> Vault<S> {
         entry.size = latest_version.size;
         entry.modified = latest_version.modified;
 
-        index.mark_dirty(path);
+        self.index.get_mut().mark_dirty(path);
 
-        let referenced: Vec<[u8; 32]> = index.addresses();
+        let referenced: Vec<[u8; 32]> = self.index.get_mut().addresses();
         let addresses: Vec<[u8; 32]> = dropped_chunks
             .into_iter()
             .map(|c| c.address)
@@ -468,20 +468,22 @@ impl<S: storage::Backend> Vault<S> {
     pub fn detach_version(
         &mut self,
         path: &str,
-        version_index: usize,
         new_path: &str,
+        version_index: usize,
     ) -> Result<(), Error> {
         self.ensure_shard(Index::shard_of(path))?;
         self.ensure_shard(Index::shard_of(new_path))?;
 
-        let index = self.index.get_mut();
-
-        if index.contains(new_path) {
+        if self.index.get_mut().contains(new_path) {
             return Err(Error::AlreadyExists);
         }
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
+        let entry = self
+            .index
+            .get_mut()
+            .entry_mut(path)
+            .ok_or(Error::NotFound)?;
 
         if version_index >= entry.versions.len() {
             return Err(Error::VersionNotFound);
@@ -489,8 +491,8 @@ impl<S: storage::Backend> Vault<S> {
 
         let detached = entry.versions.remove(version_index);
 
-        index.mark_dirty(path);
-        index.insert(
+        self.index.get_mut().mark_dirty(path);
+        self.index.get_mut().insert(
             new_path,
             index::Entry {
                 chunks: detached.chunks,
@@ -523,23 +525,25 @@ impl<S: storage::Backend> Vault<S> {
         self.ensure_shard(Index::shard_of(path))?;
         self.ensure_shard(Index::shard_of(new_path))?;
 
-        let index = self.index.get_mut();
-
-        if index.contains(new_path) {
+        if self.index.get_mut().contains(new_path) {
             return Err(Error::AlreadyExists);
         }
 
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
+        let entry = self
+            .index
+            .get_mut()
+            .entry_mut(path)
+            .ok_or(Error::NotFound)?;
 
         if entry.versions.is_empty() {
-            index.rename(path, new_path)?;
+            self.index.get_mut().rename(path, new_path)?;
 
-            if let Some(detached) = index.entry_mut(new_path) {
+            if let Some(detached) = self.index.get_mut().entry_mut(new_path) {
                 // `detach` should always produce live entry at `new_path`
                 detached.trashed = 0;
 
-                index.mark_dirty(new_path);
+                self.index.get_mut().mark_dirty(new_path);
             }
 
             self.flush_index()?;
@@ -552,8 +556,8 @@ impl<S: storage::Backend> Vault<S> {
         let size = core::mem::replace(&mut entry.size, latest_version.size);
         let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
 
-        index.mark_dirty(path);
-        index.insert(
+        self.index.get_mut().mark_dirty(path);
+        self.index.get_mut().insert(
             new_path,
             index::Entry {
                 chunks,
@@ -700,8 +704,9 @@ impl<S: storage::Backend> Vault<S> {
     pub fn list(&self) -> Result<Vec<String>, Error> {
         self.ensure_all_shards()?;
 
-        let index = self.index.borrow();
-        let mut paths: Vec<String> = index
+        let mut paths: Vec<String> = self
+            .index
+            .borrow()
             .iter()
             .filter(|(_, v)| v.trashed == 0)
             .map(|(k, _)| k.to_string())
@@ -723,8 +728,9 @@ impl<S: storage::Backend> Vault<S> {
     pub fn list_trash(&self) -> Result<Vec<String>, Error> {
         self.ensure_all_shards()?;
 
-        let index = self.index.borrow();
-        let mut paths: Vec<String> = index
+        let mut paths: Vec<String> = self
+            .index
+            .borrow()
             .iter()
             .filter(|(_, v)| v.trashed != 0)
             .map(|(k, _)| k.to_string())
@@ -747,10 +753,8 @@ impl<S: storage::Backend> Vault<S> {
     pub fn properties(&self, path: &str) -> Result<Option<Properties>, Error> {
         self.ensure_shard(Index::shard_of(path))?;
 
-        let index = self.index.borrow();
-
         // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        Ok(index.entry(path).map(|e| Properties {
+        Ok(self.index.borrow().entry(path).map(|e| Properties {
             chunk_count: e.chunks.len(),
             size: e.size,
             modified: e.modified,
@@ -820,9 +824,7 @@ impl<S: storage::Backend> Vault<S> {
             }
         }
 
-        let index = self.index.borrow();
-
-        for (path, entry) in index.iter() {
+        for (path, entry) in self.index.borrow().iter() {
             if self.verify_entry_chunks(path, &entry.chunks).is_err() {
                 tampered.push(path.to_string());
             }
@@ -1011,6 +1013,217 @@ mod tests {
         },
     };
 
+    mod faulty {
+        use crate::storage;
+
+        use gate::sys::{io, macros::format, vec::Vec};
+
+        // 5 (operation: put/get/exists/delete/list) * 2 (kind: index/blob)
+        const OPERATION_COUNT: usize = 10;
+
+        #[derive(Debug, Clone, Copy)]
+        pub enum Operation {
+            Put,
+            Get,
+            Delete,
+            List,
+            Exists,
+        }
+
+        impl Operation {
+            fn slot(self, kind: storage::Kind) -> usize {
+                let op = match self {
+                    Operation::Put => 0,
+                    Operation::Get => 1,
+                    Operation::Delete => 2,
+                    Operation::List => 3,
+                    Operation::Exists => 4,
+                };
+                let k = match kind {
+                    storage::Kind::Index => 0,
+                    storage::Kind::Blob => 1,
+                };
+
+                op * 2 + k
+            }
+        }
+
+        pub struct Storage<I: storage::Backend> {
+            inner: I,
+            calls: [core::cell::Cell<usize>; OPERATION_COUNT],
+            faults: [core::cell::Cell<Option<usize>>; OPERATION_COUNT],
+        }
+
+        impl<I: storage::Backend> Storage<I> {
+            pub fn new(inner: I) -> Self {
+                Self {
+                    inner,
+                    calls: [const { core::cell::Cell::new(0) }; OPERATION_COUNT],
+                    faults: [const { core::cell::Cell::new(None) }; OPERATION_COUNT],
+                }
+            }
+
+            pub fn fail_nth(&self, operation: Operation, kind: storage::Kind, n: usize) {
+                let slot = operation.slot(kind);
+
+                self.calls[slot].set(0);
+                self.faults[slot].set(Some(n));
+            }
+
+            pub fn clear_faults(&self) {
+                self.faults.iter().for_each(|f| f.set(None));
+            }
+
+            fn should_fail(
+                &self,
+                operation: Operation,
+                kind: storage::Kind,
+            ) -> Result<(), storage::Error> {
+                let slot = operation.slot(kind);
+                let n = self.calls[slot].get() + 1;
+
+                self.calls[slot].set(n);
+
+                if self.faults[slot].get() == Some(n) {
+                    return Err(storage::Error::Other(
+                        format!("simulated storage failure for {:?} {:?}", operation, kind).into(),
+                    ));
+                }
+
+                Ok(())
+            }
+        }
+
+        impl<I: storage::Backend> storage::Backend for Storage<I> {
+            fn put(&self, key: storage::Key, data: &[u8]) -> Result<(), storage::Error> {
+                self.should_fail(Operation::Put, key.kind())?;
+                self.inner.put(key, data)
+            }
+
+            fn get(&self, key: storage::Key) -> Result<Vec<u8>, storage::Error> {
+                self.should_fail(Operation::Get, key.kind())?;
+                self.inner.get(key)
+            }
+
+            fn exists(&self, key: storage::Key) -> Result<bool, storage::Error> {
+                self.should_fail(Operation::Exists, key.kind())?;
+                self.inner.exists(key)
+            }
+
+            fn delete(&self, key: storage::Key) -> Result<(), storage::Error> {
+                self.should_fail(Operation::Delete, key.kind())?;
+                self.inner.delete(key)
+            }
+
+            fn list(&self, kind: storage::Kind) -> Result<Vec<storage::Key>, storage::Error> {
+                self.should_fail(Operation::List, kind)?;
+                self.inner.list(kind)
+            }
+        }
+
+        pub struct Reader<'a> {
+            data: &'a [u8],
+            position: usize,
+            fail_after_bytes: Option<usize>,
+        }
+
+        impl<'a> Reader<'a> {
+            pub fn new(data: &'a [u8]) -> Self {
+                Self {
+                    data,
+                    position: 0,
+                    fail_after_bytes: None,
+                }
+            }
+
+            pub fn fail_after_bytes(mut self, fail_after_bytes: usize) -> Self {
+                self.fail_after_bytes = Some(fail_after_bytes);
+
+                self
+            }
+        }
+
+        impl<'a> io::Read for Reader<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if let Some(fail_after_bytes) = self.fail_after_bytes
+                    && self.position >= fail_after_bytes
+                {
+                    return Err(io::Error::other("simulated I/O failure"));
+                }
+
+                let available = &self.data[self.position..];
+                let mut max_bytes = available.len();
+
+                if let Some(fail_after_bytes) = self.fail_after_bytes {
+                    max_bytes = max_bytes.min(fail_after_bytes - self.position);
+                }
+
+                let n = buf.len().min(max_bytes);
+
+                if n == 0 && !buf.is_empty() && self.fail_after_bytes.is_none() {
+                    return Ok(0); // EOF
+                }
+
+                buf[..n].copy_from_slice(&available[..n]);
+
+                self.position += n;
+
+                Ok(n)
+            }
+        }
+
+        pub struct Writer {
+            written: Vec<u8>,
+            fail_after_bytes: Option<usize>,
+        }
+
+        impl Writer {
+            pub fn new() -> Self {
+                Self {
+                    written: Vec::new(),
+                    fail_after_bytes: None,
+                }
+            }
+
+            pub fn fail_after_bytes(mut self, fail_after_bytes: usize) -> Self {
+                self.fail_after_bytes = Some(fail_after_bytes);
+
+                self
+            }
+        }
+
+        impl io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if let Some(fail_after_bytes) = self.fail_after_bytes {
+                    if self.written.len() >= fail_after_bytes {
+                        return Err(io::Error::other("simulated I/O failure"));
+                    }
+
+                    let max_bytes = fail_after_bytes - self.written.len();
+                    let n = buf.len().min(max_bytes);
+
+                    self.written.extend_from_slice(&buf[..n]);
+
+                    return Ok(n);
+                }
+
+                self.written.extend_from_slice(buf);
+
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if let Some(fail_after_bytes) = self.fail_after_bytes
+                    && self.written.len() >= fail_after_bytes
+                {
+                    return Err(io::Error::other("simulated I/O failure"));
+                }
+
+                Ok(())
+            }
+        }
+    }
+
     fn temp_storage_path(name: &str) -> PathBuf {
         let nanos = time::current_nanos().unwrap();
 
@@ -1032,6 +1245,16 @@ mod tests {
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
 
         Vault::open(identity, storage)
+    }
+
+    fn faulty_vault() -> (Vault<faulty::Storage<local::Storage>>, PathBuf, Vec<String>) {
+        let path = temp_storage_path("faulty");
+        let words = make_words();
+        let identity = make_identity(&words);
+        let inner = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let storage = faulty::Storage::new(inner);
+
+        (Vault::open(identity, storage), path, words)
     }
 
     fn put_bytes<B: storage::Backend>(vault: &mut Vault<B>, path: &str, data: &[u8]) {
@@ -1072,6 +1295,34 @@ mod tests {
 
         fs::write(&temp, data).unwrap();
         fs::rename(&temp, &path).unwrap();
+    }
+
+    // Finds a path that lands in the same index shard as `path`
+    fn same_shard_path(path: &str, base: &str) -> String {
+        let target = Index::shard_of(path);
+        let mut same = String::from(base);
+        let mut i = 0;
+
+        while Index::shard_of(&same) != target {
+            same = format!("{}{}", base, i);
+            i += 1;
+        }
+
+        same
+    }
+
+    // Finds a path that lands in a different index shard than `path`
+    fn other_shard_path(from_path: &str, base: &str) -> String {
+        let target = Index::shard_of(from_path);
+        let mut other = String::from(base);
+        let mut i = 0;
+
+        while Index::shard_of(&other) == target {
+            other = format!("{}{}", base, i);
+            i += 1;
+        }
+
+        other
     }
 
     #[test]
@@ -1160,6 +1411,45 @@ mod tests {
     }
 
     #[test]
+    fn put_get_empty_string_path_roundtrips() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "", b"empty string path");
+
+        assert_eq!(get_bytes(&vault, ""), b"empty string path");
+    }
+
+    #[test]
+    fn path_that_looks_like_traversal_is_treated_as_an_opaque_string_not_a_filesystem_path() {
+        let mut vault = vault();
+        let path = "../../../etc/passwd";
+
+        put_bytes(&mut vault, path, b"lol!");
+
+        assert_eq!(get_bytes(&vault, path), b"lol!");
+        assert!(vault.get("etc/passwd", &mut Vec::new()).is_err());
+        assert!(vault.get("/etc/passwd", &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn very_long_path_name_is_handled_gracefully() {
+        let mut vault = vault();
+        let path = "x".repeat(60_000); // safely under u16::MAX (65535), still huge
+
+        put_bytes(&mut vault, &path, b"data");
+
+        assert_eq!(get_bytes(&vault, &path), b"data");
+    }
+
+    #[test]
+    fn path_longer_than_u16_max_fails_gracefully_instead_of_panicking() {
+        let mut vault = vault();
+        let huge_path = "x".repeat(70_000); // exceeds the u16 path_len field in the shard format
+
+        assert!(vault.put(&huge_path, &b"data"[..], 4).is_err());
+    }
+
+    #[test]
     fn put_same_content_on_trashed_path_restores_it() {
         let mut vault = vault();
 
@@ -1184,6 +1474,254 @@ mod tests {
 
         assert_eq!(vault.list().unwrap(), vec!["file"]);
         assert_eq!(get_bytes(&vault, "file"), b"new content");
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn a_put_that_fails_to_flush_should_not_be_gettable_in_the_same_session() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.put("new_file", &b"content"[..], 7).is_err());
+        assert!(
+            vault.get("new_file", &mut Vec::new()).is_err(),
+            "since `put()` failed, the file should not be visible via `get()`."
+        )
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn failed_put_is_rolled_back() {
+        let (mut vault, path, words) = faulty_vault();
+
+        put_bytes(&mut vault, "a", b"first");
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.put("a", &b"second"[..], 6).is_err());
+
+        // Same vault session
+        assert_eq!(
+            get_bytes(&vault, "a"),
+            b"first",
+            "a failed `put()` should already be rolled back in the same vault session"
+        );
+
+        // Storage recovered
+        vault.storage.clear_faults();
+
+        // Touch a different shard to make sure nothing else touches "a" again. The failed write
+        // doesn't complete on its own
+        put_bytes(&mut vault, &other_shard_path("a", "another"), b"something");
+
+        // Still the same vault session
+        assert_eq!(
+            get_bytes(&vault, "a"),
+            b"first",
+            "a failed put() should be fully rolled back, not silently completed later by an \
+             unrelated flush"
+        );
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        // Vault re-opened
+        assert_eq!(get_bytes(&reopened, "a"), b"first",);
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn retrying_an_identical_put_after_a_failed_flush_in_the_same_session() {
+        let (mut vault, path, words) = faulty_vault();
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        // Even though this looks like a successful retry, if the in-memory index already
+        // (incorrectly) reflects the failed write, it might get treated as a no-op and skip the
+        // flushing entirely.
+        assert!(vault.put("file", &b"same content"[..], 12).is_err());
+
+        vault.storage.clear_faults();
+
+        assert!(
+            vault.put("file", &b"same content"[..], 12).is_ok(),
+            "the retry itself should not error"
+        );
+
+        // Because of the first put failing, the in-memory index thinks this "file" already exists
+        // in the vault, and the second put completely skips flushing the second successful put.
+        assert!(!vault.index.get_mut().contains("file")); // put for "file" should be rolled back
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        assert!(
+            reopened.get("file", &mut Vec::new()).is_ok(),
+            "after a successful-looking retry, the data must actually be durable on a fresh vault \
+             session, not just cached in the memory of the session that originally failed to \
+             flush it"
+        );
+        assert_eq!(get_bytes(&vault, "file"), b"some content");
+    }
+
+    #[test]
+    fn chunks_already_uploaded_before_a_failed_index_flush_are_not_re_uploaded_on_retry() {
+        let (mut vault, _path, _words) = faulty_vault();
+        let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.put("file", &data[..], data.len() as u64).is_err());
+
+        let blobs_after_failed_attempt = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(
+            blobs_after_failed_attempt, 2,
+            "the chunks should already be durably stored even though the index flush failed"
+        );
+
+        vault.storage.clear_faults();
+
+        put_bytes(&mut vault, "file", &data);
+
+        let blobs_after_retry = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(
+            blobs_after_retry, 2,
+            "retrying the put should reuse the already-uploaded chunk instead of duplicating it"
+        );
+    }
+
+    #[test]
+    fn put_surfaces_an_exists_check_failure_without_corrupting_index() {
+        let (mut vault, _path, _words) = faulty_vault();
+        let data = [vec![0xAAu8; CHUNK_SIZE], vec![0xBBu8; CHUNK_SIZE]].concat();
+
+        // Fail the exists-check for the second chunk
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Exists, Kind::Blob, 2);
+
+        assert!(vault.put("file", &data[..], data.len() as u64).is_err());
+
+        // The entry is only inserted into the index after all chunks are collected, so the path
+        // must not exist at all yet
+        assert!(vault.get("file", &mut Vec::new()).is_err());
+
+        // The first chunk should have been successfully uploaded
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 1);
+
+        vault.storage.clear_faults();
+
+        put_bytes(&mut vault, "file", &data);
+
+        assert_eq!(get_bytes(&vault, "file"), data);
+    }
+
+    #[test]
+    fn put_with_reader_that_fails_partway_does_not_corrupt_existing_data() {
+        let mut vault = vault();
+        let data = b"original content";
+
+        put_bytes(&mut vault, "file", data);
+
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 1);
+
+        let payload = vec![0x11u8; CHUNK_SIZE + 100]; // Two chunks
+
+        // A reader that fails partway through the second chunk
+        let reader = faulty::Reader::new(&payload).fail_after_bytes(CHUNK_SIZE + 10);
+
+        assert!(vault.put("file", reader, payload.len() as u64).is_err());
+
+        // Only one chunk managed to be uploaded successfully plus the one we already had
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 2);
+
+        // File should still be readable after a failed overwrite
+        assert_eq!(get_bytes(&vault, "file"), data);
+    }
+
+    #[test]
+    fn get_with_writer_that_fails_partway_is_error_and_leaves_storage_untouched() {
+        let mut vault = vault();
+        let data = vec![0x22u8; CHUNK_SIZE * 2];
+
+        put_bytes(&mut vault, "file", &data);
+
+        let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
+        let mut writer = faulty::Writer::new().fail_after_bytes(CHUNK_SIZE);
+
+        assert!(matches!(vault.get("file", &mut writer), Err(Error::Io(_))));
+
+        let blobs_after = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(blobs_before, blobs_after);
+        assert_eq!(get_bytes(&vault, "file"), data);
+    }
+
+    #[test]
+    fn get_with_multi_chunk_file_storage_read_failure() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        let data = vec![0xABu8; CHUNK_SIZE * 2];
+
+        put_bytes(&mut vault, "file", &data);
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Get, Kind::Blob, 2);
+
+        assert!(vault.get("file", &mut Vec::new()).is_err());
+
+        vault.storage.clear_faults();
+
+        assert_eq!(get_bytes(&vault, "file"), data);
+    }
+
+    #[test]
+    fn file_exactly_one_chunk_produces_exactly_one_chunk() {
+        let mut vault = vault();
+        let data = vec![0x11u8; CHUNK_SIZE];
+
+        put_bytes(&mut vault, "exactly one", &data);
+
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 1);
+        assert_eq!(get_bytes(&vault, "exactly one"), data);
+    }
+
+    #[test]
+    fn file_exactly_two_chunks_produces_exactly_two_chunks() {
+        let mut vault = vault();
+        let data = [vec![0x22u8; CHUNK_SIZE], vec![0x33u8; CHUNK_SIZE]].concat();
+
+        put_bytes(&mut vault, "exactly two", &data);
+
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 2);
+        assert_eq!(get_bytes(&vault, "exactly two"), data);
+    }
+
+    #[test]
+    fn file_one_byte_over_the_chunk_size_produces_two_chunks() {
+        let mut vault = vault();
+        let mut data = vec![0x44u8; CHUNK_SIZE];
+
+        data.push(0x55);
+
+        put_bytes(&mut vault, "over", &data);
+
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 2);
+        assert_eq!(get_bytes(&vault, "over"), data);
     }
 
     #[test]
@@ -1215,10 +1753,10 @@ mod tests {
         put_bytes(&mut vault, "file", b"only one version");
 
         // No previous versions exist yet
-        let mut buf = Vec::new();
-        let result = vault.get_version("file", 0, &mut buf);
-
-        assert!(matches!(result, Err(Error::VersionNotFound)));
+        assert!(matches!(
+            vault.get_version("file", 0, &mut Vec::new()),
+            Err(Error::VersionNotFound)
+        ));
     }
 
     #[test]
@@ -1455,6 +1993,30 @@ mod tests {
     }
 
     #[test]
+    fn drop_version_that_fails_to_flush_index_does_not_touch_blobs() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+
+        let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.drop_version("file", 0).is_err());
+
+        let blobs_after = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(
+            blobs_before, blobs_after,
+            "if the index flush failed, the (possibly still-referenced) blobs must not have been \
+             deleted"
+        );
+    }
+
+    #[test]
     fn drop_current() {
         let mut vault = vault();
 
@@ -1496,7 +2058,7 @@ mod tests {
         put_bytes(&mut vault, "file", b"original");
         put_bytes(&mut vault, "file", b"accidentally overwritten");
 
-        vault.detach_version("file", 0, "original").unwrap();
+        vault.detach_version("file", "original", 0).unwrap();
 
         assert_eq!(get_bytes(&vault, "original"), b"original");
         assert_eq!(get_bytes(&vault, "file"), b"accidentally overwritten");
@@ -1511,10 +2073,23 @@ mod tests {
         put_bytes(&mut vault, "other", b"already here");
 
         assert!(matches!(
-            vault.detach_version("file", 0, "other"),
+            vault.detach_version("file", "other", 0),
             Err(Error::AlreadyExists)
         ));
         assert_eq!(vault.versions("file").unwrap().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn detach_version_new_path_equal_to_source_is_already_exists() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+
+        assert!(matches!(
+            vault.detach_version("file", "file", 0),
+            Err(Error::AlreadyExists)
+        ));
     }
 
     #[test]
@@ -1524,7 +2099,7 @@ mod tests {
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
 
-        vault.detach_version("file", 0, "file_v1").unwrap();
+        vault.detach_version("file", "file_v1", 0).unwrap();
 
         // Version was removed from source
         assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
@@ -1547,7 +2122,7 @@ mod tests {
         let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
 
         // Detach just references existing chunks, no new blobs written
-        vault.detach_version("file", 0, "detached").unwrap();
+        vault.detach_version("file", "detached", 0).unwrap();
 
         let blobs_after = vault.storage.list(Kind::Blob).unwrap().len();
 
@@ -1561,7 +2136,7 @@ mod tests {
         put_bytes(&mut vault, "file", b"data");
 
         assert!(matches!(
-            vault.detach_version("file", 0, "new"),
+            vault.detach_version("file", "new", 0),
             Err(Error::VersionNotFound)
         ));
     }
@@ -1625,6 +2200,19 @@ mod tests {
     }
 
     #[test]
+    fn detach_current_new_path_equal_to_source_is_already_exists() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+
+        assert!(matches!(
+            vault.detach_version_current("file", "file"),
+            Err(Error::AlreadyExists)
+        ));
+    }
+
+    #[test]
     fn rename() {
         let mut vault = vault();
 
@@ -1633,6 +2221,19 @@ mod tests {
         vault.rename("old/file", "new/file").unwrap();
 
         assert_eq!(get_bytes(&vault, "new/file"), b"data");
+    }
+
+    #[test]
+    fn rename_trashed_is_ok_and_keeps_it_trashed() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"data");
+
+        vault.trash("a").unwrap();
+
+        assert!(vault.rename("a", "b").is_ok());
+        assert!(vault.list_trash().unwrap().contains(&"b".to_string()));
+        assert!(vault.get("b", &mut Vec::new()).is_err());
     }
 
     #[test]
@@ -1645,6 +2246,69 @@ mod tests {
         assert!(matches!(vault.rename("a", "b"), Err(Error::AlreadyExists)));
         assert_eq!(get_bytes(&vault, "a"), b"a data");
         assert_eq!(get_bytes(&vault, "b"), b"b data");
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn rename_to_the_same_path_is_a_no_op() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"data");
+
+        assert!(vault.rename("file", "file").is_ok());
+        assert_eq!(get_bytes(&vault, "file"), b"data");
+    }
+
+    #[test]
+    fn rename_to_a_trashed_path_is_already_exists() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"data a");
+        put_bytes(&mut vault, "b", b"data b");
+
+        vault.trash("b").unwrap();
+
+        // Expected behavior
+        assert!(matches!(vault.rename("a", "b"), Err(Error::AlreadyExists)));
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn rename_across_shards_partial_flush_failure_should_not_lose_the_file() {
+        let (mut vault, path, words) = faulty_vault();
+
+        let old_path = "old/file";
+        let new_path = other_shard_path(old_path, "new/file");
+
+        put_bytes(&mut vault, old_path, b"data");
+
+        // `rename` marks two shards dirty, if the "moved from shard" becomes empty (delete),
+        // and the "moved to shard" is created (put), fail the put
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.rename(old_path, &new_path).is_err());
+
+        // FIXME: The in-memory index should probably be rolled back, right? Which means this
+        // assert should check `is_ok()` instead.
+        assert!(vault.get(old_path, &mut Vec::new()).is_err());
+        // assert!(vault.get(&new_path, &mut Vec::new()).is_err());
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        let old_survived = reopened.get(old_path, &mut Vec::new()).is_ok();
+        let new_survived = reopened.get(&new_path, &mut Vec::new()).is_ok();
+
+        assert!(
+            old_survived || new_survived,
+            "the file must survive a failed rename under some name (most likely the `old_path`) \
+             after reopening the vault; instead it vanished from both `{}` and `{}`",
+            old_path,
+            new_path
+        );
     }
 
     #[test]
@@ -1671,6 +2335,27 @@ mod tests {
 
         assert_eq!(get_bytes(&vault, "file.txt"), b"data");
         assert!(vault.list_trash().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_trash_and_restore_via_put_stays_consistent() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"same data");
+
+        for _ in 0..3 {
+            vault.trash("file").unwrap();
+
+            assert!(vault.get("file", &mut Vec::new()).is_err());
+
+            // Same path and content restores the file
+            put_bytes(&mut vault, "file", b"same data");
+
+            assert_eq!(get_bytes(&vault, "file"), b"same data");
+        }
+
+        // No versions are added because the put calls were just no-op restores
+        assert_eq!(vault.versions("file").unwrap().unwrap().len(), 0);
     }
 
     #[test]
@@ -1705,6 +2390,58 @@ mod tests {
         vault.restore("b").unwrap();
 
         assert_eq!(get_bytes(&vault, "b"), b"shared content");
+    }
+
+    #[test]
+    fn purge_that_fails_to_flush_index_does_not_touch_blobs() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        put_bytes(&mut vault, "file", b"data");
+
+        vault.trash("file").unwrap();
+
+        let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
+
+        // Here we do `Delete` beucase there is only the one entry and purging it causes its shard
+        // to be deleted, not put/overwrite
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Delete, Kind::Index, 1);
+
+        assert!(vault.purge("file").is_err());
+
+        let blobs_after = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(
+            blobs_before, blobs_after,
+            "if the index flush failed, the blobs must remain untouched"
+        );
+    }
+
+    #[test]
+    fn purge_blob_delete_failure_after_successful_flush_still_leaves_the_index_consistent() {
+        let (mut vault, path, words) = faulty_vault();
+
+        put_bytes(&mut vault, "file", b"data");
+
+        vault.trash("file").unwrap();
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Delete, Kind::Blob, 1);
+
+        assert!(vault.purge("file").is_err());
+
+        // The index itself should already have been flushed successfully, so the entry should be
+        // gone even though the underlying blob is now unreferenced
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        // The blob still exists in the storage though it's unreferenced
+        assert_eq!(reopened.storage.list(Kind::Blob).unwrap().len(), 1);
+        assert!(reopened.list_trash().unwrap().is_empty());
+        assert!(reopened.get("file", &mut Vec::new()).is_err());
     }
 
     #[test]
@@ -1759,6 +2496,39 @@ mod tests {
 
         assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 0);
         assert!(vault.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_stops_deleting_blobs_on_first_failure_leaving_the_rest_unreferenced() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        put_bytes(&mut vault, "a", b"aaaa");
+        put_bytes(&mut vault, "b", b"bbbb");
+
+        vault.trash("a").unwrap();
+        vault.trash("b").unwrap();
+
+        let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
+
+        assert_eq!(blobs_before, 2);
+
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Delete, Kind::Blob, 1);
+
+        assert!(vault.cleanup().is_err());
+
+        // Index side is already durable (flushed before any deletion attempt).
+        assert!(vault.list_trash().unwrap().is_empty());
+
+        let blobs_after = vault.storage.list(Kind::Blob).unwrap().len();
+
+        // At least one blob should have failed to delete and been left behind; this is a harmless
+        // storage leak (the index no longer points at it)
+        assert!(
+            blobs_after >= 1,
+            "expected at least one unreferenced blob left behind after the injected delete failure"
+        );
     }
 
     #[test]
@@ -1818,9 +2588,7 @@ mod tests {
     #[test]
     fn not_found() {
         let vault = vault();
-        let mut buf = Vec::new();
-
-        let got = vault.get("nonexistent.txt", &mut buf);
+        let got = vault.get("nonexistent.txt", &mut Vec::new());
 
         assert!(matches!(got, Err(Error::NotFound)));
     }
@@ -1861,14 +2629,7 @@ mod tests {
         let words = make_words();
 
         let shard_a = Index::shard_of("a");
-        let mut other_path = String::from("b");
-        let mut i = 0;
-
-        // Find a path guaranteed to land in a different shard than "a"
-        while Index::shard_of(&other_path) == shard_a {
-            other_path = format!("b{}", i);
-            i += 1;
-        }
+        let other_path = other_shard_path("a", "b");
 
         {
             let identity = make_identity(&words);
@@ -1911,14 +2672,7 @@ mod tests {
         put_bytes(&mut vault, "a", b"a data");
 
         let shard_a = Index::shard_of("a");
-        let mut other_path = String::from("b");
-        let mut i = 0;
-
-        // Find a path guaranteed to land in a different shard than "a"
-        while Index::shard_of(&other_path) == shard_a {
-            other_path = format!("b{}", i);
-            i += 1;
-        }
+        let other_path = other_shard_path("a", "b");
 
         put_bytes(&mut vault, &other_path, b"other data");
 
@@ -1948,6 +2702,191 @@ mod tests {
         // No entries left in that shard, so its blob should be removed entirely rather than kept
         // around as an empty encrypted shell
         assert!(!vault.storage.exists(Key::Index(shard)).unwrap());
+    }
+
+    #[test]
+    fn shard_is_not_deleted_when_it_still_contains_other_entries() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"data a");
+
+        let file2 = same_shard_path("a", "b");
+
+        put_bytes(&mut vault, &file2, b"data b");
+
+        let shard = Index::shard_of("a");
+
+        assert_eq!(shard, Index::shard_of(&file2));
+        assert!(vault.storage.exists(Key::Index(shard)).unwrap());
+
+        vault.delete("a").unwrap();
+
+        // The shard still contains `b`, so its underlying blob must not be deleted
+        assert!(vault.storage.exists(Key::Index(shard)).unwrap());
+        assert_eq!(get_bytes(&vault, &file2), b"data b");
+
+        vault.delete(&file2).unwrap();
+
+        assert!(!vault.storage.exists(Key::Index(shard)).unwrap());
+    }
+
+    #[test]
+    fn rename_within_the_same_shard_preserves_data() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "old_name", b"data");
+
+        let other = same_shard_path("old_name", "other");
+
+        put_bytes(&mut vault, &other, b"other data");
+
+        let new_name = same_shard_path("old_name", "new_name");
+
+        vault.rename("old_name", &new_name).unwrap();
+
+        assert!(vault.get("old_name", &mut Vec::new()).is_err());
+        assert_eq!(get_bytes(&vault, &new_name), b"data");
+
+        // The other in the same shard must remain intact
+        assert_eq!(get_bytes(&vault, &other), b"other data");
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn failed_delete_in_shared_shard_leaves_other_entries_intact() {
+        let (mut vault, path, words) = faulty_vault();
+
+        put_bytes(&mut vault, "a", b"data 1");
+
+        let b = same_shard_path("a", "b");
+
+        put_bytes(&mut vault, &b, b"data 2");
+
+        // Deleting `a` requires a `Put` to rewrite the shard (since `b` keeps it alive).
+        // We force that rewrite to fail
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 1);
+
+        assert!(vault.delete("a").is_err());
+
+        // The in-memory index should roll back. Both files should still be accessible.
+        assert_eq!(get_bytes(&vault, "a"), b"data 1");
+        assert_eq!(get_bytes(&vault, &b), b"data 2");
+
+        // Verify persistence after reopening
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        assert_eq!(get_bytes(&reopened, "a"), b"data 1");
+        assert_eq!(get_bytes(&reopened, &b), b"data 2");
+    }
+
+    #[test]
+    fn verify_clean_file() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "clean", b"all good, mate!");
+
+        assert!(vault.verify("clean").is_ok());
+    }
+
+    #[test]
+    fn verify_nonexistent_path_is_not_found() {
+        let vault = vault();
+
+        assert!(matches!(vault.verify("nonexistent"), Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn verify_detects_tampering() {
+        let path = temp_storage_path("verify_active_tamper");
+        let words = make_words();
+        let identity = make_identity(&words);
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
+        let mut vault = Vault::open(identity, storage);
+
+        put_bytes(&mut vault, "file", b"trust me");
+
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entry("file").unwrap().chunks[0].address
+        };
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
+
+        assert!(matches!(vault.verify("file"), Err(Error::Tampered(_))));
+    }
+
+    #[test]
+    fn verify_detects_tampering_in_a_version() {
+        let path = temp_storage_path("verify_version_tamper");
+        let words = make_words();
+        let identity = make_identity(&words);
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
+        let mut vault = Vault::open(identity, storage);
+
+        put_bytes(&mut vault, "file", b"v1");
+        put_bytes(&mut vault, "file", b"v2");
+
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entry("file").unwrap().versions[0].chunks[0].address
+        };
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
+
+        assert!(matches!(vault.verify("file"), Err(Error::Tampered(_))));
+    }
+
+    #[test]
+    fn verify_includes_trashed_entries() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"data");
+
+        vault.trash("file").unwrap();
+
+        // Should still verify the trashed entry rather than reporting NotFound
+        assert!(vault.verify("file").is_ok());
+    }
+
+    #[ignore = "needs to be fixed"]
+    #[test]
+    fn verify_a_dangling_chunk_reference_is_reported_as_tampered_not_not_found() {
+        let mut vault = vault();
+        let data = [
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xBBu8; CHUNK_SIZE],
+            vec![0xCCu8; CHUNK_SIZE],
+        ]
+        .concat();
+
+        put_bytes(&mut vault, "file", &data);
+
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entry("file").unwrap().chunks[0].address
+        };
+
+        vault.storage.delete(Key::Blob(address)).unwrap();
+
+        assert!(matches!(vault.verify("file"), Err(Error::Tampered(_))));
+
+        // A genuinely nonexistent path is still reported distinctly
+        assert!(matches!(vault.verify("nonexistent"), Err(Error::NotFound)));
     }
 
     #[test]
@@ -2044,10 +2983,10 @@ mod tests {
 
         overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
-        let mut buf = Vec::new();
-        let result = vault.get("secret.txt", &mut buf);
-
-        assert!(matches!(result, Err(Error::Tampered(_))));
+        assert!(matches!(
+            vault.get("secret.txt", &mut Vec::new()),
+            Err(Error::Tampered(_))
+        ));
     }
 
     #[test]
@@ -2180,6 +3119,53 @@ mod tests {
     }
 
     #[test]
+    fn swapping_a_chunk_address_to_point_at_a_different_real_blob_fails_decryption_rather_than_silently_returning_wrong_data()
+     {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "a", b"data a");
+        put_bytes(&mut vault, "b", b"data b");
+
+        let address_b = {
+            let index = vault.index.borrow();
+
+            index.entry("b").unwrap().chunks[0].address
+        };
+
+        {
+            let mut index = vault.index.borrow_mut();
+
+            index.entry_mut("a").unwrap().chunks[0].address = address_b;
+        }
+
+        let result = vault.get("a", &mut Vec::new());
+
+        assert!(
+            matches!(result, Err(Error::Cipher(_))),
+            "reading through a swapped chunk address must fail loudly via AEAD/signature \
+             verification, not silently return the wrong file's bytes; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn corrupting_the_encrypted_chunk_key_fails_decryption_cleanly() {
+        let mut vault = vault();
+
+        put_bytes(&mut vault, "file", b"some secret bytes");
+
+        {
+            let mut index = vault.index.borrow_mut();
+
+            index.entry_mut("file").unwrap().chunks[0].encrypted_key[5] ^= 0xFF;
+        }
+
+        let result = vault.get("file", &mut Vec::new());
+
+        assert!(matches!(result, Err(Error::Cipher(_))), "got {:?}", result);
+    }
+
+    #[test]
     fn wrong_key() {
         let path = temp_storage_path("wrongkey");
         let words1 = make_words();
@@ -2197,10 +3183,9 @@ mod tests {
             let identity = make_identity(&words2);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let vault = Vault::open(identity, storage);
-            let mut buf = Vec::new();
 
             // User2 cannot access user1's data
-            assert!(vault.get("user1.txt", &mut buf).is_err());
+            assert!(vault.get("user1.txt", &mut Vec::new()).is_err());
         }
     }
 

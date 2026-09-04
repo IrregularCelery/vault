@@ -751,6 +751,7 @@ impl PartialEq for Index {
 }
 
 /// File entry metadata.
+#[derive(Debug, PartialEq)]
 pub struct Properties {
     /// Number of content-addressed chunks in the active revision.
     pub chunk_count: usize,
