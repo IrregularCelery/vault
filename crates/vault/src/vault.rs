@@ -199,58 +199,76 @@ impl<S: storage::Backend> Vault<S> {
 
         let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
 
-        // A genuine no-op. Identical content already live at `path`.
-        if let Some(existing) = self.index.get_mut().entry(path) {
-            let existing_addresses: Vec<[u8; 32]> =
-                existing.chunks.iter().map(|c| c.address).collect();
+        enum Action {
+            NoOp,
+            Restore,
+            NewVersion,
+            Insert,
+        }
 
-            if existing_addresses == new_addresses && existing.trashed == 0 {
-                return Ok(0);
+        let action = match self.index.get_mut().entry(path) {
+            Some(existing) => {
+                let existing_addresses: Vec<[u8; 32]> =
+                    existing.chunks.iter().map(|c| c.address).collect();
+
+                if existing_addresses == new_addresses {
+                    if existing.trashed == 0 {
+                        Action::NoOp
+                    } else {
+                        Action::Restore
+                    }
+                } else {
+                    Action::NewVersion
+                }
             }
+            None => Action::Insert,
+        };
+
+        if matches!(action, Action::NoOp) {
+            return Ok(0);
         }
 
         let chunk_count = entry_chunks.len();
         let modified = time::current_secs().unwrap_or(0);
 
-        self.mutate_and_flush(&[path], move |index| {
-            if let Some(existing) = index.entry_mut(path) {
-                let existing_addresses: Vec<[u8; 32]> =
-                    existing.chunks.iter().map(|c| c.address).collect();
+        self.mutate_and_flush(&[path], move |index| match action {
+            Action::NoOp => unreachable!("returned early above"),
+            Action::Restore => {
+                let existing = index.entry_mut(path).expect("already checked above");
 
-                // Same `path`, same existing content, not a new version.
-                // If the `path` is trashed, restore it
-                if existing_addresses == new_addresses {
-                    existing.trashed = 0;
+                existing.trashed = 0;
 
-                    index.mark_dirty(path);
+                index.mark_dirty(path);
 
-                    return Ok(0);
-                }
-
-                // Same `path`, different content, a new version.
+                Ok(0)
+            }
+            Action::NewVersion => {
+                let existing = index.entry_mut(path).expect("already checked above");
 
                 existing.push_version(entry_chunks, size, modified);
+
                 // NOTE: It's debatable whether this should gracefully restore the `path`, or return
                 // an error instead.
                 existing.trashed = 0;
 
                 index.mark_dirty(path);
 
-                return Ok(chunk_count);
+                Ok(chunk_count)
             }
+            Action::Insert => {
+                index.insert(
+                    path,
+                    index::Entry {
+                        chunks: entry_chunks,
+                        versions: Vec::new(),
+                        size,
+                        modified,
+                        trashed: 0,
+                    },
+                );
 
-            index.insert(
-                path,
-                index::Entry {
-                    chunks: entry_chunks,
-                    versions: Vec::new(),
-                    size,
-                    modified,
-                    trashed: 0,
-                },
-            );
-
-            Ok(chunk_count)
+                Ok(chunk_count)
+            }
         })
     }
 
@@ -1037,15 +1055,15 @@ impl<S: storage::Backend> Vault<S> {
         paths: &[&str],
         mutate: impl FnOnce(&mut Index) -> Result<T, index::Error>,
     ) -> Result<T, Error> {
-        let snapshots: Vec<(String, Option<index::Entry>)> = paths
+        let snapshots: Vec<(&str, Option<index::Entry>)> = paths
             .iter()
-            .map(|p| (p.to_string(), self.index.get_mut().entry(p).cloned()))
+            .map(|&p| (p, self.index.get_mut().entry(p).cloned()))
             .collect();
         let value = mutate(self.index.get_mut())?;
 
         if let Err(e) = self.flush_index() {
             for (path, snapshot) in snapshots {
-                self.index.get_mut().restore_entry(&path, snapshot);
+                self.index.get_mut().restore_entry(path, snapshot);
             }
 
             return Err(e);
