@@ -197,21 +197,14 @@ impl<S: storage::Backend> Vault<S> {
             });
         }
 
-        if let Some(existing) = self.index.get_mut().entry_mut(path) {
+        let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
+
+        // A genuine no-op. Identical content already live at `path`.
+        if let Some(existing) = self.index.get_mut().entry(path) {
             let existing_addresses: Vec<[u8; 32]> =
                 existing.chunks.iter().map(|c| c.address).collect();
-            let new_addresses: Vec<[u8; 32]> = entry_chunks.iter().map(|c| c.address).collect();
 
-            // Same `path`, same existing content, not a new version.
-            // If the `path` is trashed, restore it
-            if existing_addresses == new_addresses {
-                if existing.trashed != 0 {
-                    existing.trashed = 0;
-
-                    self.index.get_mut().mark_dirty(path);
-                    self.flush_index()?;
-                }
-
+            if existing_addresses == new_addresses && existing.trashed == 0 {
                 return Ok(0);
             }
         }
@@ -219,32 +212,46 @@ impl<S: storage::Backend> Vault<S> {
         let chunk_count = entry_chunks.len();
         let modified = time::current_secs().unwrap_or(0);
 
-        if let Some(existing) = self.index.get_mut().entry_mut(path) {
-            // Same `path`, different content, a new version.
-            existing.push_version(entry_chunks, size, modified);
-            // NOTE: It's debatable whether this should gracefully restore the `path`, or return
-            // an error instead.
-            existing.trashed = 0;
+        self.mutate_and_flush(&[path], move |index| {
+            if let Some(existing) = index.entry_mut(path) {
+                let existing_addresses: Vec<[u8; 32]> =
+                    existing.chunks.iter().map(|c| c.address).collect();
 
-            self.index.get_mut().mark_dirty(path);
-            self.flush_index()?;
+                // Same `path`, same existing content, not a new version.
+                // If the `path` is trashed, restore it
+                if existing_addresses == new_addresses {
+                    existing.trashed = 0;
 
-            return Ok(chunk_count);
-        }
+                    index.mark_dirty(path);
 
-        self.index.get_mut().insert(
-            path,
-            index::Entry {
-                chunks: entry_chunks,
-                versions: Vec::new(),
-                size,
-                modified,
-                trashed: 0,
-            },
-        );
-        self.flush_index()?;
+                    return Ok(0);
+                }
 
-        Ok(chunk_count)
+                // Same `path`, different content, a new version.
+
+                existing.push_version(entry_chunks, size, modified);
+                // NOTE: It's debatable whether this should gracefully restore the `path`, or return
+                // an error instead.
+                existing.trashed = 0;
+
+                index.mark_dirty(path);
+
+                return Ok(chunk_count);
+            }
+
+            index.insert(
+                path,
+                index::Entry {
+                    chunks: entry_chunks,
+                    versions: Vec::new(),
+                    size,
+                    modified,
+                    trashed: 0,
+                },
+            );
+
+            Ok(chunk_count)
+        })
     }
 
     /// Decrypts and streams the current version of `path` into `writer` then returns the total
@@ -280,7 +287,6 @@ impl<S: storage::Backend> Vault<S> {
     pub fn versions(&self, path: &str) -> Result<Option<Vec<VersionProperties>>, Error> {
         self.ensure_shard(Index::shard_of(path))?;
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
         Ok(self.index.borrow().entry(path).map(|e| {
             e.versions
                 .iter()
@@ -316,7 +322,6 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.borrow();
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
         let entry = index.entry(path).ok_or(Error::NotFound)?;
         let version = entry
             .versions
@@ -342,33 +347,29 @@ impl<S: storage::Backend> Vault<S> {
     pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
         self.ensure_shard(Index::shard_of(path))?;
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = self
-            .index
-            .get_mut()
-            .entry_mut(path)
-            .ok_or(Error::NotFound)?;
+        self.mutate_and_flush(&[path], |index| {
+            let entry = index.entry_mut(path).ok_or(index::Error::NotFound)?;
 
-        if version_index >= entry.versions.len() {
-            return Err(Error::VersionNotFound);
-        }
+            if version_index >= entry.versions.len() {
+                return Err(index::Error::VersionNotFound);
+            }
 
-        let current = index::Version {
-            chunks: core::mem::take(&mut entry.chunks),
-            size: entry.size,
-            modified: entry.modified,
-        };
-        let target = entry.versions.remove(version_index);
+            let current = index::Version {
+                chunks: core::mem::take(&mut entry.chunks),
+                size: entry.size,
+                modified: entry.modified,
+            };
+            let target = entry.versions.remove(version_index);
 
-        entry.chunks = target.chunks;
-        entry.size = target.size;
-        entry.modified = target.modified;
-        entry.versions.push(current);
+            entry.chunks = target.chunks;
+            entry.size = target.size;
+            entry.modified = target.modified;
+            entry.versions.push(current);
 
-        self.index.get_mut().mark_dirty(path);
-        self.flush_index()?;
+            index.mark_dirty(path);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Permanently drops a historical version and deletes its now-unreferenced blobs.
@@ -387,12 +388,8 @@ impl<S: storage::Backend> Vault<S> {
     pub fn drop_version(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
         self.ensure_all_shards()?;
 
-        let dropped = self.index.get_mut().drop_version(path, version_index)?;
-
-        // Persist the index before deleting the blobs. If a delete fails partway, or
-        // the process dies right here, the worst case is an unreferenced blob, never a live entry
-        // pointing at a chunk that no longer exists.
-        self.flush_index()?;
+        let dropped =
+            self.mutate_and_flush(&[path], |index| index.drop_version(path, version_index))?;
 
         for address in dropped {
             self.storage.delete(Key::Blob(address))?;
@@ -417,35 +414,38 @@ impl<S: storage::Backend> Vault<S> {
     pub fn drop_version_current(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_all_shards()?;
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = self
+        let has_no_versions = self
             .index
-            .get_mut()
-            .entry_mut(path)
-            .ok_or(Error::NotFound)?;
+            .borrow()
+            .entry(path)
+            .ok_or(Error::NotFound)?
+            .versions
+            .is_empty();
 
-        if entry.versions.is_empty() {
+        if has_no_versions {
             return self.delete(path);
         }
 
-        let latest_version = entry.versions.remove(entry.versions.len() - 1);
-        let dropped_chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
+        let dropped_chunks = self.mutate_and_flush(&[path], |index| {
+            let entry = index.entry_mut(path).ok_or(index::Error::NotFound)?;
+            let latest_version = entry.versions.remove(entry.versions.len() - 1);
+            let dropped_chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
 
-        entry.size = latest_version.size;
-        entry.modified = latest_version.modified;
+            entry.size = latest_version.size;
+            entry.modified = latest_version.modified;
 
-        self.index.get_mut().mark_dirty(path);
+            index.mark_dirty(path);
 
-        let referenced: Vec<[u8; 32]> = self.index.get_mut().addresses();
-        let addresses: Vec<[u8; 32]> = dropped_chunks
-            .into_iter()
-            .map(|c| c.address)
-            .filter(|a| !referenced.contains(a))
-            .collect();
+            let referenced: Vec<[u8; 32]> = index.addresses();
 
-        self.flush_index()?;
+            Ok(dropped_chunks
+                .into_iter()
+                .map(|c| c.address)
+                .filter(|a| !referenced.contains(a))
+                .collect::<Vec<[u8; 32]>>())
+        })?;
 
-        for address in addresses {
+        for address in dropped_chunks {
             self.storage.delete(Key::Blob(address))?;
         }
 
@@ -474,38 +474,33 @@ impl<S: storage::Backend> Vault<S> {
         self.ensure_shard(Index::shard_of(path))?;
         self.ensure_shard(Index::shard_of(new_path))?;
 
-        if self.index.get_mut().contains(new_path) {
-            return Err(Error::AlreadyExists);
-        }
+        self.mutate_and_flush(&[path, new_path], |index| {
+            if index.contains(new_path) {
+                return Err(index::Error::AlreadyExists);
+            }
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = self
-            .index
-            .get_mut()
-            .entry_mut(path)
-            .ok_or(Error::NotFound)?;
+            let entry = index.entry_mut(path).ok_or(index::Error::NotFound)?;
 
-        if version_index >= entry.versions.len() {
-            return Err(Error::VersionNotFound);
-        }
+            if version_index >= entry.versions.len() {
+                return Err(index::Error::VersionNotFound);
+            }
 
-        let detached = entry.versions.remove(version_index);
+            let detached = entry.versions.remove(version_index);
 
-        self.index.get_mut().mark_dirty(path);
-        self.index.get_mut().insert(
-            new_path,
-            index::Entry {
-                chunks: detached.chunks,
-                versions: Vec::new(),
-                size: detached.size,
-                modified: detached.modified,
-                trashed: 0,
-            },
-        );
+            index.mark_dirty(path);
+            index.insert(
+                new_path,
+                index::Entry {
+                    chunks: detached.chunks,
+                    versions: Vec::new(),
+                    size: detached.size,
+                    modified: detached.modified,
+                    trashed: 0,
+                },
+            );
 
-        self.flush_index()?;
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Moves the active version of `path` to `new_path` and makees the most recent historical
@@ -525,56 +520,47 @@ impl<S: storage::Backend> Vault<S> {
         self.ensure_shard(Index::shard_of(path))?;
         self.ensure_shard(Index::shard_of(new_path))?;
 
-        if self.index.get_mut().contains(new_path) {
-            return Err(Error::AlreadyExists);
-        }
-
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
-        let entry = self
-            .index
-            .get_mut()
-            .entry_mut(path)
-            .ok_or(Error::NotFound)?;
-
-        if entry.versions.is_empty() {
-            self.index.get_mut().rename(path, new_path)?;
-
-            if let Some(detached) = self.index.get_mut().entry_mut(new_path) {
-                // `detach` should always produce live entry at `new_path`
-                detached.trashed = 0;
-
-                self.index.get_mut().mark_dirty(new_path);
+        self.mutate_and_flush(&[path, new_path], |index| {
+            if index.contains(new_path) {
+                return Err(index::Error::AlreadyExists);
             }
 
-            self.flush_index()?;
+            let entry = index.entry_mut(path).ok_or(index::Error::NotFound)?;
 
-            return Ok(());
-        }
+            if entry.versions.is_empty() {
+                index.rename(path, new_path)?;
 
-        let latest_version = entry.versions.remove(entry.versions.len() - 1);
-        let chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
-        let size = core::mem::replace(&mut entry.size, latest_version.size);
-        let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
+                if let Some(detached) = index.entry_mut(new_path) {
+                    detached.trashed = 0;
+                    index.mark_dirty(new_path);
+                }
 
-        self.index.get_mut().mark_dirty(path);
-        self.index.get_mut().insert(
-            new_path,
-            index::Entry {
-                chunks,
-                versions: Vec::new(),
-                size,
-                modified,
-                trashed: 0,
-            },
-        );
+                return Ok(());
+            }
 
-        self.flush_index()?;
+            let latest_version = entry.versions.remove(entry.versions.len() - 1);
+            let chunks = core::mem::replace(&mut entry.chunks, latest_version.chunks);
+            let size = core::mem::replace(&mut entry.size, latest_version.size);
+            let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
 
-        Ok(())
+            index.mark_dirty(path);
+            index.insert(
+                new_path,
+                index::Entry {
+                    chunks,
+                    versions: Vec::new(),
+                    size,
+                    modified,
+                    trashed: 0,
+                },
+            );
+
+            Ok(())
+        })
     }
 
     /// Renames `old_path` to `new_path` in the index. Index manipulation only, no blobs are
-    /// touched.
+    /// touched. A no-op if both `old_path` and `new_path` are identical.
     ///
     /// # Errors
     ///
@@ -584,12 +570,15 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     /// - [`Error::Tampered`]: If a touched index shard's signature is invalid.
     pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error> {
+        if old_path == new_path {
+            return Ok(());
+        }
+
         self.ensure_shard(Index::shard_of(old_path))?;
         self.ensure_shard(Index::shard_of(new_path))?;
-        self.index.get_mut().rename(old_path, new_path)?;
-        self.flush_index()?;
-
-        Ok(())
+        self.mutate_and_flush(&[old_path, new_path], |index| {
+            index.rename(old_path, new_path)
+        })
     }
 
     /// Soft-deletes `path`, moving it to the trash. Blobs are retained and the entry can be
@@ -604,10 +593,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_shard(Index::shard_of(path))?;
-        self.index.get_mut().trash(path)?;
-        self.flush_index()?;
-
-        Ok(())
+        self.mutate_and_flush(&[path], |index| index.trash(path))
     }
 
     /// Recovers a trashed entry, making it live again.
@@ -621,10 +607,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_shard(Index::shard_of(path))?;
-        self.index.get_mut().restore(path)?;
-        self.flush_index()?;
-
-        Ok(())
+        self.mutate_and_flush(&[path], |index| index.restore(path))
     }
 
     /// Permanently removes a trashed entry and deletes its blobs if no longer referenced by any
@@ -641,9 +624,7 @@ impl<S: storage::Backend> Vault<S> {
     pub fn purge(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_all_shards()?;
 
-        let addresses = self.index.get_mut().purge(path)?;
-
-        self.flush_index()?;
+        let addresses = self.mutate_and_flush(&[path], |index| index.purge(path))?;
 
         for address in addresses {
             self.storage.delete(Key::Blob(address))?;
@@ -662,10 +643,17 @@ impl<S: storage::Backend> Vault<S> {
     pub fn cleanup(&mut self) -> Result<usize, Error> {
         self.ensure_all_shards()?;
 
-        let addresses = self.index.get_mut().purge_all();
-        let removed = addresses.len();
+        let trashed_path: Vec<String> = self
+            .index
+            .borrow()
+            .iter()
+            .filter(|(_, v)| v.trashed != 0)
+            .map(|(k, _)| k.to_string())
+            .collect();
+        let path_refs: Vec<&str> = trashed_path.iter().map(|s| s.as_str()).collect();
 
-        self.flush_index()?;
+        let addresses = self.mutate_and_flush(&path_refs, |index| Ok(index.purge_all()))?;
+        let removed = addresses.len();
 
         for address in addresses {
             self.storage.delete(Key::Blob(address))?;
@@ -684,11 +672,19 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Tampered`]: If an index shard's signature is invalid.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
         self.ensure_shard(Index::shard_of(path))?;
-        self.index.get_mut().trash(path).or_else(|e| match e {
-            index::Error::AlreadyTrashed => Ok(()),
-            other => Err(other),
+
+        let addresses = self.mutate_and_flush(&[path], |index| {
+            match index.trash(path) {
+                Ok(()) | Err(index::Error::AlreadyTrashed) => {}
+                Err(other) => return Err(other),
+            }
+
+            index.purge(path)
         })?;
-        self.purge(path)?;
+
+        for address in addresses {
+            self.storage.delete(Key::Blob(address))?;
+        }
 
         Ok(())
     }
@@ -753,7 +749,6 @@ impl<S: storage::Backend> Vault<S> {
     pub fn properties(&self, path: &str) -> Result<Option<Properties>, Error> {
         self.ensure_shard(Index::shard_of(path))?;
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
         Ok(self.index.borrow().entry(path).map(|e| Properties {
             chunk_count: e.chunks.len(),
             size: e.size,
@@ -776,7 +771,6 @@ impl<S: storage::Backend> Vault<S> {
 
         let index = self.index.borrow();
 
-        // Direct `entries` get instead of `Index::get()` so the trashed entries are included
         let entry = index.entry(path).ok_or(Error::NotFound)?;
 
         self.verify_entry_chunks(path, &entry.chunks)?;
@@ -926,7 +920,16 @@ impl<S: storage::Backend> Vault<S> {
                 .as_slice()
                 .try_into()
                 .map_err(|_| Error::Other("wrong size chunk encryption key was found".into()))?;
-            let blob = self.storage.get(Key::Blob(chunk.address))?;
+            let blob = self
+                .storage
+                .get(Key::Blob(chunk.address))
+                .map_err(|e| match e {
+                    storage::Error::NotFound => Error::Tampered(format!(
+                        "{}: referenced chunk is missing from storage",
+                        path
+                    )),
+                    other => Error::Storage(other),
+                })?;
             let plaintext = cipher::unlock(&key, &blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
             })
@@ -952,7 +955,16 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Tampered`]: If signature verification fails.
     fn verify_entry_chunks(&self, path: &str, chunks: &[index::EntryChunk]) -> Result<(), Error> {
         for chunk in chunks {
-            let blob = self.storage.get(Key::Blob(chunk.address))?;
+            let blob = self
+                .storage
+                .get(Key::Blob(chunk.address))
+                .map_err(|e| match e {
+                    storage::Error::NotFound => Error::Tampered(format!(
+                        "{}: referenced chunk is missing from storage",
+                        path
+                    )),
+                    other => Error::Storage(other),
+                })?;
 
             cipher::verify_signature(&blob, |message, signature_bytes| {
                 self.identity.verify(message, signature_bytes)
@@ -975,10 +987,21 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Storage`]: If writing or deleting a shard fails.
     /// - [`Error::Index`]: If a shard's encryption or serialization fails.
     fn flush_index(&mut self) -> Result<(), Error> {
-        // FIXME: This isn't atomic!
-        for shard in self.index.get_mut().take_dirty() {
+        let dirty = self.index.get_mut().dirty_shards();
+        let mut to_delete = Vec::new();
+
+        // Writes before deletes: if something below fails partway through, we want to have failed
+        // before removing anything, not after. A partially-failed flush can leave old and new
+        // content briefly existing on disk until the next successful flush, but it should never
+        // lose data.
+        //
+        // Each shard's dirty flag is only cleared once it's actually confirmed persisted (or
+        // deleted); if a call below fails, every shard not yet reached, including the one that
+        // just failed, stays marked dirty, so the next `flush_index()` call retries exactly what
+        // didn't make it, instead of silently forgetting about it.
+        for shard in dirty {
             if self.index.get_mut().is_shard_empty(shard) {
-                self.storage.delete(Key::Index(shard))?;
+                to_delete.push(shard);
 
                 continue;
             }
@@ -990,9 +1013,45 @@ impl<S: storage::Backend> Vault<S> {
             )?;
 
             self.storage.put(Key::Index(shard), &data)?;
+            self.index.get_mut().clear_dirty(shard);
+        }
+
+        for shard in to_delete {
+            self.storage.delete(Key::Index(shard))?;
+            self.index.get_mut().clear_dirty(shard);
         }
 
         Ok(())
+    }
+
+    /// Runs `mutate` against the index, then flushes. If the flush fails, every path in
+    /// `paths` is rolled back to its state immediately before `mutate` ran, so a caller that
+    /// gets `Err` back can trust nothing changed.
+    ///
+    /// `mutate` is expected to validate everything it needs to before touching the index,
+    /// the same way every [`Index`] method already does (`NotFound`/`AlreadyExists`/etc. are all
+    /// checked first). If `mutate` itself returns `Err`, this assumes nothing was actually
+    /// changed and skips the rollback.
+    fn mutate_and_flush<T>(
+        &mut self,
+        paths: &[&str],
+        mutate: impl FnOnce(&mut Index) -> Result<T, index::Error>,
+    ) -> Result<T, Error> {
+        let snapshots: Vec<(String, Option<index::Entry>)> = paths
+            .iter()
+            .map(|p| (p.to_string(), self.index.get_mut().entry(p).cloned()))
+            .collect();
+        let value = mutate(self.index.get_mut())?;
+
+        if let Err(e) = self.flush_index() {
+            for (path, snapshot) in snapshots {
+                self.index.get_mut().restore_entry(&path, snapshot);
+            }
+
+            return Err(e);
+        }
+
+        Ok(value)
     }
 }
 
@@ -1476,7 +1535,6 @@ mod tests {
         assert_eq!(get_bytes(&vault, "file"), b"new content");
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn a_put_that_fails_to_flush_should_not_be_gettable_in_the_same_session() {
         let (mut vault, _path, _words) = faulty_vault();
@@ -1492,7 +1550,6 @@ mod tests {
         )
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn failed_put_is_rolled_back() {
         let (mut vault, path, words) = faulty_vault();
@@ -1535,7 +1592,6 @@ mod tests {
         assert_eq!(get_bytes(&reopened, "a"), b"first",);
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn retrying_an_identical_put_after_a_failed_flush_in_the_same_session() {
         let (mut vault, path, words) = faulty_vault();
@@ -1544,10 +1600,15 @@ mod tests {
             .storage
             .fail_nth(faulty::Operation::Put, Kind::Index, 1);
 
-        // Even though this looks like a successful retry, if the in-memory index already
-        // (incorrectly) reflects the failed write, it might get treated as a no-op and skip the
-        // flushing entirely.
         assert!(vault.put("file", &b"same content"[..], 12).is_err());
+
+        // The failed put should already be fully rolled back, "file" never existed before this
+        // call, so it shouldn't exist now either
+        assert!(!vault.index.get_mut().contains("file"));
+        assert!(vault.get("file", &mut Vec::new()).is_err());
+
+        // The blob persisted correctly though, so the retry would only update the index
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 1);
 
         vault.storage.clear_faults();
 
@@ -1555,10 +1616,10 @@ mod tests {
             vault.put("file", &b"same content"[..], 12).is_ok(),
             "the retry itself should not error"
         );
+        assert!(vault.index.get_mut().contains("file"));
 
-        // Because of the first put failing, the in-memory index thinks this "file" already exists
-        // in the vault, and the second put completely skips flushing the second successful put.
-        assert!(!vault.index.get_mut().contains("file")); // put for "file" should be rolled back
+        // No new blob is added to the vault
+        assert_eq!(vault.storage.list(Kind::Blob).unwrap().len(), 1);
 
         let identity = make_identity(&words);
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
@@ -1566,11 +1627,9 @@ mod tests {
 
         assert!(
             reopened.get("file", &mut Vec::new()).is_ok(),
-            "after a successful-looking retry, the data must actually be durable on a fresh vault \
-             session, not just cached in the memory of the session that originally failed to \
-             flush it"
+            "after a successful retry, the data must actually be durable on a fresh vault session"
         );
-        assert_eq!(get_bytes(&vault, "file"), b"some content");
+        assert_eq!(get_bytes(&vault, "file"), b"same content");
     }
 
     #[test]
@@ -2248,7 +2307,6 @@ mod tests {
         assert_eq!(get_bytes(&vault, "b"), b"b data");
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn rename_to_the_same_path_is_a_no_op() {
         let mut vault = vault();
@@ -2272,7 +2330,6 @@ mod tests {
         assert!(matches!(vault.rename("a", "b"), Err(Error::AlreadyExists)));
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn rename_across_shards_partial_flush_failure_should_not_lose_the_file() {
         let (mut vault, path, words) = faulty_vault();
@@ -2290,10 +2347,8 @@ mod tests {
 
         assert!(vault.rename(old_path, &new_path).is_err());
 
-        // FIXME: The in-memory index should probably be rolled back, right? Which means this
-        // assert should check `is_ok()` instead.
-        assert!(vault.get(old_path, &mut Vec::new()).is_err());
-        // assert!(vault.get(&new_path, &mut Vec::new()).is_err());
+        assert!(vault.get(old_path, &mut Vec::new()).is_ok());
+        assert!(vault.get(&new_path, &mut Vec::new()).is_err());
 
         let identity = make_identity(&words);
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
@@ -2751,7 +2806,6 @@ mod tests {
         assert_eq!(get_bytes(&vault, &other), b"other data");
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn failed_delete_in_shared_shard_leaves_other_entries_intact() {
         let (mut vault, path, words) = faulty_vault();
@@ -2862,7 +2916,6 @@ mod tests {
         assert!(vault.verify("file").is_ok());
     }
 
-    #[ignore = "needs to be fixed"]
     #[test]
     fn verify_a_dangling_chunk_reference_is_reported_as_tampered_not_not_found() {
         let mut vault = vault();

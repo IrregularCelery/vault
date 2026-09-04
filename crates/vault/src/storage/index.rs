@@ -128,7 +128,7 @@ pub struct EntryChunk {
 }
 
 /// A snapshot of a previous file revision, created when a file at a path is overwritten.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Version {
     /// List of chunks for this revision.
     pub chunks: Vec<EntryChunk>,
@@ -141,7 +141,7 @@ pub struct Version {
 }
 
 /// Metadata and chunk references for a single file tracked by the index.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     /// List of chunks for the currently active (latest) revision of this file.
     pub chunks: Vec<EntryChunk>,
@@ -290,6 +290,41 @@ impl Index {
     /// Drains and returns the shards pending a rewrite.
     pub fn take_dirty(&mut self) -> Vec<u16> {
         core::mem::take(&mut self.dirty)
+    }
+
+    /// Returns a snapshot of the shards pending a rewrite, without clearing their dirty status.
+    /// Unlike [`Index::take_dirty`], this can be called repeatedly and keeps returning the same
+    /// shards until they're individually cleared via [`Index::clear_dirty`].
+    pub fn dirty_shards(&self) -> Vec<u16> {
+        self.dirty.clone()
+    }
+
+    /// Clears the dirty flag for a single shard, once it's been confirmed persisted (or
+    /// deleted). Unlike [`Index::take_dirty`], this only affects the one shard it's given, leaving
+    /// any other still-dirty shards untouched, so a flush that fails partway through doesn't lose
+    /// track of what's still pending.
+    pub fn clear_dirty(&mut self, shard: u16) {
+        self.dirty.retain(|&s| s != shard);
+    }
+
+    /// Replaces (or removes, if `entry` is `None`) the entry at `path`. Used for when a flush
+    /// fails and an in-memory mutation needs to be rolled back to a known-good snapshot.
+    /// Doesn't touch dirty tracking, whatever [`Index::mark_dirty`] call was already made for
+    /// `path` before the mutation being undone is what makes sure the shard gets retried on the
+    /// next flush.
+    pub fn restore_entry(&mut self, path: &str, entry: Option<Entry>) {
+        match entry {
+            Some(entry) => {
+                let entry_path = Rc::from(path);
+
+                self.track_path(&entry_path);
+                self.entries.insert(entry_path, entry);
+            }
+            None => {
+                self.entries.remove(path);
+                self.untrack_path(path);
+            }
+        }
     }
 
     /// Inserts or replaces the entry at `path`.
