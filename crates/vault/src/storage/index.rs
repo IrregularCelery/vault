@@ -5,8 +5,8 @@
 //! [`Index::shard_of`] so the same path always lands in the same shard without ever needing to be
 //! tracked anywhere else. Mutating a single entry therefore only requires re-serializing,
 //! re-encrypting, and rewriting the one shard it belongs to, rather than the entire index.
-//! Shard assignment itself doesn't need to be secret (it isn't a security boundary, just a
-//! load-balancing scheme), so unlike chunk addressing it isn't keyed to the user's encryption key.
+//! Shard assignment is salted with a key derived from the user's encryption key so that shard
+//! numbers can't be correlated across different users' vaults.
 //!
 //! Binary serialization format for a single shard (big-endian):
 //!
@@ -52,6 +52,8 @@ const INDEX_VERSION: u16 = 1;
 const DOMAIN_INDEX: &str = "vault::index";
 /// BLAKE3 domain tag used to derive the shard a path is assigned to.
 const DOMAIN_SHARD: &str = "vault::shard";
+/// BLAKE3 domain tag used to derive the user-specific shard key from their encryption key.
+const DOMAIN_SHARD_KEY: &str = "vault::shard_key";
 
 /// Errors that can occur when processing an [`Index`] or its shards.
 #[derive(Debug)]
@@ -191,6 +193,10 @@ pub struct Index {
     /// `"photos/image.png"`). Includes both live and trashed entries, across every loaded shard.
     entries: BTreeMap<Rc<str>, Entry>,
 
+    /// User-specific key derived from the user's encryption key, used to salt shard assignment.
+    /// This ensures shard numbers are unique per user, preventing cross-user correlation.
+    shard_key: [u8; 32],
+
     /// Reverse index of paths assigned to shards. Mirrors `entries`'s keys, scoped by shard.
     /// Only exists as a derived lookup cache, never serialized.
     shard_paths: BTreeMap<u16, BTreeSet<Rc<str>>>,
@@ -206,9 +212,10 @@ pub struct Index {
 
 impl Index {
     /// Creates an empty index with no entries loaded.
-    pub fn new() -> Self {
+    pub fn new(encryption_key: &[u8; 32]) -> Self {
         Self {
             entries: BTreeMap::new(),
+            shard_key: hash::derive_key(DOMAIN_SHARD_KEY, encryption_key),
             shard_paths: BTreeMap::new(),
             // `loaded` and `dirty` are only ever as big as `SHARD_COUNT`
             loaded: Vec::with_capacity(SHARD_COUNT as usize),
@@ -246,12 +253,14 @@ impl Index {
         self.entries.is_empty()
     }
 
-    /// Deterministically assigns `path` to a shard in `0..SHARD_COUNT`.
-    pub fn shard_of(path: &str) -> u16 {
-        // TODO: This should probably be derived using user's private key too.
-        // Or maybe not? Let's say an attacker knows that path `something/file` would be stored
-        // in shard `5`; So what? Many other path also belong to the same shard. Is this a leak?
-        let hash = hash::derive_key(DOMAIN_SHARD, path.as_bytes());
+    /// Deterministically assigns `path` to a shard number/id.
+    pub fn shard_of(&self, path: &str) -> u16 {
+        let mut hasher = hash::Hasher::new_keyed(&self.shard_key);
+
+        hasher.update(DOMAIN_SHARD.as_bytes());
+        hasher.update(path.as_bytes());
+
+        let hash = hasher.finalize();
         let n = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
 
         (n % SHARD_COUNT as u32) as u16
@@ -280,7 +289,7 @@ impl Index {
     /// All of [`Index`]'s own mutating methods already call this internally; call it directly
     /// after directly mutating [`Index::entries`].
     pub fn mark_dirty(&mut self, path: &str) {
-        let shard = Self::shard_of(path);
+        let shard = self.shard_of(path);
 
         if !self.dirty.contains(&shard) {
             self.dirty.push(shard);
@@ -745,14 +754,14 @@ impl Index {
     /// Registers `path` under its shard.
     fn track_path(&mut self, path: &Rc<str>) {
         self.shard_paths
-            .entry(Self::shard_of(path))
+            .entry(self.shard_of(path))
             .or_default()
             .insert(Rc::clone(path));
     }
 
     /// Unregisters `path` from its shard.
     fn untrack_path(&mut self, path: &str) {
-        let shard = Self::shard_of(path);
+        let shard = self.shard_of(path);
 
         if let Some(paths) = self.shard_paths.get_mut(&shard) {
             paths.remove(path);
@@ -761,12 +770,6 @@ impl Index {
                 self.shard_paths.remove(&shard);
             }
         }
-    }
-}
-
-impl Default for Index {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -822,8 +825,8 @@ mod tests {
         string::String,
     };
 
-    fn index() -> Index {
-        let mut index = Index::new();
+    fn index(key: &[u8; 32]) -> Index {
+        let mut index = Index::new(key);
 
         index.insert(
             "music/song.mp3",
@@ -877,8 +880,8 @@ mod tests {
         sign(data) == *sig
     }
 
-    fn roundtrip(index: &Index) -> Index {
-        let mut restored = Index::new();
+    fn roundtrip(index: &Index, key: &[u8; 32]) -> Index {
+        let mut restored = Index::new(key);
 
         for shard in 0..SHARD_COUNT {
             let bytes = index.serialize_shard(shard).unwrap();
@@ -890,15 +893,31 @@ mod tests {
     }
 
     #[test]
-    fn shard_of_is_deterministic() {
+    fn shard_of_is_deterministic_for_the_same_user() {
+        let key = [0xFF; 32];
+        let index = Index::new(&key);
+
         assert_eq!(
-            Index::shard_of("same/path.txt"),
-            Index::shard_of("same/path.txt")
+            index.shard_of("same/path.txt"),
+            index.shard_of("same/path.txt")
         );
     }
 
     #[test]
+    fn shard_of_is_unique_per_user() {
+        let key1 = [0x01u8; 32];
+        let index1 = Index::new(&key1);
+        let key2 = [0x02u8; 32];
+        let index2 = Index::new(&key2);
+
+        assert_ne!(index1.shard_of("path"), index2.shard_of("path"));
+    }
+
+    #[test]
     fn shard_of_is_bounded() {
+        let key = [0xFF; 32];
+        let index = Index::new(&key);
+
         for path in [
             "a",
             "b",
@@ -906,13 +925,14 @@ mod tests {
             "",
             "very/deeply/nested/path.bin",
         ] {
-            assert!(Index::shard_of(path) < SHARD_COUNT);
+            assert!(index.shard_of(path) < SHARD_COUNT);
         }
     }
 
     #[test]
     fn loaded_tracking() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         assert!(!index.is_loaded(5));
 
@@ -929,16 +949,18 @@ mod tests {
 
     #[test]
     fn mark_dirty_only_marks_the_affected_shard() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.mark_dirty("file");
 
-        assert_eq!(index.dirty_shards(), vec![Index::shard_of("file")]);
+        assert_eq!(index.dirty_shards(), vec![index.shard_of("file")]);
     }
 
     #[test]
     fn insert_marks_its_shard_dirty() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "file",
@@ -951,12 +973,13 @@ mod tests {
             },
         );
 
-        assert_eq!(index.dirty_shards(), vec![Index::shard_of("file")]);
+        assert_eq!(index.dirty_shards(), vec![index.shard_of("file")]);
     }
 
     #[test]
     fn unrelated_mutation_does_not_dirty_other_shards() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "a",
@@ -969,12 +992,12 @@ mod tests {
             },
         );
 
-        let shard_a = Index::shard_of("a");
+        let shard_a = index.shard_of("a");
         let mut other = String::from("b");
         let mut i = 0;
 
         // Find a path guaranteed to land in a different shard than "a"
-        while Index::shard_of(&other) == shard_a {
+        while index.shard_of(&other) == shard_a {
             other = format!("b{}", i);
             i += 1;
         }
@@ -991,16 +1014,17 @@ mod tests {
             },
         );
 
-        assert_eq!(index.dirty_shards(), vec![Index::shard_of(&other)]);
+        assert_eq!(index.dirty_shards(), vec![index.shard_of(&other)]);
     }
 
     #[test]
     fn serialize_shard_only_includes_that_shards_entries() {
-        let index = index();
+        let key = [0xFF; 32];
+        let index = index(&key);
 
         for path in index.entries.keys() {
-            let shard = Index::shard_of(path);
-            let mut restored = Index::new();
+            let shard = index.shard_of(path);
+            let mut restored = Index::new(&key);
 
             restored
                 .deserialize_shard(&index.serialize_shard(shard).unwrap())
@@ -1010,14 +1034,15 @@ mod tests {
 
             // No entry from a different shard leaked in
             for other_path in restored.entries.keys() {
-                assert_eq!(Index::shard_of(other_path), shard);
+                assert_eq!(index.shard_of(other_path), shard);
             }
         }
     }
 
     #[test]
     fn is_shard_empty() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "solo",
@@ -1030,7 +1055,7 @@ mod tests {
             },
         );
 
-        let shard = Index::shard_of("solo");
+        let shard = index.shard_of("solo");
 
         assert!(!index.is_shard_empty(shard));
 
@@ -1041,7 +1066,8 @@ mod tests {
 
     #[test]
     fn entry_push_version() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "file",
@@ -1096,18 +1122,20 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_roundtrip() {
-        let index = index();
+        let key = [0xFF; 32];
+        let index = index(&key);
 
-        assert_eq!(index, roundtrip(&index));
+        assert_eq!(index, roundtrip(&index, &key));
     }
 
     #[test]
     fn serialize_deserialize_trashed_roundtrip() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
 
-        let restored = roundtrip(&index);
+        let restored = roundtrip(&index, &key);
 
         assert_eq!(index, restored);
         assert_ne!(restored.entries.get("photos/image.png").unwrap().trashed, 0);
@@ -1115,7 +1143,8 @@ mod tests {
 
     #[test]
     fn serialize_deserialize_with_versions_roundtrip() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "file",
@@ -1138,9 +1167,9 @@ mod tests {
             },
         );
 
-        let shard = Index::shard_of("file");
+        let shard = index.shard_of("file");
         let bytes = index.serialize_shard(shard).unwrap();
-        let mut restored = Index::new();
+        let mut restored = Index::new(&key);
 
         restored.deserialize_shard(&bytes).unwrap();
 
@@ -1149,7 +1178,8 @@ mod tests {
 
     #[test]
     fn insert_remove_roundtrip() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.insert(
             "file.txt",
@@ -1175,8 +1205,8 @@ mod tests {
     #[test]
     fn lock_unlock_roundtrip() {
         let key = [0x55u8; 32];
-        let index = index();
-        let mut restored = Index::new();
+        let index = index(&key);
+        let mut restored = Index::new(&key);
 
         for shard in 0..SHARD_COUNT {
             let locked = index.lock_shard(shard, &key, sign).unwrap();
@@ -1189,7 +1219,8 @@ mod tests {
 
     #[test]
     fn trash_and_restore_roundtrip() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
 
@@ -1204,7 +1235,8 @@ mod tests {
 
     #[test]
     fn version_mismatch() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.insert(
             "file",
@@ -1217,14 +1249,14 @@ mod tests {
             },
         );
 
-        let shard = Index::shard_of("file");
+        let shard = index.shard_of("file");
         let mut bytes = index.serialize_shard(shard).unwrap();
 
         // Change the version bytes
         bytes[0] = 0xFF;
         bytes[1] = 0xFF;
 
-        let mut restored = Index::new();
+        let mut restored = Index::new(&key);
         let result = restored.deserialize_shard(&bytes);
 
         assert!(matches!(
@@ -1235,10 +1267,11 @@ mod tests {
 
     #[test]
     fn wrong_key() {
-        let index = index();
-        let shard = Index::shard_of("music/song.mp3");
+        let key = [0xFF; 32];
+        let index = index(&key);
+        let shard = index.shard_of("music/song.mp3");
         let locked = index.lock_shard(shard, &[0x55u8; 32], sign).unwrap();
-        let mut restored = Index::new();
+        let mut restored = Index::new(&key);
 
         assert!(
             restored
@@ -1249,10 +1282,10 @@ mod tests {
 
     #[test]
     fn empty_shard() {
-        let index = Index::new();
         let key = [0x01u8; 32];
+        let index = Index::new(&key);
         let locked = index.lock_shard(0, &key, sign).unwrap();
-        let mut restored = Index::new();
+        let mut restored = Index::new(&key);
 
         restored.unlock_shard(&key, &locked, verify).unwrap();
 
@@ -1261,7 +1294,8 @@ mod tests {
 
     #[test]
     fn rename() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index
             .rename("photos/image.png", "photos/image_renamed.png")
@@ -1273,7 +1307,8 @@ mod tests {
 
     #[test]
     fn rename_not_found() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
         let renamed = index.rename("nonexistent.txt", "nonexistent_renamed.txt");
 
         assert!(matches!(renamed, Err(Error::NotFound)));
@@ -1281,7 +1316,8 @@ mod tests {
 
     #[test]
     fn rename_rejects_existing_new_path() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         let renamed = index.rename("music/song.mp3", "photos/image.png");
 
@@ -1293,7 +1329,8 @@ mod tests {
 
     #[test]
     fn get_returns_none_trashed() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
 
@@ -1320,7 +1357,8 @@ mod tests {
 
     #[test]
     fn addresses_includes_all_version_chunks() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "file",
@@ -1352,7 +1390,8 @@ mod tests {
 
     #[test]
     fn addresses_excludes_trashed() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
 
@@ -1363,7 +1402,8 @@ mod tests {
 
     #[test]
     fn purge_returns_trashed_addresses() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
 
@@ -1375,7 +1415,8 @@ mod tests {
 
     #[test]
     fn purge_skips_live_shared_addresses() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
         let shared_addr = EntryChunk {
             address: [0xAAu8; 32],
             encrypted_key: [0xFF; 60],
@@ -1411,7 +1452,8 @@ mod tests {
 
     #[test]
     fn purge_skips_address_still_used_by_a_trashed_entry() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
         let shared = EntryChunk {
             address: [0xAAu8; 32],
             encrypted_key: [0xFF; 60],
@@ -1450,7 +1492,8 @@ mod tests {
 
     #[test]
     fn purge_rejects_live_entry() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         // Cannot purge a live entry
         assert!(index.purge("music/song.mp3").is_err());
@@ -1458,7 +1501,8 @@ mod tests {
 
     #[test]
     fn purge_all_clears_trash() {
-        let mut index = index();
+        let key = [0xFF; 32];
+        let mut index = index(&key);
 
         index.trash("photos/image.png").unwrap();
         index.trash("music/song.mp3").unwrap();
@@ -1471,7 +1515,8 @@ mod tests {
 
     #[test]
     fn all_chunk_addresses() {
-        let index = index();
+        let key = [0xFF; 32];
+        let index = index(&key);
         let addresses = index.addresses_live();
 
         // Sample has 2 + 1 = 3 chunk addresses
@@ -1480,7 +1525,8 @@ mod tests {
 
     #[test]
     fn drop_version() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
 
         index.insert(
             "file",
@@ -1511,7 +1557,8 @@ mod tests {
 
     #[test]
     fn drop_version_skips_address_shared_with_active() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
         let shared = EntryChunk {
             address: [0xAAu8; 32],
             encrypted_key: [0xFF; 60],
@@ -1540,7 +1587,8 @@ mod tests {
 
     #[test]
     fn drop_version_skips_address_still_used_by_a_trashed_entry() {
-        let mut index = Index::new();
+        let key = [0xFF; 32];
+        let mut index = Index::new(&key);
         let shared = EntryChunk {
             address: [0xAAu8; 32],
             encrypted_key: [0xFF; 60],

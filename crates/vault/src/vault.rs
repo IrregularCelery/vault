@@ -144,10 +144,12 @@ impl<S: storage::Backend> Vault<S> {
     ///
     /// Shards are lazily loaded into the index when they are actually touched.
     pub fn open(identity: Identity, storage: S) -> Self {
+        let encryption_key = &identity.encryption_key();
+
         Self {
             identity,
             storage,
-            index: core::cell::RefCell::new(Index::new()),
+            index: core::cell::RefCell::new(Index::new(encryption_key)),
         }
     }
 
@@ -169,7 +171,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Index`]: If loading or encrypting the dirty index shard fails.
     /// - [`Error::Tampered`]: If the dirty index shard's signature is invalid.
     pub fn put(&mut self, path: &str, reader: impl io::Read, size: u64) -> Result<usize, Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         let mut chunks = Chunks::new(reader);
         let mut entry_chunks = Vec::new();
@@ -284,7 +286,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Tampered`]: If signature verification fails.
     /// - [`Error::Other`]: If wrong size chunk encryption key is found.
     pub fn get(&self, path: &str, writer: &mut impl io::Write) -> Result<u64, Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         let index = self.index.borrow();
         let entry = index.get(path).ok_or(Error::NotFound)?;
@@ -303,7 +305,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn versions(&self, path: &str) -> Result<Option<Vec<VersionProperties>>, Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         Ok(self.index.borrow().entry(path).map(|e| {
             e.versions
@@ -336,7 +338,7 @@ impl<S: storage::Backend> Vault<S> {
         version_index: usize,
         writer: &mut impl io::Write,
     ) -> Result<u64, Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         let index = self.index.borrow();
 
@@ -363,8 +365,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn revert(&mut self, path: &str, version_index: usize) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
-
+        self.ensure_shard_for(path)?;
         self.mutate_and_flush(&[path], |index| {
             let entry = index.entry_mut(path).ok_or(Error::NotFound)?;
 
@@ -492,9 +493,8 @@ impl<S: storage::Backend> Vault<S> {
         new_path: &str,
         version_index: usize,
     ) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
-        self.ensure_shard(Index::shard_of(new_path))?;
-
+        self.ensure_shard_for(path)?;
+        self.ensure_shard_for(new_path)?;
         self.mutate_and_flush(&[path, new_path], |index| {
             if index.contains(new_path) {
                 return Err(Error::AlreadyExists);
@@ -538,8 +538,8 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::AlreadyExists`]: If `new_path` already exists.
     /// - [`Error::Tampered`]: If a touched index shard's signature is invalid.
     pub fn detach_version_current(&mut self, path: &str, new_path: &str) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
-        self.ensure_shard(Index::shard_of(new_path))?;
+        self.ensure_shard_for(path)?;
+        self.ensure_shard_for(new_path)?;
 
         self.mutate_and_flush(&[path, new_path], |index| {
             if index.contains(new_path) {
@@ -595,8 +595,8 @@ impl<S: storage::Backend> Vault<S> {
             return Ok(());
         }
 
-        self.ensure_shard(Index::shard_of(old_path))?;
-        self.ensure_shard(Index::shard_of(new_path))?;
+        self.ensure_shard_for(old_path)?;
+        self.ensure_shard_for(new_path)?;
         self.mutate_and_flush(&[old_path, new_path], |index| {
             Ok(index.rename(old_path, new_path)?)
         })
@@ -613,7 +613,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::AlreadyTrashed`]: If the `path` is already trashed.
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn trash(&mut self, path: &str) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
         self.mutate_and_flush(&[path], |index| Ok(index.trash(path)?))
     }
 
@@ -627,7 +627,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::NotTrashed`]: If the `path` is not currently trashed.
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn restore(&mut self, path: &str) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
         self.mutate_and_flush(&[path], |index| Ok(index.restore(path)?))
     }
 
@@ -692,7 +692,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If an index shard's signature is invalid.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         let addresses = self.mutate_and_flush(&[path], |index| {
             match index.trash(path) {
@@ -768,7 +768,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
     /// - [`Error::Tampered`]: If the touched index shard's signature is invalid.
     pub fn properties(&self, path: &str) -> Result<Option<Properties>, Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         Ok(self.index.borrow().entry(path).map(|e| Properties {
             chunk_count: e.chunks.len(),
@@ -788,7 +788,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
     pub fn verify(&self, path: &str) -> Result<(), Error> {
-        self.ensure_shard(Index::shard_of(path))?;
+        self.ensure_shard_for(path)?;
 
         let index = self.index.borrow();
 
@@ -899,6 +899,13 @@ impl<S: storage::Backend> Vault<S> {
         self.index.borrow_mut().mark_loaded(shard);
 
         Ok(())
+    }
+
+    /// Ensures the shard for `path` is loaded into the in-memory index cache. See [`Vault::ensure_shard`].
+    fn ensure_shard_for(&self, path: &str) -> Result<(), Error> {
+        let shard = self.index.borrow().shard_of(path);
+
+        self.ensure_shard(shard)
     }
 
     /// Ensures every shard currently present in storage is loaded into the in-memory index cache.
@@ -1318,13 +1325,13 @@ mod tests {
         Identity::from_mnemonic(words).unwrap()
     }
 
-    fn vault() -> Vault<local::Storage> {
+    fn vault() -> (Vault<local::Storage>, PathBuf, Vec<String>) {
         let path = temp_storage_path("");
         let words = make_words();
         let identity = make_identity(&words);
         let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
 
-        Vault::open(identity, storage)
+        (Vault::open(identity, storage), path, words)
     }
 
     fn faulty_vault() -> (Vault<faulty::Storage<local::Storage>>, PathBuf, Vec<String>) {
@@ -1378,12 +1385,12 @@ mod tests {
     }
 
     // Finds a path that lands in the same index shard as `path`
-    fn same_shard_path(path: &str, base: &str) -> String {
-        let target = Index::shard_of(path);
+    fn same_shard_path(path: &str, base: &str, index: &Index) -> String {
+        let target = index.shard_of(path);
         let mut same = String::from(base);
         let mut i = 0;
 
-        while Index::shard_of(&same) != target {
+        while index.shard_of(&same) != target {
             same = format!("{}{}", base, i);
             i += 1;
         }
@@ -1392,12 +1399,13 @@ mod tests {
     }
 
     // Finds a path that lands in a different index shard than `path`
-    fn other_shard_path(from_path: &str, base: &str) -> String {
-        let target = Index::shard_of(from_path);
+    fn other_shard_path(from_path: &str, base: &str, encryption_key: &[u8; 32]) -> String {
+        let index = Index::new(encryption_key);
+        let target = index.shard_of(from_path);
         let mut other = String::from(base);
         let mut i = 0;
 
-        while Index::shard_of(&other) == target {
+        while index.shard_of(&other) == target {
             other = format!("{}{}", base, i);
             i += 1;
         }
@@ -1407,7 +1415,7 @@ mod tests {
 
     #[test]
     fn put_get_small_data_roundtrip() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = b"small data";
 
         put_bytes(&mut vault, "notes/small.txt", data);
@@ -1417,7 +1425,7 @@ mod tests {
 
     #[test]
     fn put_get_large_data_roundtrip() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = [
             vec![0xAAu8; CHUNK_SIZE],
             vec![0xBBu8; CHUNK_SIZE],
@@ -1435,7 +1443,7 @@ mod tests {
 
     #[test]
     fn per_user_per_chunk_deduplication() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data1 = [
             vec![0xAAu8; CHUNK_SIZE],
             vec![0xBBu8; CHUNK_SIZE],
@@ -1465,7 +1473,7 @@ mod tests {
 
     #[test]
     fn deduplicate_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = [
             vec![0xAAu8; chunk::CHUNK_SIZE],
             vec![0xAAu8; chunk::CHUNK_SIZE],
@@ -1483,7 +1491,7 @@ mod tests {
 
     #[test]
     fn put_get_empty_file_roundtrip() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "notes/empty.txt", b"");
 
@@ -1492,7 +1500,7 @@ mod tests {
 
     #[test]
     fn put_get_empty_string_path_roundtrips() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "", b"empty string path");
 
@@ -1501,7 +1509,7 @@ mod tests {
 
     #[test]
     fn path_that_looks_like_traversal_is_treated_as_an_opaque_string_not_a_filesystem_path() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let path = "../../../etc/passwd";
 
         put_bytes(&mut vault, path, b"lol!");
@@ -1513,7 +1521,7 @@ mod tests {
 
     #[test]
     fn very_long_path_name_is_handled_gracefully() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let path = "x".repeat(60_000); // safely under u16::MAX (65535), still huge
 
         put_bytes(&mut vault, &path, b"data");
@@ -1523,7 +1531,7 @@ mod tests {
 
     #[test]
     fn path_longer_than_u16_max_fails_gracefully_instead_of_panicking() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let huge_path = "x".repeat(70_000); // exceeds the u16 path_len field in the shard format
 
         assert!(vault.put(&huge_path, &b"data"[..], 4).is_err());
@@ -1531,7 +1539,7 @@ mod tests {
 
     #[test]
     fn put_same_content_on_trashed_path_restores_it() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"same content");
 
@@ -1544,7 +1552,7 @@ mod tests {
 
     #[test]
     fn put_different_content_on_trashed_path_restores_it() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"original");
 
@@ -1595,7 +1603,11 @@ mod tests {
 
         // Touch a different shard to make sure nothing else touches "a" again. The failed write
         // doesn't complete on its own
-        put_bytes(&mut vault, &other_shard_path("a", "another"), b"something");
+        put_bytes(
+            &mut vault,
+            &other_shard_path("a", "another", &make_identity(&words).encryption_key()),
+            b"something",
+        );
 
         // Still the same vault session
         assert_eq!(
@@ -1711,7 +1723,7 @@ mod tests {
 
     #[test]
     fn put_with_reader_that_fails_partway_does_not_corrupt_existing_data() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = b"original content";
 
         put_bytes(&mut vault, "file", data);
@@ -1734,7 +1746,7 @@ mod tests {
 
     #[test]
     fn get_with_writer_that_fails_partway_is_error_and_leaves_storage_untouched() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = vec![0x22u8; CHUNK_SIZE * 2];
 
         put_bytes(&mut vault, "file", &data);
@@ -1771,7 +1783,7 @@ mod tests {
 
     #[test]
     fn file_exactly_one_chunk_produces_exactly_one_chunk() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = vec![0x11u8; CHUNK_SIZE];
 
         put_bytes(&mut vault, "exactly one", &data);
@@ -1782,7 +1794,7 @@ mod tests {
 
     #[test]
     fn file_exactly_two_chunks_produces_exactly_two_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = [vec![0x22u8; CHUNK_SIZE], vec![0x33u8; CHUNK_SIZE]].concat();
 
         put_bytes(&mut vault, "exactly two", &data);
@@ -1793,7 +1805,7 @@ mod tests {
 
     #[test]
     fn file_one_byte_over_the_chunk_size_produces_two_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let mut data = vec![0x44u8; CHUNK_SIZE];
 
         data.push(0x55);
@@ -1806,7 +1818,7 @@ mod tests {
 
     #[test]
     fn get_version() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"first");
         put_bytes(&mut vault, "file", b"second");
@@ -1828,7 +1840,7 @@ mod tests {
 
     #[test]
     fn get_version_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"only one version");
 
@@ -1841,7 +1853,7 @@ mod tests {
 
     #[test]
     fn overwrite() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"version one");
         put_bytes(&mut vault, "file", b"version two");
@@ -1852,7 +1864,7 @@ mod tests {
 
     #[test]
     fn overwrite_creates_version() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"version one");
         put_bytes(&mut vault, "file", b"version two");
@@ -1869,7 +1881,7 @@ mod tests {
 
     #[test]
     fn overwrite_no_unreferenced_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"version one");
 
@@ -1886,7 +1898,7 @@ mod tests {
 
     #[test]
     fn overwrite_same_content_no_new_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"same content");
 
@@ -1905,7 +1917,7 @@ mod tests {
 
     #[test]
     fn multiple_overwrites_accumulate_versions() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -1917,7 +1929,7 @@ mod tests {
 
     #[test]
     fn revert() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"original");
         put_bytes(&mut vault, "file", b"overwritten");
@@ -1930,7 +1942,7 @@ mod tests {
 
     #[test]
     fn revert_preserves_full_history() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -1954,7 +1966,7 @@ mod tests {
 
     #[test]
     fn revert_version_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -1966,7 +1978,7 @@ mod tests {
 
     #[test]
     fn drop_version() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"old content");
         put_bytes(&mut vault, "file", b"new content");
@@ -1985,7 +1997,7 @@ mod tests {
 
     #[test]
     fn drop_version_skips_shared_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(
             &mut vault,
@@ -2010,7 +2022,7 @@ mod tests {
 
     #[test]
     fn drop_version_skips_shared_chunks_across_files() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file1", &vec![0xAAu8; CHUNK_SIZE]);
         put_bytes(
@@ -2035,7 +2047,7 @@ mod tests {
 
     #[test]
     fn drop_version_current_skips_chunks_shared_with_its_own_new_active_version_when_trashed() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         let chunk_a = vec![0xAAu8; CHUNK_SIZE];
         let chunk_b = vec![0xBBu8; CHUNK_SIZE];
@@ -2062,7 +2074,7 @@ mod tests {
 
     #[test]
     fn drop_version_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2098,7 +2110,7 @@ mod tests {
 
     #[test]
     fn drop_current() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2119,7 +2131,7 @@ mod tests {
 
     #[test]
     fn drop_current_no_versions_deletes_file() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2133,7 +2145,7 @@ mod tests {
 
     #[test]
     fn detach_version() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"original");
         put_bytes(&mut vault, "file", b"accidentally overwritten");
@@ -2146,7 +2158,7 @@ mod tests {
 
     #[test]
     fn detach_version_rejects_existing_new_path() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2161,7 +2173,7 @@ mod tests {
 
     #[test]
     fn detach_version_new_path_equal_to_source_is_already_exists() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2174,7 +2186,7 @@ mod tests {
 
     #[test]
     fn detach_version_removes_from_source_history() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2194,7 +2206,7 @@ mod tests {
 
     #[test]
     fn detach_version_no_chunk_duplication() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"shared data");
         put_bytes(&mut vault, "file", b"other data");
@@ -2211,7 +2223,7 @@ mod tests {
 
     #[test]
     fn detach_version_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2223,7 +2235,7 @@ mod tests {
 
     #[test]
     fn detach_current() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2238,7 +2250,7 @@ mod tests {
 
     #[test]
     fn detach_current_no_versions_is_rename() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2253,7 +2265,7 @@ mod tests {
 
     #[test]
     fn detach_current_no_versions_restores_trashed_at_new_path() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2266,7 +2278,7 @@ mod tests {
 
     #[test]
     fn detach_current_rejects_existing_new_path() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2281,7 +2293,7 @@ mod tests {
 
     #[test]
     fn detach_current_new_path_equal_to_source_is_already_exists() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2294,7 +2306,7 @@ mod tests {
 
     #[test]
     fn rename() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "old/file", b"data");
 
@@ -2305,7 +2317,7 @@ mod tests {
 
     #[test]
     fn rename_trashed_is_ok_and_keeps_it_trashed() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "a", b"data");
 
@@ -2318,7 +2330,7 @@ mod tests {
 
     #[test]
     fn rename_rejects_existing_new_path() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "a", b"a data");
         put_bytes(&mut vault, "b", b"b data");
@@ -2330,7 +2342,7 @@ mod tests {
 
     #[test]
     fn rename_to_the_same_path_is_a_no_op() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2340,7 +2352,7 @@ mod tests {
 
     #[test]
     fn rename_to_a_trashed_path_is_already_exists() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "a", b"data a");
         put_bytes(&mut vault, "b", b"data b");
@@ -2356,7 +2368,11 @@ mod tests {
         let (mut vault, path, words) = faulty_vault();
 
         let old_path = "old/file";
-        let new_path = other_shard_path(old_path, "new/file");
+        let new_path = other_shard_path(
+            old_path,
+            "new/file",
+            &make_identity(&words).encryption_key(),
+        );
 
         put_bytes(&mut vault, old_path, b"data");
 
@@ -2389,7 +2405,7 @@ mod tests {
 
     #[test]
     fn trash() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file.txt", b"data");
 
@@ -2402,7 +2418,7 @@ mod tests {
 
     #[test]
     fn restore() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file.txt", b"data");
 
@@ -2415,7 +2431,7 @@ mod tests {
 
     #[test]
     fn repeated_trash_and_restore_via_put_stays_consistent() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"same data");
 
@@ -2436,7 +2452,7 @@ mod tests {
 
     #[test]
     fn purge() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "1.txt", b"keep this");
         put_bytes(&mut vault, "2.txt", b"delete this");
@@ -2454,7 +2470,7 @@ mod tests {
 
     #[test]
     fn purge_skips_chunks_still_used_by_a_trashed_entry() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "a", b"shared content");
         put_bytes(&mut vault, "b", b"shared content"); // Share the same chunk as "a"
@@ -2522,7 +2538,7 @@ mod tests {
 
     #[test]
     fn purge_all_version_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file1", b"keep this");
         put_bytes(&mut vault, "file2", b"delete v1");
@@ -2543,7 +2559,7 @@ mod tests {
 
     #[test]
     fn cleanup() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "1.txt", b"data 1");
         put_bytes(&mut vault, "2.txt", b"data 2");
@@ -2560,7 +2576,7 @@ mod tests {
 
     #[test]
     fn cleanup_purges_all_version_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"v1");
         put_bytes(&mut vault, "file", b"v2");
@@ -2609,7 +2625,7 @@ mod tests {
 
     #[test]
     fn delete() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file.txt", b"data");
 
@@ -2623,7 +2639,7 @@ mod tests {
 
     #[test]
     fn delete_a_trashed_entry_is_ok() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file.txt", b"data");
 
@@ -2639,7 +2655,7 @@ mod tests {
 
     #[test]
     fn only_uploads_changed_chunks() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         let chunk_a = vec![0xAAu8; CHUNK_SIZE];
         let chunk_b = vec![0xBBu8; CHUNK_SIZE];
@@ -2663,7 +2679,7 @@ mod tests {
 
     #[test]
     fn not_found() {
-        let vault = vault();
+        let (vault, _path, _words) = vault();
         let got = vault.get("nonexistent.txt", &mut Vec::new());
 
         assert!(matches!(got, Err(Error::NotFound)));
@@ -2671,7 +2687,7 @@ mod tests {
 
     #[test]
     fn delete_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let deleted = vault.delete("nonexistent.txt");
 
         assert!(matches!(deleted, Err(Error::NotFound)));
@@ -2703,12 +2719,13 @@ mod tests {
     fn accessing_one_path_does_not_load_an_unrelated_shard() {
         let path = temp_storage_path("unrelated_shard");
         let words = make_words();
+        let identity = make_identity(&words);
+        let index = Index::new(&identity.encryption_key());
 
-        let shard_a = Index::shard_of("a");
-        let other_path = other_shard_path("a", "b");
+        let shard_a = index.shard_of("a");
+        let other_path = other_shard_path("a", "b", &make_identity(&words).encryption_key());
 
         {
-            let identity = make_identity(&words);
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
             let mut vault = Vault::open(identity, storage);
 
@@ -2726,7 +2743,7 @@ mod tests {
             !reopened
                 .index
                 .borrow()
-                .is_loaded(Index::shard_of(&other_path))
+                .is_loaded(index.shard_of(&other_path))
         );
 
         assert_eq!(get_bytes(&reopened, "a"), b"a data");
@@ -2737,18 +2754,20 @@ mod tests {
             !reopened
                 .index
                 .borrow()
-                .is_loaded(Index::shard_of(&other_path))
+                .is_loaded(index.shard_of(&other_path))
         );
     }
 
     #[test]
     fn only_dirty_shard_is_rewritten() {
-        let mut vault = vault();
+        let (mut vault, _path, words) = vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
 
         put_bytes(&mut vault, "a", b"a data");
 
-        let shard_a = Index::shard_of("a");
-        let other_path = other_shard_path("a", "b");
+        let shard_a = index.shard_of("a");
+        let other_path = other_shard_path("a", "b", &key);
 
         put_bytes(&mut vault, &other_path, b"other data");
 
@@ -2765,11 +2784,13 @@ mod tests {
 
     #[test]
     fn empty_shard_is_deleted_from_storage() {
-        let mut vault = vault();
+        let (mut vault, _path, words) = vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
 
         put_bytes(&mut vault, "solo", b"only entry");
 
-        let shard = Index::shard_of("solo");
+        let shard = index.shard_of("solo");
 
         assert!(vault.storage.exists(Key::Index(shard)).unwrap());
 
@@ -2782,17 +2803,19 @@ mod tests {
 
     #[test]
     fn shard_is_not_deleted_when_it_still_contains_other_entries() {
-        let mut vault = vault();
+        let (mut vault, _path, words) = vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
 
         put_bytes(&mut vault, "a", b"data a");
 
-        let file2 = same_shard_path("a", "b");
+        let file2 = same_shard_path("a", "b", &index);
 
         put_bytes(&mut vault, &file2, b"data b");
 
-        let shard = Index::shard_of("a");
+        let shard = index.shard_of("a");
 
-        assert_eq!(shard, Index::shard_of(&file2));
+        assert_eq!(shard, index.shard_of(&file2));
         assert!(vault.storage.exists(Key::Index(shard)).unwrap());
 
         vault.delete("a").unwrap();
@@ -2808,15 +2831,17 @@ mod tests {
 
     #[test]
     fn rename_within_the_same_shard_preserves_data() {
-        let mut vault = vault();
+        let (mut vault, _path, words) = vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
 
         put_bytes(&mut vault, "old_name", b"data");
 
-        let other = same_shard_path("old_name", "other");
+        let other = same_shard_path("old_name", "other", &index);
 
         put_bytes(&mut vault, &other, b"other data");
 
-        let new_name = same_shard_path("old_name", "new_name");
+        let new_name = same_shard_path("old_name", "new_name", &index);
 
         vault.rename("old_name", &new_name).unwrap();
 
@@ -2830,10 +2855,12 @@ mod tests {
     #[test]
     fn failed_delete_in_shared_shard_leaves_other_entries_intact() {
         let (mut vault, path, words) = faulty_vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
 
         put_bytes(&mut vault, "a", b"data 1");
 
-        let b = same_shard_path("a", "b");
+        let b = same_shard_path("a", "b", &index);
 
         put_bytes(&mut vault, &b, b"data 2");
 
@@ -2860,7 +2887,7 @@ mod tests {
 
     #[test]
     fn verify_clean_file() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "clean", b"all good, mate!");
 
@@ -2869,7 +2896,7 @@ mod tests {
 
     #[test]
     fn verify_nonexistent_path_is_not_found() {
-        let vault = vault();
+        let (vault, _path, _words) = vault();
 
         assert!(matches!(vault.verify("nonexistent"), Err(Error::NotFound)));
     }
@@ -2927,7 +2954,7 @@ mod tests {
 
     #[test]
     fn verify_includes_trashed_entries() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"data");
 
@@ -2939,7 +2966,7 @@ mod tests {
 
     #[test]
     fn verify_a_dangling_chunk_reference_is_reported_as_tampered_not_not_found() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
         let data = [
             vec![0xAAu8; CHUNK_SIZE],
             vec![0xBBu8; CHUNK_SIZE],
@@ -2965,7 +2992,7 @@ mod tests {
 
     #[test]
     fn verify_all() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file1", b"clean data");
         put_bytes(&mut vault, "file2", b"more clean data");
@@ -2975,7 +3002,7 @@ mod tests {
 
     #[test]
     fn verify_all_empty_vault() {
-        let vault = vault();
+        let (vault, _path, _words) = vault();
 
         assert!(vault.verify_all().is_empty());
     }
@@ -3014,11 +3041,12 @@ mod tests {
         let identity = make_identity(&words);
         let public_signing_key = identity.public_signing_key();
         let storage = local::Storage::new(&path, &public_signing_key).unwrap();
+        let index = Index::new(&identity.encryption_key());
         let mut vault = Vault::open(identity, storage);
 
         put_bytes(&mut vault, "file", b"important data");
 
-        let shard = Index::shard_of("file");
+        let shard = index.shard_of("file");
 
         // The shard is already cached in memory from the `put` above; `verify_all` must still
         // catch tampering of the on-disk copy rather than trusting the cache.
@@ -3195,7 +3223,7 @@ mod tests {
     #[test]
     fn swapping_a_chunk_address_to_point_at_a_different_real_blob_fails_decryption_rather_than_silently_returning_wrong_data()
      {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "a", b"data a");
         put_bytes(&mut vault, "b", b"data b");
@@ -3224,7 +3252,7 @@ mod tests {
 
     #[test]
     fn corrupting_the_encrypted_chunk_key_fails_decryption_cleanly() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"some secret bytes");
 
@@ -3265,7 +3293,7 @@ mod tests {
 
     #[test]
     fn same_file_same_path_same_user() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"same content");
 
@@ -3282,7 +3310,7 @@ mod tests {
 
     #[test]
     fn same_file_different_paths_same_user() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file1", b"same content");
 
@@ -3298,7 +3326,7 @@ mod tests {
 
     #[test]
     fn different_files_same_path_same_user() {
-        let mut vault = vault();
+        let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "file", b"content");
 
