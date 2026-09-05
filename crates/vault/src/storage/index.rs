@@ -200,7 +200,7 @@ pub struct Index {
     loaded: Vec<u16>,
 
     /// Shards with entries added, changed, or removed since the last flush, and need to be
-    /// rewritten. Drained by [`Index::take_dirty`]
+    /// rewritten.
     dirty: Vec<u16>,
 }
 
@@ -287,22 +287,15 @@ impl Index {
         }
     }
 
-    /// Drains and returns the shards pending a rewrite.
-    pub fn take_dirty(&mut self) -> Vec<u16> {
-        core::mem::take(&mut self.dirty)
-    }
-
     /// Returns a snapshot of the shards pending a rewrite, without clearing their dirty status.
-    /// Unlike [`Index::take_dirty`], this can be called repeatedly and keeps returning the same
-    /// shards until they're individually cleared via [`Index::clear_dirty`].
+    /// Shards can individually be cleared from the list via [`Index::clear_dirty`].
     pub fn dirty_shards(&self) -> Vec<u16> {
         self.dirty.clone()
     }
 
     /// Clears the dirty flag for a single shard, once it's been confirmed persisted (or
-    /// deleted). Unlike [`Index::take_dirty`], this only affects the one shard it's given, leaving
-    /// any other still-dirty shards untouched, so a flush that fails partway through doesn't lose
-    /// track of what's still pending.
+    /// deleted). This only affects the one shard it's given, leaving any other still-dirty shards
+    /// untouched.
     pub fn clear_dirty(&mut self, shard: u16) {
         self.dirty.retain(|&s| s != shard);
     }
@@ -940,10 +933,7 @@ mod tests {
 
         index.mark_dirty("file");
 
-        assert_eq!(index.take_dirty(), vec![Index::shard_of("file")]);
-
-        // Draining clears it
-        assert!(index.take_dirty().is_empty());
+        assert_eq!(index.dirty_shards(), vec![Index::shard_of("file")]);
     }
 
     #[test]
@@ -961,7 +951,7 @@ mod tests {
             },
         );
 
-        assert_eq!(index.take_dirty(), vec![Index::shard_of("file")]);
+        assert_eq!(index.dirty_shards(), vec![Index::shard_of("file")]);
     }
 
     #[test]
@@ -989,7 +979,7 @@ mod tests {
             i += 1;
         }
 
-        index.take_dirty(); // Clear the dirty state from inserting "a" to simulate flushing
+        index.clear_dirty(shard_a); // Clear the dirty state from inserting "a" to simulate flushing
         index.insert(
             &other,
             Entry {
@@ -1001,7 +991,7 @@ mod tests {
             },
         );
 
-        assert_eq!(index.take_dirty(), vec![Index::shard_of(&other)]);
+        assert_eq!(index.dirty_shards(), vec![Index::shard_of(&other)]);
     }
 
     #[test]
