@@ -205,8 +205,11 @@ pub struct Index {
     /// [`Index::entries`].
     loaded: Vec<u16>,
 
-    /// Shards with entries added, changed, or removed since the last flush, and need to be
-    /// rewritten.
+    /// Shards not yet confirmed to match what's persisted in storage. Either they have
+    /// entries added, changed, or removed since the last confirmed-successful write of that
+    /// specific shard, or a previous flush attempt for them failed and hasn't been retried yet.
+    /// Cleared per-shard via [`Index::clear_dirty`] once that shard is confirmed persisted
+    /// or deleted.
     dirty: Vec<u16>,
 }
 
