@@ -184,8 +184,9 @@ impl<S: storage::Backend> Vault<S> {
 
             encrypted_key.copy_from_slice(&encrypted_chunk_key);
 
-            // Redundant check but we keep it in case a storage::Backend::put() didn't do the check
-            // though not entirely useless since we can avoid calling an unnecessary `cipher::lock()`
+            // Redundant check, but we keep it in case a storage::Backend::put() didn't do
+            // the check, though not entirely useless, since we can avoid calling
+            // an unnecessary `cipher::lock()`
             if !self.storage.exists(Key::Blob(address))? {
                 let encrypted =
                     cipher::lock(&key, chunk.data, |message| self.identity.sign(message))?;
@@ -281,6 +282,7 @@ impl<S: storage::Backend> Vault<S> {
     ///
     /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
     /// - [`Error::Cipher`]: If chunk or index decryption fails.
+    /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
@@ -327,6 +329,7 @@ impl<S: storage::Backend> Vault<S> {
     ///
     /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
     /// - [`Error::Cipher`]: If chunk or index decryption fails.
+    /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
     /// - [`Error::Io`]: If writing to `writer` fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::VersionNotFound`]: If version at `version_index` is absent.
@@ -524,7 +527,7 @@ impl<S: storage::Backend> Vault<S> {
         })
     }
 
-    /// Moves the active version of `path` to `new_path` and makees the most recent historical
+    /// Moves the active version of `path` to `new_path` and makes the most recent historical
     /// version the new active revision.
     ///
     /// Equivalent to [`Vault::rename`] when no historical versions exist. (this also makes
@@ -785,6 +788,7 @@ impl<S: storage::Backend> Vault<S> {
     ///
     /// - [`Error::Storage`]: If reading a chunk blob or the touched index shard fails.
     /// - [`Error::Cipher`]: If chunk or index decryption fails.
+    /// - [`Error::Index`]: If the touched index shard's decryption or deserialization fails.
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If signature verification fails.
     pub fn verify(&self, path: &str) -> Result<(), Error> {
@@ -902,6 +906,13 @@ impl<S: storage::Backend> Vault<S> {
     }
 
     /// Ensures the shard for `path` is loaded into the in-memory index cache. See [`Vault::ensure_shard`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Storage`]: If reading the shard from storage fails for a reason other than the
+    ///   shard not existing yet.
+    /// - [`Error::Index`]: If the shard's decryption or deserialization fails.
+    /// - [`Error::Tampered`]: If the shard's signature is invalid.
     fn ensure_shard_for(&self, path: &str) -> Result<(), Error> {
         let shard = self.index.borrow().shard_of(path);
 
@@ -1399,8 +1410,7 @@ mod tests {
     }
 
     // Finds a path that lands in a different index shard than `path`
-    fn other_shard_path(from_path: &str, base: &str, encryption_key: &[u8; 32]) -> String {
-        let index = Index::new(encryption_key);
+    fn other_shard_path(from_path: &str, base: &str, index: &Index) -> String {
         let target = index.shard_of(from_path);
         let mut other = String::from(base);
         let mut i = 0;
@@ -1475,9 +1485,9 @@ mod tests {
     fn deduplicate_chunks() {
         let (mut vault, _path, _words) = vault();
         let data = [
-            vec![0xAAu8; chunk::CHUNK_SIZE],
-            vec![0xAAu8; chunk::CHUNK_SIZE],
-            vec![0xBBu8; chunk::CHUNK_SIZE / 2],
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xAAu8; CHUNK_SIZE],
+            vec![0xBBu8; CHUNK_SIZE / 2],
         ]
         .concat();
 
@@ -1499,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn put_get_empty_string_path_roundtrips() {
+    fn put_get_empty_string_path_roundtrip() {
         let (mut vault, _path, _words) = vault();
 
         put_bytes(&mut vault, "", b"empty string path");
@@ -1582,6 +1592,8 @@ mod tests {
     #[test]
     fn failed_put_is_rolled_back() {
         let (mut vault, path, words) = faulty_vault();
+        let identity = make_identity(&words);
+        let index = Index::new(&identity.encryption_key());
 
         put_bytes(&mut vault, "a", b"first");
 
@@ -1605,7 +1617,7 @@ mod tests {
         // doesn't complete on its own
         put_bytes(
             &mut vault,
-            &other_shard_path("a", "another", &make_identity(&words).encryption_key()),
+            &other_shard_path("a", "another", &index),
             b"something",
         );
 
@@ -1779,6 +1791,34 @@ mod tests {
         vault.storage.clear_faults();
 
         assert_eq!(get_bytes(&vault, "file"), data);
+    }
+
+    #[test]
+    fn get_detects_tampering() {
+        let path = temp_storage_path("verify_all_tampered_error");
+        let words = make_words();
+        let identity = make_identity(&words);
+        let public_signing_key = identity.public_signing_key();
+        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
+        let mut vault = Vault::open(identity, storage);
+
+        put_bytes(&mut vault, "secret.txt", b"secret");
+
+        let address = {
+            let index = vault.index.borrow();
+
+            index.entry("secret.txt").unwrap().chunks[0].address
+        };
+        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
+
+        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
+
+        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
+
+        assert!(matches!(
+            vault.get("secret.txt", &mut Vec::new()),
+            Err(Error::Tampered(_))
+        ));
     }
 
     #[test]
@@ -2366,13 +2406,11 @@ mod tests {
     #[test]
     fn rename_across_shards_partial_flush_failure_should_not_lose_the_file() {
         let (mut vault, path, words) = faulty_vault();
+        let identity = make_identity(&words);
+        let index = Index::new(&identity.encryption_key());
 
         let old_path = "old/file";
-        let new_path = other_shard_path(
-            old_path,
-            "new/file",
-            &make_identity(&words).encryption_key(),
-        );
+        let new_path = other_shard_path(old_path, "new/file", &index);
 
         put_bytes(&mut vault, old_path, b"data");
 
@@ -2494,7 +2532,7 @@ mod tests {
 
         let blobs_before = vault.storage.list(Kind::Blob).unwrap().len();
 
-        // Here we do `Delete` beucase there is only the one entry and purging it causes its shard
+        // Here we do `Delete` because there is only the one entry and purging it causes its shard
         // to be deleted, not put/overwrite
         vault
             .storage
@@ -2723,7 +2761,7 @@ mod tests {
         let index = Index::new(&identity.encryption_key());
 
         let shard_a = index.shard_of("a");
-        let other_path = other_shard_path("a", "b", &make_identity(&words).encryption_key());
+        let other_path = other_shard_path("a", "b", &index);
 
         {
             let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
@@ -2767,7 +2805,7 @@ mod tests {
         put_bytes(&mut vault, "a", b"a data");
 
         let shard_a = index.shard_of("a");
-        let other_path = other_shard_path("a", "b", &key);
+        let other_path = other_shard_path("a", "b", &index);
 
         put_bytes(&mut vault, &other_path, b"other data");
 
@@ -3029,9 +3067,9 @@ mod tests {
 
         overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
-        let tampared = vault.verify_all();
+        let tampered = vault.verify_all();
 
-        assert!(tampared.contains(&"file".into()));
+        assert!(tampered.contains(&"file".into()));
     }
 
     #[test]
@@ -3064,34 +3102,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_all_tampered_error() {
-        let path = temp_storage_path("verify_all_tampered_error");
-        let words = make_words();
-        let identity = make_identity(&words);
-        let public_signing_key = identity.public_signing_key();
-        let storage = local::Storage::new(&path, &public_signing_key).unwrap();
-        let mut vault = Vault::open(identity, storage);
-
-        put_bytes(&mut vault, "secret.txt", b"secret");
-
-        let address = {
-            let index = vault.index.borrow();
-
-            index.entry("secret.txt").unwrap().chunks[0].address
-        };
-        let mut blob = vault.storage.get(Key::Blob(address)).unwrap();
-
-        blob[65] ^= 0xFF; // Flip a bit inside the ciphertext region
-
-        overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
-
-        assert!(matches!(
-            vault.get("secret.txt", &mut Vec::new()),
-            Err(Error::Tampered(_))
-        ));
-    }
-
-    #[test]
     fn verify_all_includes_trashed_entries() {
         let path = temp_storage_path("verify_trashed");
         let words = make_words();
@@ -3116,9 +3126,9 @@ mod tests {
 
         overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
-        let tampared = vault.verify_all();
+        let tampered = vault.verify_all();
 
-        assert!(tampared.contains(&"trashed.txt".into()));
+        assert!(tampered.contains(&"trashed.txt".into()));
     }
 
     #[test]
@@ -3154,10 +3164,10 @@ mod tests {
             overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
         }
 
-        let tampared = vault.verify_all();
+        let tampered = vault.verify_all();
 
-        // Path should appear exactly once despite two tampared chunks
-        assert_eq!(tampared.iter().filter(|p| p.as_str() == "large").count(), 1);
+        // Path should appear exactly once despite two tampered chunks
+        assert_eq!(tampered.iter().filter(|p| p.as_str() == "large").count(), 1);
     }
 
     #[test]
@@ -3183,10 +3193,10 @@ mod tests {
 
         overwrite_bytes(&path, &public_signing_key, Key::Blob(address), &blob);
 
-        let tampared = vault.verify_all();
+        let tampered = vault.verify_all();
 
-        assert!(tampared.contains(&"file1".into()));
-        assert!(tampared.contains(&"file2".into()));
+        assert!(tampered.contains(&"file1".into()));
+        assert!(tampered.contains(&"file2".into()));
     }
 
     #[test]
@@ -3217,7 +3227,6 @@ mod tests {
         let tampered = vault.verify_all();
 
         assert_eq!(tampered, vec!["file@v1".to_string()]);
-        assert!(tampered.contains(&"file@v1".into()));
     }
 
     #[test]
