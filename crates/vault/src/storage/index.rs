@@ -350,7 +350,7 @@ impl Index {
 
     /// Collects all blob addresses referenced by every entry, live or trashed, including their
     /// version history.
-    pub fn addresses(&self) -> Vec<[u8; 32]> {
+    pub fn addresses(&self) -> BTreeSet<[u8; 32]> {
         self.entries
             .values()
             .flat_map(|e| {
@@ -365,7 +365,7 @@ impl Index {
 
     /// Collects all blob addresses referenced by live (non-trashed) entries, including their
     /// version history.
-    pub fn addresses_live(&self) -> Vec<[u8; 32]> {
+    pub fn addresses_live(&self) -> BTreeSet<[u8; 32]> {
         self.entries
             .values()
             .filter(|e| e.trashed == 0)
@@ -380,7 +380,7 @@ impl Index {
     }
 
     /// Collects all blob addresses referenced by trashed entries and their version history.
-    pub fn addresses_trashed(&self) -> Vec<[u8; 32]> {
+    pub fn addresses_trashed(&self) -> BTreeSet<[u8; 32]> {
         self.entries
             .values()
             .filter(|e| e.trashed != 0)
@@ -414,8 +414,8 @@ impl Index {
         self.track_path(&new_entry_path);
         self.entries.insert(new_entry_path, entry);
 
-        self.mark_dirty(old_path);
         self.mark_dirty(new_path);
+        self.mark_dirty(old_path);
 
         Ok(())
     }
@@ -536,7 +536,7 @@ impl Index {
             .filter(|(_, v)| v.trashed != 0)
             .map(|(k, _)| Rc::clone(k))
             .collect();
-        let mut purged = Vec::new();
+        let mut purged = BTreeSet::new();
 
         for path in paths {
             if let Some(entry) = self.entries.remove(&path) {
@@ -551,14 +551,14 @@ impl Index {
                 );
 
                 for address in all {
-                    if !live.contains(&address) && !purged.contains(&address) {
-                        purged.push(address);
+                    if !live.contains(&address) {
+                        purged.insert(address);
                     }
                 }
             }
         }
 
-        purged
+        purged.into_iter().collect()
     }
 
     /// Derives a user address from a `public_signing_key`.

@@ -22,8 +22,10 @@ use crate::{
 
 use gate::sys::{
     borrow::Cow,
+    collections::btree_set::BTreeSet,
     io,
     macros::format,
+    rc::Rc,
     string::{String, ToString},
     time,
     vec::Vec,
@@ -461,7 +463,7 @@ impl<S: storage::Backend> Vault<S> {
 
             index.mark_dirty(path);
 
-            let referenced: Vec<[u8; 32]> = index.addresses();
+            let referenced: BTreeSet<[u8; 32]> = index.addresses();
 
             Ok(dropped_chunks
                 .into_iter()
@@ -511,7 +513,6 @@ impl<S: storage::Backend> Vault<S> {
 
             let detached = entry.versions.remove(version_index);
 
-            index.mark_dirty(path);
             index.insert(
                 new_path,
                 index::Entry {
@@ -522,6 +523,7 @@ impl<S: storage::Backend> Vault<S> {
                     trashed: 0,
                 },
             );
+            index.mark_dirty(path);
 
             Ok(())
         })
@@ -567,7 +569,6 @@ impl<S: storage::Backend> Vault<S> {
             let size = core::mem::replace(&mut entry.size, latest_version.size);
             let modified = core::mem::replace(&mut entry.modified, latest_version.modified);
 
-            index.mark_dirty(path);
             index.insert(
                 new_path,
                 index::Entry {
@@ -578,6 +579,7 @@ impl<S: storage::Backend> Vault<S> {
                     trashed: 0,
                 },
             );
+            index.mark_dirty(path);
 
             Ok(())
         })
@@ -667,15 +669,14 @@ impl<S: storage::Backend> Vault<S> {
     pub fn cleanup(&mut self) -> Result<usize, Error> {
         self.ensure_all_shards()?;
 
-        let trashed_path: Vec<String> = self
+        let trashed_path: Vec<Rc<str>> = self
             .index
             .borrow()
             .iter()
             .filter(|(_, v)| v.trashed != 0)
-            .map(|(k, _)| k.to_string())
+            .map(|(k, _)| Rc::clone(k))
             .collect();
-        let path_refs: Vec<&str> = trashed_path.iter().map(|s| s.as_str()).collect();
-
+        let path_refs: Vec<&str> = trashed_path.iter().map(|s| s.as_ref()).collect();
         let addresses = self.mutate_and_flush(&path_refs, |index| Ok(index.purge_all()))?;
         let removed = addresses.len();
 
@@ -695,7 +696,7 @@ impl<S: storage::Backend> Vault<S> {
     /// - [`Error::NotFound`]: If `path` is absent.
     /// - [`Error::Tampered`]: If an index shard's signature is invalid.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
-        self.ensure_shard_for(path)?;
+        self.ensure_all_shards()?;
 
         let addresses = self.mutate_and_flush(&[path], |index| {
             match index.trash(path) {
@@ -1083,8 +1084,18 @@ impl<S: storage::Backend> Vault<S> {
         let value = mutate(self.index.get_mut())?;
 
         if let Err(e) = self.flush_index() {
+            let still_dirty = self.index.get_mut().dirty_shards();
+
             for (path, snapshot) in snapshots {
-                self.index.get_mut().restore_entry(path, snapshot);
+                let shard = self.index.get_mut().shard_of(path);
+
+                // A shard that already made it to storage before the failure is durable; rolling
+                // it back here would desync the memory from the disk while `dirty` incorrectly
+                // reports it as in sync, since nothing will ever retry a write for a shard that
+                // isn't dirty
+                if still_dirty.contains(&shard) {
+                    self.index.get_mut().restore_entry(path, snapshot);
+                }
             }
 
             return Err(e);
@@ -2442,6 +2453,73 @@ mod tests {
     }
 
     #[test]
+    fn rename_shared_source_shard_partial_flush_failure_should_not_lose_the_file() {
+        let (mut vault, path, words) = faulty_vault();
+        let identity = make_identity(&words);
+        let index = Index::new(&identity.encryption_key());
+
+        let old_path = "old/file";
+        // Force an unrelated path into the same shard as `old_path`, so removing `old_path` during
+        // the rename does not empty that shard, it becomes an ordinary write, competing with the
+        // destination's write for which one lands first, rather than a deferred deletion
+        let shared = same_shard_path(old_path, "shared", &index);
+        let new_path = other_shard_path(old_path, "new/file", &index);
+
+        put_bytes(&mut vault, old_path, b"data");
+        put_bytes(&mut vault, &shared, b"unrelated data");
+
+        // Two index `Put` calls happen here: one for the shard losing `old_path` (still non-empty
+        // because of `shared`), one for the shard gaining `new_path`. Failing the second call
+        // guarantees exactly one of the two durably lands before the whole rename reports `Err`
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Put, Kind::Index, 2);
+
+        assert!(vault.rename(old_path, &new_path).is_err());
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        let old_survived = reopened.get(old_path, &mut Vec::new()).is_ok();
+        let new_survived = reopened.get(&new_path, &mut Vec::new()).is_ok();
+
+        assert!(
+            old_survived || new_survived,
+            "the file must survive a failed rename under some name even when its source shard is \
+             shared with another live entry; instead it vanished from both `{}` and `{}`",
+            old_path,
+            new_path
+        );
+
+        // The unrelated file sharing `old_path`'s shard must be untouched either way
+        assert_eq!(get_bytes(&reopened, &shared), b"unrelated data");
+    }
+
+    #[test]
+    fn rename_within_the_same_shard_preserves_data() {
+        let (mut vault, _path, words) = vault();
+        let key = make_identity(&words).encryption_key();
+        let index = Index::new(&key);
+
+        put_bytes(&mut vault, "old_name", b"data");
+
+        let other = same_shard_path("old_name", "other", &index);
+
+        put_bytes(&mut vault, &other, b"other data");
+
+        let new_name = same_shard_path("old_name", "new_name", &index);
+
+        vault.rename("old_name", &new_name).unwrap();
+
+        assert!(vault.get("old_name", &mut Vec::new()).is_err());
+        assert_eq!(get_bytes(&vault, &new_name), b"data");
+
+        // The other in the same shard must remain intact
+        assert_eq!(get_bytes(&vault, &other), b"other data");
+    }
+
+    #[test]
     fn trash() {
         let (mut vault, _path, _words) = vault();
 
@@ -2662,6 +2740,48 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_partial_multi_shard_failure_does_not_misreport_trash_state_in_the_current_session() {
+        let (mut vault, path, words) = faulty_vault();
+        let identity = make_identity(&words);
+        let index = Index::new(&identity.encryption_key());
+
+        let trashed1 = "trashed 1";
+        let trashed2 = other_shard_path(trashed1, "trashed 2", &index);
+
+        put_bytes(&mut vault, trashed1, b"trash me one");
+        put_bytes(&mut vault, &trashed2, b"trash me two");
+
+        vault.trash(trashed1).unwrap();
+        vault.trash(&trashed2).unwrap();
+
+        // Both are solo in their shards, so `cleanup()` will mark two shards dirty, each destined
+        // for the deletion in `flush_index` (emptied shard). Failing the second deletion call
+        // and the first one succeeding means only the first one is durably persisted before
+        // the whole `cleanup()` call reports `Err`
+        vault
+            .storage
+            .fail_nth(faulty::Operation::Delete, Kind::Index, 2);
+
+        assert!(vault.cleanup().is_err());
+
+        let identity = make_identity(&words);
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let reopened = Vault::open(identity, storage);
+
+        // Whatever the current session believes is still trashed/recoverable must match what's
+        // actually durable, even though the overall call returned an error
+        assert_eq!(
+            vault.list_trash().unwrap(),
+            reopened.list_trash().unwrap(),
+            "the session must not claim a path is still recoverable when the shard deletion that \
+             purges it has already succeeded and been durably persisted"
+        );
+
+        // Sanity check the fault actually produced a genuine partial failure.
+        assert_eq!(reopened.list_trash().unwrap().len(), 1);
+    }
+
+    #[test]
     fn delete() {
         let (mut vault, _path, _words) = vault();
 
@@ -2689,6 +2809,37 @@ mod tests {
 
         // file is permanently removed and cannot be restored
         assert!(vault.restore("file.txt").is_err());
+    }
+
+    #[test]
+    fn delete_does_not_corrupt_a_shared_chunk_chunk_still_referenced_by_an_unloaded_shard() {
+        let (mut vault, path, words) = vault();
+        let identity = make_identity(&words);
+        let key = identity.encryption_key();
+        let index = Index::new(&key);
+
+        put_bytes(&mut vault, "a", b"shared content");
+
+        let b = other_shard_path("a", "b", &index);
+
+        put_bytes(&mut vault, &b, b"shared content");
+
+        // Re-open so nothing is loaded yet
+        let storage = local::Storage::new(&path, &identity.public_signing_key()).unwrap();
+        let mut reopened = Vault::open(identity, storage);
+
+        assert!(!reopened.index.borrow().is_loaded(index.shard_of("a")));
+        assert!(!reopened.index.borrow().is_loaded(index.shard_of(&b)));
+
+        reopened.delete("a").unwrap();
+
+        assert!(reopened.get("a", &mut Vec::new()).is_err());
+        assert_eq!(
+            get_bytes(&reopened, &b),
+            b"shared content",
+            "deleting `a` must not delete the chunk `b` still references just because `b`'s shard \
+             hadn't been loaded yet"
+        );
     }
 
     #[test]
@@ -2865,29 +3016,6 @@ mod tests {
         vault.delete(&file2).unwrap();
 
         assert!(!vault.storage.exists(Key::Index(shard)).unwrap());
-    }
-
-    #[test]
-    fn rename_within_the_same_shard_preserves_data() {
-        let (mut vault, _path, words) = vault();
-        let key = make_identity(&words).encryption_key();
-        let index = Index::new(&key);
-
-        put_bytes(&mut vault, "old_name", b"data");
-
-        let other = same_shard_path("old_name", "other", &index);
-
-        put_bytes(&mut vault, &other, b"other data");
-
-        let new_name = same_shard_path("old_name", "new_name", &index);
-
-        vault.rename("old_name", &new_name).unwrap();
-
-        assert!(vault.get("old_name", &mut Vec::new()).is_err());
-        assert_eq!(get_bytes(&vault, &new_name), b"data");
-
-        // The other in the same shard must remain intact
-        assert_eq!(get_bytes(&vault, &other), b"other data");
     }
 
     #[test]
