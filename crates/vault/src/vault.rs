@@ -22,7 +22,7 @@ use crate::{
 
 use gate::sys::{
     borrow::Cow,
-    collections::btree_set::BTreeSet,
+    collections::{btree_map::BTreeMap, btree_set::BTreeSet},
     io,
     macros::format,
     rc::Rc,
@@ -820,6 +820,11 @@ impl<S: storage::Backend> Vault<S> {
     /// directly from storage, even ones that are already cached.
     pub fn verify_all(&self) -> Vec<String> {
         let mut tampered = Vec::new();
+        // Chunks are content-addressed and deduplicated, so a chunk shared by several paths (or
+        // several versions of the same path) is the same physical blob. Caching by address means
+        // each distinct blob is fetched and signature-checked exactly once, no matter how many
+        // paths/versions reference it, instead of once per reference
+        let mut checked: BTreeMap<[u8; 32], bool> = BTreeMap::new();
 
         // Check the index shards
         if let Ok(keys) = self.storage.list(Kind::Index) {
@@ -845,17 +850,14 @@ impl<S: storage::Backend> Vault<S> {
         }
 
         for (path, entry) in self.index.borrow().iter() {
-            if self.verify_entry_chunks(path, &entry.chunks).is_err() {
+            if !self.verify_chunks_cached(&entry.chunks, &mut checked) {
                 tampered.push(path.to_string());
             }
 
             for (i, version) in entry.versions.iter().enumerate() {
                 let path_versioned = format!("{}@v{}", path, i + 1); // Display versions start from 1
 
-                if self
-                    .verify_entry_chunks(&path_versioned, &version.chunks)
-                    .is_err()
-                {
+                if !self.verify_chunks_cached(&version.chunks, &mut checked) {
                     tampered.push(path_versioned);
                 }
             }
@@ -1016,6 +1018,41 @@ impl<S: storage::Backend> Vault<S> {
         }
 
         Ok(())
+    }
+
+    /// Verifies a chunk list against `checked`, a cross-path/version cache of already-verified
+    /// blob addresses, keyed by address. Returns `false` if any chunk is missing or fails
+    /// signature verification.
+    ///
+    /// Unlike [`Vault::verify_entry_chunks`] (used by the single-path [`Vault::verify`]), this
+    /// discards which specific path/version a failure came from, [`Vault::verify_all`] only needs
+    /// to know whether this chunk list is clean, and an address that fails is equally tampered
+    /// no matter which entry happened to check it first.
+    fn verify_chunks_cached(
+        &self,
+        chunks: &[index::EntryChunk],
+        checked: &mut BTreeMap<[u8; 32], bool>,
+    ) -> bool {
+        let mut all_ok = true;
+
+        for chunk in chunks {
+            let ok = *checked.entry(chunk.address).or_insert_with(|| {
+                self.storage
+                    .get(Key::Blob(chunk.address))
+                    .ok()
+                    .map(|blob| {
+                        cipher::verify_signature(&blob, |message, signature_bytes| {
+                            self.identity.verify(message, signature_bytes)
+                        })
+                        .is_ok()
+                    })
+                    .unwrap_or(false) // missing or unreadable chunk counts as tampered
+            });
+
+            all_ok &= ok;
+        }
+
+        all_ok
     }
 
     /// Serializes, encrypts, signs, and persists every shard marked dirty since the last flush.
@@ -1181,6 +1218,10 @@ mod tests {
 
             pub fn clear_faults(&self) {
                 self.faults.iter().for_each(|f| f.set(None));
+            }
+
+            pub fn call_count(&self, operation: Operation, kind: storage::Kind) -> usize {
+                self.calls[operation.slot(kind)].get()
             }
 
             fn should_fail(
@@ -3355,6 +3396,25 @@ mod tests {
         let tampered = vault.verify_all();
 
         assert_eq!(tampered, vec!["file@v1".to_string()]);
+    }
+
+    #[test]
+    fn verify_all_fetches_each_shared_chunk_only_once() {
+        let (mut vault, _path, _words) = faulty_vault();
+
+        // All three share one physical chunk
+        put_bytes(&mut vault, "a", b"shared content");
+        put_bytes(&mut vault, "b", b"shared content");
+        put_bytes(&mut vault, "c", b"shared content");
+
+        vault.verify_all();
+
+        assert_eq!(
+            vault.storage.call_count(faulty::Operation::Get, Kind::Blob),
+            1,
+            "the one shared chunk should be fetched once across all three referencing paths, not \
+             once per path",
+        );
     }
 
     #[test]
